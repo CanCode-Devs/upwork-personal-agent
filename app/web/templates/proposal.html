@@ -10,6 +10,8 @@
 
 {% if request.query_params.get('saved') %}
 <div class="banner ok">Proposal settings saved. They apply to the next draft or Regenerate.</div>
+{% elif request.query_params.get('reset') == 'role' %}
+<div class="banner ok">Restored the default role-hire letter sections.</div>
 {% elif request.query_params.get('reset') %}
 <div class="banner ok">Restored the default writer instructions.</div>
 {% elif request.query_params.get('example') %}
@@ -40,9 +42,15 @@
     </div>
     <div class="card">
       <h2>Letter structure</h2>
-      <p class="muted">One section per line, in the order they should appear.</p>
-      <label for="letter_structure">Sections</label>
+      <p class="muted">One section per line for scoped builds (deliver this thing).</p>
+      <label for="letter_structure">Project sections</label>
       <textarea id="letter_structure" name="letter_structure" class="medium">{{ writer.letter_structure }}</textarea>
+    </div>
+    <div class="card">
+      <h2>Role hire letters</h2>
+      <p class="muted">Used when the posting is hiring a person for ongoing work, not a one-off build. One section per line.</p>
+      <label for="role_letter_structure">Role sections</label>
+      <textarea id="role_letter_structure" name="role_letter_structure" class="medium">{{ writer.role_letter_structure }}</textarea>
     </div>
   </div>
 
@@ -115,8 +123,11 @@
   </div>
 </form>
 
-<form method="post" action="/proposal/reset" style="margin-top:12px">
+<form method="post" action="/proposal/reset" style="margin-top:12px; display:inline-block">
   <button class="btn secondary" type="submit">Restore defaults</button>
+</form>
+<form method="post" action="/proposal/reset-role" style="margin-top:12px; display:inline-block; margin-left:8px">
+  <button class="btn secondary" type="submit">Restore role hire default</button>
 </form>
 
 <div class="card" style="margin-top:28px">
@@ -166,7 +177,7 @@
 
 <div class="card" style="margin-top:28px">
   <h2>Prompt preview</h2>
-  <p class="muted">Exact instructions assembled from the fields above, plus your agent voice and any proposal-style rules from Settings.</p>
+  <p class="muted">Project-formula preview. Role hires use the Role hire sections instead.</p>
   <textarea class="preview" readonly>{{ prompt_preview }}</textarea>
 </div>
 {% endblock %}

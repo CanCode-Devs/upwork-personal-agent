@@ -46,6 +46,8 @@ async def approve_and_submit(
     profile_history_ids: list[str] | None = None,
     attachment_uids: list[str] | None = None,
 ) -> Job:
+    if job.applied_on_upwork:
+        raise ValueError("Already applied on Upwork")
     if job.status not in {JobStatus.pending_review.value, JobStatus.submit_failed.value}:
         raise ValueError(f"Job cannot be approved from status {job.status}")
     letter = (cover_letter or "").strip() or cover_letter_for(job)

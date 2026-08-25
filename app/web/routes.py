@@ -18,19 +18,22 @@ from app.actions import approve_and_submit, cover_letter_for, latest_proposal, r
 from app.auth import COOKIE_NAME, create_session_value, current_user, verify_password
 from app.config import Settings, get_settings
 from app.models import ApplyHighlight, ConnectsPanel, FreelancerProfile, InboxCounts, InboxSort, JobStatus, MilestoneStageConfig, PitchTone, ScreeningAnswer, SessionUser, WorkKind, WorkOrigin, WriterConfig
-from app.db.models import Event, FeedbackLog, Job, PortfolioItem, PreferenceRule, ProposalExample, UpworkApplication, UpworkProfile, User
+from app.db.models import ChatMessage, Event, FeedbackLog, Job, MessageRoom, PortfolioItem, PreferenceRule, ProposalExample, UpworkApplication, UpworkProfile, User
+from app.llm import llm_suggest_reply
 from app.db.session import SessionLocal, get_db
+from app.engagement import classify_engagement
 from app.events import add_event
 from app.job_attachments import safe_filename
 from app.job_display import application_card, job_card, sort_job_cards
 from app.milestones import heuristic_milestones, job_needs_milestones, load_milestones, parse_milestone_form
-from app.profile import load_overlay, save_overlay
+from app.profile import load_overlay, load_profile, save_overlay
 from app.proposal_settings import (
     apply_config_to_row,
     build_system_prompt,
     get_or_create_proposal_settings,
     load_proposal_settings,
     reset_proposal_settings,
+    reset_role_letter_structure,
     style_rules_for_prompt,
 )
 from app.proposal_writer import dump_apply, finalize_letter, load_apply, load_screening, parse_screening_form
@@ -38,7 +41,7 @@ from app.runtime import get_or_create_runtime
 from app.tools.discovery import apply_runtime_filters
 from app.tools.execution import HIGHLIGHT_PICK, PitchSkipped, bid_amount_for_job, generate_tailored_pitch, local_job_highlights, rank_highlights
 from app.tools.memory import learn_preference, log_interaction_feedback, save_agent_item, update_portfolio_matrix
-from app.upwork.mcp_client import UpworkMcpClient
+from app.upwork.mcp_client import UpworkMcpClient, already_applied, connects_shortage, format_mcp_error, oauth_needs_login, public_job_url
 from app.upwork.oauth import (
     OAuthCallbackPayload,
     WebOAuthFlow,
@@ -48,12 +51,24 @@ from app.upwork.oauth import (
     set_last_oauth_error,
     start_web_oauth_flow,
 )
-from app.upwork.sync import sync_upwork_memory
+from app.upwork.messages import (
+    first_message_blocked,
+    load_rooms,
+    message_views,
+    related_job_id,
+    refresh_room,
+    save_suggested_draft,
+    sync_messages,
+    thread_card,
+)
+from app.upwork.sync import mark_jobs_applied, sync_upwork_memory
 from app.worker import run_poll_cycle
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/web/templates")
 logger = logging.getLogger(__name__)
+_STYLE_PATH = Path(__file__).resolve().parent / "static" / "style.css"
+_ASSET_V = str(int(_STYLE_PATH.stat().st_mtime)) if _STYLE_PATH.exists() else "1"
 
 
 def _fmt_dt(value: datetime | None) -> str:
@@ -64,7 +79,12 @@ def _fmt_dt(value: datetime | None) -> str:
     return value.astimezone().strftime("%Y-%m-%d %H:%M")
 
 
+def _upwork_job_filter(value: str | None) -> str:
+    return public_job_url(str(value) if value else "")
+
+
 templates.env.filters["dt"] = _fmt_dt
+templates.env.filters["upwork_job"] = _upwork_job_filter
 
 
 def render(request: Request, name: str, context: dict | None = None, status_code: int = 200) -> Response:
@@ -73,7 +93,22 @@ def render(request: Request, name: str, context: dict | None = None, status_code
     payload.pop("request", None)
     payload.setdefault("app_name", settings.app_name)
     payload.setdefault("app_tagline", settings.app_tagline)
+    payload.setdefault("asset_v", _ASSET_V)
     return templates.TemplateResponse(request, name, payload, status_code=status_code)
+
+
+def _inbox_auth_stale(events: Sequence[Event], oauth: str | None) -> bool:
+    if oauth == "ok":
+        return False
+    for item in events:
+        text = (item.message or "").lower()
+        if item.kind == "upwork" and "connected" in text and "failed" not in text:
+            return False
+        if item.kind == "poll_error" and oauth_needs_login(item.message):
+            return True
+        if item.kind == "poll" and "session expired" in text:
+            return True
+    return False
 
 
 INBOX_SORTS: tuple[tuple[InboxSort, str], ...] = (
@@ -195,10 +230,12 @@ async def inbox(
     events = db.query(Event).order_by(Event.created_at.desc()).limit(12).all()
     mcp = UpworkMcpClient()
     connected = await mcp.is_authenticated()
+    stale_auth = _inbox_auth_stale(events, oauth)
     mcp_status = {
-        "connected": connected,
+        "connected": connected and not stale_auth,
         "tools": [],
-        "error": "" if connected else "Not logged in",
+        "error": "Upwork session expired. Connect again." if stale_auth else ("" if connected else "Not logged in"),
+        "stale": stale_auth,
     }
     oauth_notice = {
         "ok": "Upwork connected. Polling can fetch jobs now.",
@@ -257,7 +294,11 @@ async def job_detail(request: Request, job_id: int, db: Session = Depends(get_db
         .order_by(FeedbackLog.created_at.desc())
         .all()
     )
-    can_act = job.status in {JobStatus.pending_review.value, JobStatus.submit_failed.value}
+    can_act = job.status in {JobStatus.pending_review.value, JobStatus.submit_failed.value} and not job.applied_on_upwork
+    applied_ids = {row.posting_id for row in db.query(UpworkApplication).all()}
+    if can_act and mark_jobs_applied(db, applied_ids, "Matched an Upwork proposal"):
+        db.refresh(job)
+        can_act = job.status in {JobStatus.pending_review.value, JobStatus.submit_failed.value} and not job.applied_on_upwork
     writer = load_proposal_settings(db)
     letter = cover_letter_for(job, db)
     overlay = load_overlay(get_settings())
@@ -283,25 +324,38 @@ async def job_detail(request: Request, job_id: int, db: Session = Depends(get_db
                 )
         except Exception as exc:
             logger.exception("proposal preview failed")
+            detail = format_mcp_error(exc)
             try:
-                panel = ConnectsPanel(available=await mcp.get_connects_balance(), charged_amount=bid, error=str(exc))
+                available = await mcp.get_connects_balance()
             except Exception:
-                panel = ConnectsPanel(charged_amount=bid, error=str(exc))
+                available = None
+            panel = ConnectsPanel(available=available, charged_amount=bid, error=detail)
+        if already_applied(panel.error):
+            mark_jobs_applied(db, {job.upwork_id}, "Upwork reports an existing proposal")
+            db.refresh(job)
+            can_act = False
+            panel.can_apply = False
+            panel.error = "Already applied on Upwork"
         try:
             highlights = await mcp.list_highlights()
         except Exception:
             logger.exception("list_highlights failed")
         highlights.extend(local_job_highlights(db))
-        if panel.apply_cost is None:
-            try:
-                details = json.loads(job.client_json or "{}")
-                cost = details.get("connects_cost")
-                if isinstance(cost, (int, float)):
-                    panel.apply_cost = int(cost)
-            except json.JSONDecodeError:
-                pass
+        listing_cost: int | None = None
+        try:
+            details = json.loads(job.client_json or "{}")
+            cost = details.get("connects_cost")
+            if isinstance(cost, (int, float)):
+                listing_cost = int(cost)
+        except json.JSONDecodeError:
+            listing_cost = None
+        panel.listing_cost = listing_cost
+        if panel.apply_cost is None and listing_cost is not None and not connects_shortage(panel.error):
+            panel.apply_cost = listing_cost
         if panel.available is not None and panel.apply_cost is not None:
             panel.remaining_after_apply = panel.available - panel.apply_cost
+        if panel.remaining_after_apply is not None and panel.remaining_after_apply < 0:
+            panel.can_apply = False
     allowed = None if panel.error else panel.milestones_allowed
     proposal = latest_proposal(job)
     milestones = load_milestones(proposal)
@@ -351,6 +405,13 @@ async def job_detail(request: Request, job_id: int, db: Session = Depends(get_db
             highlights.append(ApplyHighlight(kind="upwork_job", id=hid, title=hid, selected=True))
     kind_order = {"upwork_job": 0, "portfolio": 1, "certificate": 2, "profile_history": 3}
     highlights.sort(key=lambda item: (not item.selected, kind_order.get(item.kind, 9), item.title.lower()))
+    submit_error = (proposal.submit_error if proposal is not None else None) or ""
+    if not submit_error:
+        for event in events:
+            if event.kind == "submit_failed" and event.message:
+                submit_error = event.message
+                break
+    oauth_stale = oauth_needs_login(submit_error)
     return render(
         request,
         "job.html",
@@ -369,6 +430,9 @@ async def job_detail(request: Request, job_id: int, db: Session = Depends(get_db
             "show_milestones": bool(milestones) or job_needs_milestones(job, bid, allowed),
             "screening": screening,
             "highlights": highlights,
+            "engagement": classify_engagement(job.title or "", job.description or "", job.job_type or ""),
+            "submit_error": submit_error,
+            "oauth_stale": oauth_stale,
         },
     )
 
@@ -518,8 +582,9 @@ async def approve_job(
             profile_history_ids=profile_history_ids,
             attachment_uids=attachment_uids,
         )
-    except (ValueError, RuntimeError) as exc:
-        add_event(db, "submit_failed", str(exc), job.id)
+    except (ValueError, RuntimeError, Exception) as exc:
+        add_event(db, "submit_failed", format_mcp_error(exc), job.id)
+        logger.exception("approve/submit failed for job %s", job.id)
     return RedirectResponse(f"/jobs/{job.id}", status_code=303)
 
 
@@ -579,8 +644,9 @@ def _abandon_web_login(flow: WebOAuthFlow, message: str) -> None:
 @router.get("/upwork/connect")
 async def upwork_connect(request: Request, db: Session = Depends(get_db)) -> Response:
     user = _user(request)
+    force = request.query_params.get("force") == "1"
     client = UpworkMcpClient()
-    if await client.is_authenticated():
+    if await client.is_authenticated() and not force:
         return RedirectResponse("/", status_code=303)
 
     flow = get_web_oauth_flow()
@@ -590,6 +656,9 @@ async def upwork_connect(request: Request, db: Session = Depends(get_db)) -> Res
         set_last_oauth_error(str(flow.exception))
         clear_web_oauth_flow()
         return RedirectResponse("/?oauth=failed", status_code=303)
+    if flow is not None and flow.finished.is_set() and not flow.exception:
+        clear_web_oauth_flow()
+        return RedirectResponse("/?oauth=ok", status_code=303)
     if flow is not None and time.monotonic() - flow.started_at > 90:
         _abandon_web_login(flow, "Timed out starting Upwork OAuth")
         return RedirectResponse("/?oauth=timeout", status_code=303)
@@ -598,6 +667,7 @@ async def upwork_connect(request: Request, db: Session = Depends(get_db)) -> Res
         flow.task = asyncio.create_task(_complete_web_login(flow))
 
     runtime = get_or_create_runtime(db)
+    connect_path = "/upwork/connect?force=1" if force else "/upwork/connect"
     return render(
         request,
         "connecting.html",
@@ -605,6 +675,7 @@ async def upwork_connect(request: Request, db: Session = Depends(get_db)) -> Res
             "user": user,
             "counts": _counts(db),
             "runtime": runtime,
+            "connect_path": connect_path,
             "status_message": "Contacting Upwork MCP and preparing the login URL…",
         },
     )
@@ -692,6 +763,7 @@ def _writer_from_form(
     enforce_opening_hook: str | None,
     tone: str,
     letter_structure: str,
+    role_letter_structure: str,
     must_include: str,
     never_say: str,
     extra_instructions: str,
@@ -731,6 +803,7 @@ def _writer_from_form(
         enforce_opening_hook=bool(enforce_opening_hook),
         tone=tone_value,
         letter_structure=letter_structure,
+        role_letter_structure=role_letter_structure,
         must_include=must_include,
         never_say=never_say,
         extra_instructions=extra_instructions,
@@ -774,6 +847,7 @@ def save_proposal_settings(
     enforce_opening_hook: str | None = Form(default=None),
     tone: str = Form("consultative"),
     letter_structure: str = Form(""),
+    role_letter_structure: str = Form(""),
     must_include: str = Form(""),
     never_say: str = Form(""),
     extra_instructions: str = Form(""),
@@ -798,6 +872,7 @@ def save_proposal_settings(
             enforce_opening_hook,
             tone,
             letter_structure,
+            role_letter_structure,
             must_include,
             never_say,
             extra_instructions,
@@ -821,6 +896,13 @@ def reset_proposal(request: Request, db: Session = Depends(get_db)) -> Response:
     _user(request)
     reset_proposal_settings(db)
     return RedirectResponse("/proposal?reset=1", status_code=303)
+
+
+@router.post("/proposal/reset-role")
+def reset_role_structure(request: Request, db: Session = Depends(get_db)) -> Response:
+    _user(request)
+    reset_role_letter_structure(db)
+    return RedirectResponse("/proposal?reset=role", status_code=303)
 
 
 @router.post("/proposal/examples")
@@ -1111,4 +1193,172 @@ def delete_portfolio(item_id: int, db: Session = Depends(get_db)) -> Response:
     if row is not None and row.origin == WorkOrigin.agent.value:
         db.delete(row)
     return RedirectResponse("/portfolio", status_code=303)
+
+
+def _read_uploads(items: list[UploadFile] | None) -> list[tuple[str, bytes, str]]:
+    files: list[tuple[str, bytes, str]] = []
+    for item in items or []:
+        name = (item.filename or "").strip()
+        if not name:
+            continue
+        data = item.file.read()
+        if not data:
+            continue
+        files.append((name, data, item.content_type or "application/octet-stream"))
+    return files
+
+
+def _safe_room_next(value: str) -> str:
+    text = (value or "").strip()
+    if text.startswith("room_") and "/" not in text and "?" not in text:
+        return f"/messages/{text}"
+    return "/messages"
+
+
+async def _messages_context(
+    request: Request,
+    db: Session,
+    selected_room_id: str | None = None,
+) -> dict:
+    user = _user(request)
+    rooms = load_rooms(db)
+    cards = [thread_card(room, related=related_job_id(db, room)) for room in rooms]
+    mcp = UpworkMcpClient()
+    connected = await mcp.is_authenticated()
+    selected = None
+    messages: list = []
+    if selected_room_id:
+        for card in cards:
+            if card["room_id"] == selected_room_id:
+                selected = card
+                break
+    q_error = request.query_params.get("error") or ""
+    if selected is not None:
+        if q_error == "first":
+            selected["client_first_required"] = True
+            selected["can_send"] = False
+        room_row = next((row for row in rooms if row.room_id == selected_room_id), None)
+        if room_row is not None:
+            rows = db.query(ChatMessage).filter(ChatMessage.room_pk == room_row.id).all()
+            messages = message_views(rows)
+    return {
+        "user": user,
+        "rooms": cards,
+        "room": selected,
+        "messages": messages,
+        "counts": _counts(db),
+        "connected": connected,
+        "error": q_error,
+        "synced": request.query_params.get("synced") or "",
+        "notice": request.query_params.get("sent") or request.query_params.get("draft") or "",
+    }
+
+
+@router.get("/messages", response_class=HTMLResponse)
+async def messages_page(request: Request, db: Session = Depends(get_db)) -> Response:
+    return render(request, "messages.html", await _messages_context(request, db))
+
+
+@router.post("/messages/sync")
+async def messages_sync(next: str = Form(""), db: Session = Depends(get_db)) -> Response:
+    dest = _safe_room_next(next)
+    mcp = UpworkMcpClient()
+    if not await mcp.is_authenticated():
+        return RedirectResponse(f"{dest}?error=connect", status_code=303)
+    try:
+        await sync_messages(mcp, db)
+    except Exception as exc:
+        detail = format_mcp_error(exc)
+        if oauth_needs_login(detail):
+            return RedirectResponse(f"{dest}?error=connect", status_code=303)
+        logger.exception("messages sync failed")
+        return RedirectResponse(f"{dest}?error=sync", status_code=303)
+    return RedirectResponse(f"{dest}?synced=1", status_code=303)
+
+
+@router.get("/messages/{room_id}", response_class=HTMLResponse)
+async def message_thread(request: Request, room_id: str, db: Session = Depends(get_db)) -> Response:
+    exists = db.query(MessageRoom).filter(MessageRoom.room_id == room_id).one_or_none()
+    if exists is None:
+        return RedirectResponse("/messages", status_code=303)
+    return render(request, "messages.html", await _messages_context(request, db, room_id))
+
+
+@router.post("/messages/{room_id}/suggest")
+async def suggest_reply(room_id: str, db: Session = Depends(get_db)) -> Response:
+    room = db.query(MessageRoom).filter(MessageRoom.room_id == room_id).one_or_none()
+    if room is None:
+        return RedirectResponse("/messages", status_code=303)
+    rows = db.query(ChatMessage).filter(ChatMessage.room_pk == room.id).all()
+    views = message_views(rows)
+    lines = []
+    for item in views:
+        who = "You" if item.get("sender") == "you" else ("System" if item.get("sender") == "system" else "Client")
+        lines.append(f"{who}: {item.get('body') or ''}")
+    try:
+        result = llm_suggest_reply(
+            "\n\n".join(lines) or "(empty thread)",
+            load_profile(),
+            get_settings(),
+            counterpart=room.counterpart or room.title,
+        )
+    except Exception:
+        logger.exception("suggest reply failed")
+        return RedirectResponse(f"/messages/{room.room_id}?error=suggest", status_code=303)
+    save_suggested_draft(db, room, result.intents[0].text, result.intents)
+    return RedirectResponse(f"/messages/{room.room_id}?draft=1", status_code=303)
+
+
+@router.post("/messages/{room_id}/send")
+async def send_reply(
+    room_id: str,
+    body: str = Form(""),
+    chat_files: list[UploadFile] | None = File(default=None),
+    db: Session = Depends(get_db),
+) -> Response:
+    room = db.query(MessageRoom).filter(MessageRoom.room_id == room_id).one_or_none()
+    if room is None:
+        return RedirectResponse("/messages", status_code=303)
+    if room.send_status == "sending":
+        return RedirectResponse(f"/messages/{room.room_id}", status_code=303)
+    text = body.strip()
+    uploads = _read_uploads(chat_files)
+    if not text and not uploads:
+        return RedirectResponse(f"/messages/{room.room_id}?error=empty", status_code=303)
+    if len(text) > 10240:
+        return RedirectResponse(f"/messages/{room.room_id}?error=long", status_code=303)
+    room.send_status = "sending"
+    room.send_error = None
+    db.add(room)
+    db.commit()
+    mcp = UpworkMcpClient()
+    try:
+        if not await mcp.is_authenticated():
+            raise RuntimeError("Upwork is not connected")
+        attachments: list[dict[str, str]] = []
+        if uploads:
+            attachments = await mcp.upload_files(uploads, context="messages", room_id=room.room_id)
+        result = await mcp.send_room_message(room.room_id, text, attachments)
+        room.send_status = "idle"
+        room.send_error = None
+        db.add(room)
+        db.commit()
+        try:
+            await refresh_room(mcp, db, room)
+        except Exception:
+            logger.exception("refresh after send failed")
+        add_event(db, "messages", f"sent room={room.room_id} {result[:180]}")
+        return RedirectResponse(f"/messages/{room.room_id}?sent=1", status_code=303)
+    except Exception as exc:
+        detail = format_mcp_error(exc)
+        room.send_status = "error"
+        room.send_error = detail
+        db.add(room)
+        db.commit()
+        if first_message_blocked(detail):
+            return RedirectResponse(f"/messages/{room.room_id}?error=first", status_code=303)
+        if oauth_needs_login(detail):
+            return RedirectResponse(f"/messages/{room.room_id}?error=connect", status_code=303)
+        logger.exception("send message failed")
+        return RedirectResponse(f"/messages/{room.room_id}?error=send", status_code=303)
 

@@ -11,6 +11,7 @@ from app.config import Settings, get_settings
 from app.db.models import Job, PortfolioItem, Proposal
 from app.db.session import SessionLocal
 from app.embeddings import cosine, embed_texts, query_similar
+from app.engagement import classify_engagement
 from app.events import add_event
 from app.llm import llm_draft, llm_screening_answers
 from app.milestones import (
@@ -43,7 +44,7 @@ from app.proposal_settings import build_system_prompt, load_proposal_settings, s
 from app.proposal_writer import dump_apply, dump_screening, finalize_letter, load_apply, load_screening
 from app.tools import register_tool
 from app.tools.discovery import settings_block_reasons_for_job
-from app.upwork.mcp_client import UpworkMcpClient
+from app.upwork.mcp_client import UpworkMcpClient, already_applied, format_mcp_error
 
 logger = logging.getLogger(__name__)
 
@@ -379,7 +380,8 @@ async def generate_tailored_pitch(
         bid = bid_amount_for_job(job, profile.hourly_rate)
         need_plan = job_needs_milestones(job, bid)
         style_examples = select_examples(session, blob, writer.example_count)
-        system_prompt = build_system_prompt(writer, profile, style_rules_for_prompt(session))
+        engagement = classify_engagement(job.title or "", job.description or "", job.job_type or "")
+        system_prompt = build_system_prompt(writer, profile, style_rules_for_prompt(session), engagement=engagement)
         stage_payload = [item.model_dump() for item in writer.milestone_stages]
         drafted = llm_draft(
             payload,
@@ -653,12 +655,8 @@ async def submit_proposal(
                         "certificate_ids": cert_ids,
                     }
                 )
-            add_event(
-                session,
-                "submitted",
-                f"{result[:1500]} bid={bid:g}",
-                job.id,
-            )
+            note = "Already on Upwork" if already_applied(result) or result == "already_applied" else f"{result[:1500]} bid={bid:g}"
+            add_event(session, "submitted", note, job.id)
             add_embedding(session, EmbeddingSource.job, job.id, f"{job.title}\n{job.description}")
             if proposal is not None:
                 add_embedding(session, EmbeddingSource.proposal, proposal.id, letter)
@@ -666,13 +664,22 @@ async def submit_proposal(
                 session.commit()
             return {"status": job.status, "result": result}
         except Exception as exc:
+            detail = format_mcp_error(exc)
+            if already_applied(detail):
+                job.status = JobStatus.submitted.value
+                job.applied_on_upwork = True
+                add_event(session, "submitted", "Already applied on Upwork", job.id)
+                if own:
+                    session.commit()
+                return {"status": job.status, "result": detail}
             job.status = JobStatus.submit_failed.value
+            logger.exception("submit_proposal failed for job %s", job.id)
             if proposal is not None:
-                proposal.submit_error = str(exc)
-            add_event(session, "submit_failed", str(exc), job.id)
+                proposal.submit_error = detail
+            add_event(session, "submit_failed", detail, job.id)
             if own:
                 session.commit()
-            return {"status": job.status, "result": str(exc)}
+            return {"status": job.status, "result": detail}
     except Exception:
         if own:
             session.rollback()

@@ -1,10 +1,23 @@
 import json
 
+from pydantic import ValidationError
+
 from openai import OpenAI
 
 from app.config import Settings
 from app.milestones import coerce_milestones
-from app.models import DraftResult, FreelancerProfile, JobPayload, ScoreResult, ScreeningAnswer, StyleExample
+from app.models import (
+    DraftResult,
+    FreelancerProfile,
+    JobPayload,
+    ReplyIntent,
+    ReplyIntentKind,
+    ScoreResult,
+    ScreeningAnswer,
+    StyleExample,
+    SuggestReplyResult,
+    display_intent_label,
+)
 from app.proposal_writer import (
     SYSTEM_PROMPT,
     extract_apply_questions,
@@ -195,3 +208,88 @@ def llm_screening_answers(
         ScreeningAnswer(question=item.question, answer=sanitize_proposal(item.answer))
         for item in answers
     ]
+
+
+def clamp_reply_intents(result: SuggestReplyResult) -> list[ReplyIntent]:
+    seen: set[ReplyIntentKind] = set()
+    out: list[ReplyIntent] = []
+    for item in result.intents:
+        text = (item.text or "").strip()
+        if not text or item.kind in seen:
+            continue
+        label = display_intent_label(item.kind, item.label)
+        out.append(ReplyIntent(kind=item.kind, label=label[:48], text=text))
+        seen.add(item.kind)
+        if len(out) >= 3:
+            break
+    if not out:
+        fallback = (result.text or "").strip()
+        if fallback:
+            out.append(
+                ReplyIntent(
+                    kind=ReplyIntentKind.general_answer,
+                    label=display_intent_label(ReplyIntentKind.general_answer),
+                    text=fallback,
+                )
+            )
+    return out
+
+
+def parse_suggest_reply(content: str) -> SuggestReplyResult:
+    parsed = json.loads(content or "{}")
+    if not isinstance(parsed, dict):
+        parsed = {}
+    raw_intents = parsed.get("intents")
+    if not isinstance(raw_intents, list):
+        raw_intents = []
+    collected: list[ReplyIntent] = []
+    for item in raw_intents:
+        if not isinstance(item, dict):
+            continue
+        try:
+            collected.append(ReplyIntent.model_validate(item))
+        except ValidationError:
+            continue
+    leftover = str(parsed.get("text") or parsed.get("reply") or "").strip()
+    intents = clamp_reply_intents(SuggestReplyResult(intents=collected, text=leftover))
+    return SuggestReplyResult(intents=intents, text=leftover)
+
+
+def llm_suggest_reply(
+    transcript: str,
+    profile: FreelancerProfile,
+    settings: Settings,
+    counterpart: str = "",
+) -> SuggestReplyResult:
+    _require_key(settings)
+    client = _client(settings)
+    system = (
+        "You draft short Upwork chat replies for a freelancer. "
+        "Return JSON only with key intents: 2 or 3 objects, each with kind, label, text. "
+        "kind must be follow_up, set_meeting, or general_answer. Pick only kinds that fit the thread. "
+        "label is a short human phrase such as Set a meeting, never snake_case. "
+        "follow_up: nudge if the conversation stalled. "
+        "set_meeting: they asked for a call or time; ask them to suggest times, never invent availability. "
+        "general_answer: a direct reply to the latest client message. "
+        "Consultative, specific, no fake claims, no invented rates. "
+        "Plain text replies. No markdown headings. No em dashes."
+    )
+    user = (
+        f"Freelancer profile:\n{json.dumps(profile_for_prompt(profile), ensure_ascii=False, indent=2)}\n\n"
+        f"Chat with: {counterpart or 'the client'}\n\n"
+        f"Transcript (oldest first):\n{transcript[:12000]}\n\n"
+        "Return {\"intents\": [{\"kind\", \"label\", \"text\"}, ...]}."
+    )
+    response = client.chat.completions.create(
+        model=settings.openai_model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.4,
+    )
+    result = parse_suggest_reply(response.choices[0].message.content or "{}")
+    if not result.intents:
+        raise RuntimeError("LLM returned no reply intents")
+    return result

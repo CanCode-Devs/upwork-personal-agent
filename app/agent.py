@@ -17,10 +17,15 @@ from app.upwork.mcp_client import (
     UpworkMcpClient,
     derive_client_stats,
     fold_search_client,
+    format_mcp_error,
     merge_client_details,
+    oauth_needs_login,
     prefer_price_label,
     price_from_raw,
+    public_job_url,
+    job_ref_keys,
 )
+from app.upwork.messages import sync_messages
 
 logger = logging.getLogger(__name__)
 
@@ -51,13 +56,11 @@ def _needs_client_refresh(row: Job) -> bool:
 
 def _job_url(payload: JobPayload) -> str | None:
     if payload.get("url"):
-        return payload["url"]
+        return public_job_url(payload["url"])
     job_id = payload.get("id")
     if not job_id:
         return None
-    if job_id.startswith("http"):
-        return job_id
-    return f"https://www.upwork.com/jobs/{job_id}"
+    return public_job_url(job_id)
 
 
 def expire_stale_jobs() -> int:
@@ -107,7 +110,9 @@ async def backfill_job_details(mcp: UpworkMcpClient) -> None:
         by_id = {item["id"]: item for item in enriched if item.get("id")}
     db = SessionLocal()
     try:
-        applied = {row.posting_id for row in db.query(UpworkApplication).all()}
+        applied: set[str] = set()
+        for item in db.query(UpworkApplication).all():
+            applied |= job_ref_keys(item.posting_id)
         pending = db.query(Job).filter(Job.status == JobStatus.pending_review.value).all()
         for row in pending:
             extra = by_id.get(row.upwork_id, {})
@@ -139,7 +144,8 @@ async def backfill_job_details(mcp: UpworkMcpClient) -> None:
                     row.client_json = json.dumps(merged, default=str)
             except json.JSONDecodeError:
                 row.client_json = extra.get("client_details") or row.client_json
-            row.applied_on_upwork = row.upwork_id in applied or row.status == JobStatus.submitted.value
+            if any(job_ref_keys(row.upwork_id) & applied) or row.status == JobStatus.submitted.value:
+                row.applied_on_upwork = True
             extra_desc = extra.get("description") or ""
             if len(extra_desc) > len(row.description or ""):
                 row.description = extra_desc
@@ -291,12 +297,22 @@ async def run_agent_cycle(settings: Settings | None = None) -> dict[str, int]:
             jobs = await fetch_live_jobs(query, client=mcp)
         except Exception as exc:
             counts["errors"] += 1
+            detail = format_mcp_error(exc)
+            logger.exception("poll search failed for %s", query)
             db = SessionLocal()
             try:
-                add_event(db, "poll_error", f"{query}: {exc}")
+                add_event(db, "poll_error", f"{query}: {detail}")
                 db.commit()
             finally:
                 db.close()
+            if oauth_needs_login(detail):
+                db = SessionLocal()
+                try:
+                    add_event(db, "poll", "Upwork session expired. Connect Upwork from the inbox.")
+                    db.commit()
+                finally:
+                    db.close()
+                break
             continue
         counts["searched"] += len(jobs)
         db = SessionLocal()
@@ -330,6 +346,25 @@ async def run_agent_cycle(settings: Settings | None = None) -> dict[str, int]:
         await backfill_job_details(mcp)
     except Exception:
         logger.exception("backfill job details failed")
+    try:
+        db_msg = SessionLocal()
+        try:
+            n = await sync_messages(mcp, db_msg)
+            add_event(db_msg, "messages", f"synced_rooms={n}")
+            db_msg.commit()
+        except Exception as exc:
+            db_msg.rollback()
+            detail = format_mcp_error(exc)
+            logger.exception("message sync failed")
+            add_event(db_msg, "poll_error", f"messages: {detail}")
+            db_msg.commit()
+            if oauth_needs_login(detail):
+                add_event(db_msg, "poll", "Upwork session expired. Connect Upwork from the inbox.")
+                db_msg.commit()
+        finally:
+            db_msg.close()
+    except Exception:
+        logger.exception("message sync wrapper failed")
     db = SessionLocal()
     try:
         add_event(

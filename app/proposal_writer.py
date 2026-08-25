@@ -5,7 +5,7 @@ import re
 from typing import Any
 
 from app.db.models import Proposal
-from app.models import FreelancerProfile, JobPayload, ScreeningAnswer
+from app.engagement import classify_engagement
 
 OPENING_HOOK = ""
 
@@ -95,6 +95,11 @@ def job_context(job: JobPayload) -> dict[str, Any]:
         "attachment_names": attachment_names,
         "attachment_text": str(details.get("attachment_text") or "")[:8000],
         "apply_questions": extract_apply_questions(str(job.get("description") or "")),
+        "engagement": classify_engagement(
+            str(job.get("title") or ""),
+            str(job.get("description") or ""),
+            str(job.get("job_type") or ""),
+        ),
     }
 
 

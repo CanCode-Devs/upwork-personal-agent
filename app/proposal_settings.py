@@ -20,6 +20,12 @@ Posting apply items: if job.apply_questions is non-empty, add one labeled sectio
 Offer: a low-risk reason to start talking, only when the job is substantial
 Direct CTA: tell them what to send or do next. If a client timezone and working hours are provided, make availability specific to those. Do not invent hours"""
 
+DEFAULT_ROLE_LETTER_STRUCTURE = """Opening hook
+Role read: 1-2 lines showing you understood they are hiring a person for ongoing work, not a one-off build
+Fit: how you work vs their how-we-work (async, AI-with vs without, with a team)
+Proof: ONE similar seat or platform from the provided proof. Do not invent a delivery plan, architecture, or escrow stages
+Trial/CTA: answer their trial, start date, hours, or links ask. Do not invent hours"""
+
 DEFAULT_NEVER_SAY = """excited to apply
 would love to work
 perfect candidate
@@ -78,6 +84,7 @@ def default_writer_config() -> WriterConfig:
         enforce_opening_hook=bool(OPENING_HOOK.strip()),
         tone="consultative",
         letter_structure=DEFAULT_LETTER_STRUCTURE,
+        role_letter_structure=DEFAULT_ROLE_LETTER_STRUCTURE,
         must_include="",
         never_say=DEFAULT_NEVER_SAY,
         extra_instructions="",
@@ -120,6 +127,7 @@ def row_to_config(row: ProposalSettings) -> WriterConfig:
         enforce_opening_hook=bool(row.enforce_opening_hook),
         tone=row.tone or "consultative",
         letter_structure=row.letter_structure or DEFAULT_LETTER_STRUCTURE,
+        role_letter_structure=row.role_letter_structure or DEFAULT_ROLE_LETTER_STRUCTURE,
         must_include=row.must_include or "",
         never_say=row.never_say or "",
         extra_instructions=row.extra_instructions or "",
@@ -139,6 +147,7 @@ def apply_config_to_row(row: ProposalSettings, config: WriterConfig) -> None:
     row.enforce_opening_hook = config.enforce_opening_hook
     row.tone = config.tone
     row.letter_structure = config.letter_structure
+    row.role_letter_structure = config.role_letter_structure
     row.must_include = config.must_include
     row.never_say = config.never_say
     row.extra_instructions = config.extra_instructions
@@ -158,6 +167,9 @@ def get_or_create_proposal_settings(db: Session) -> ProposalSettings:
         row = ProposalSettings()
         apply_config_to_row(row, default_writer_config())
         db.add(row)
+        db.flush()
+    elif not (row.role_letter_structure or "").strip():
+        row.role_letter_structure = DEFAULT_ROLE_LETTER_STRUCTURE
         db.flush()
     return row
 
@@ -182,6 +194,13 @@ def reset_proposal_settings(db: Session) -> WriterConfig:
     return row_to_config(row)
 
 
+def reset_role_letter_structure(db: Session) -> WriterConfig:
+    row = get_or_create_proposal_settings(db)
+    row.role_letter_structure = DEFAULT_ROLE_LETTER_STRUCTURE
+    db.flush()
+    return row_to_config(row)
+
+
 def _lines(text: str) -> list[str]:
     return [line.strip() for line in (text or "").splitlines() if line.strip()]
 
@@ -199,12 +218,40 @@ def build_system_prompt(
     config: WriterConfig,
     profile: FreelancerProfile | None = None,
     style_rules: Sequence[str] | None = None,
+    engagement: str = "project",
 ) -> str:
+    role_hire = engagement == "role"
+    if role_hire:
+        goal = (
+            "Core goal: they are hiring a person for ongoing work, not buying a one-off build. "
+            "Show you understood the seat, how you work with a team and with AI, and one real proof. "
+            "Do not invent a product architecture, delivery plan, or escrow stages."
+        )
+        mix = "Mix roughly 40% role-read + how you work, 40% one real proof, 20% trial/start/CTA."
+        structure_text = config.role_letter_structure or DEFAULT_ROLE_LETTER_STRUCTURE
+    else:
+        goal = (
+            "Core goal: make the client think this person understands the problem, knows the difficult part, "
+            "already has a plan, and is worth a conversation. Sound like a technical expert presenting a solution, "
+            "not a freelancer asking for a job."
+        )
+        mix = "Mix roughly 70% client problem + how you would build it, 20% proof, 10% you + availability + CTA."
+        structure_text = config.letter_structure or DEFAULT_LETTER_STRUCTURE
     parts: list[str] = [
         "You write Upwork proposals for a technical freelancer.",
         "",
-        "Core goal: make the client think this person understands the problem, knows the difficult part, already has a plan, and is worth a conversation. Sound like a technical expert presenting a solution, not a freelancer asking for a job.",
+        goal,
+        "",
+        f"Engagement type: {engagement}.",
     ]
+    if role_hire:
+        parts.extend(
+            [
+                "",
+                "Do not write as if they posted a scoped build. Do not say you would design their platform this week. "
+                "Do not name a fake hardest-part of an architecture they did not ask you to deliver.",
+            ]
+        )
     if profile and profile.voice.strip():
         parts.extend(["", f"Voice: {profile.voice.strip()}"])
     parts.extend(["", f"Tone: {config.tone}."])
@@ -219,7 +266,7 @@ def build_system_prompt(
         )
     elif config.opening_hook.strip():
         parts.extend(["", "Suggested opening (optional):", config.opening_hook.strip()])
-    structure = _lines(config.letter_structure)
+    structure = _lines(structure_text)
     if structure:
         parts.extend(["", "Formula (use this order):"])
         for index, line in enumerate(structure, 1):
@@ -236,7 +283,7 @@ def build_system_prompt(
         parts.extend(["", "Posting apply items:", config.apply_questions_instructions.strip()])
     if config.screening_instructions.strip():
         parts.extend(["", "Screening questions:", config.screening_instructions.strip()])
-    if config.milestone_instructions.strip():
+    if config.milestone_instructions.strip() and not role_hire:
         parts.extend(["", "Milestones:", config.milestone_instructions.strip()])
     if config.target_words:
         parts.extend(["", f"Aim for about {config.target_words} words in the cover letter."])
@@ -249,7 +296,7 @@ def build_system_prompt(
     parts.extend(
         [
             "",
-            "Mix roughly 70% client problem + how you would build it, 20% proof, 10% you + availability + CTA.",
+            mix,
             "",
             JSON_OUTPUT_RULES,
         ]

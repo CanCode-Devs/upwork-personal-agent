@@ -10,9 +10,9 @@ from sqlalchemy.orm import Session
 from app.db.models import Job, UpworkApplication, UpworkProfile
 from app.embeddings import rebuild_portfolio_embeddings
 from app.events import add_event
-from app.models import WorkKind
+from app.models import JobStatus, WorkKind
 from app.tools.memory import prune_upwork_work, upsert_upwork_work
-from app.upwork.mcp_client import UpworkMcpClient
+from app.upwork.mcp_client import UpworkMcpClient, already_applied, job_ref_keys
 
 _UNTRUSTED = re.compile(r"</?untrusted_participant_content>\s*", re.IGNORECASE)
 
@@ -263,11 +263,35 @@ def _from_applications(payloads: list[Any]) -> list[dict[str, str]]:
     return found
 
 
+def mark_jobs_applied(db: Session, posting_ids: set[str], message: str) -> int:
+    keys: set[str] = set()
+    for posting_id in posting_ids:
+        keys |= job_ref_keys(posting_id)
+    if not keys:
+        return 0
+    changed = 0
+    open_statuses = {
+        JobStatus.pending_review.value,
+        JobStatus.submit_failed.value,
+        JobStatus.approved.value,
+    }
+    for job in db.query(Job).all():
+        if not (job_ref_keys(job.upwork_id) & keys):
+            continue
+        was_open = job.status in open_statuses
+        job.applied_on_upwork = True
+        if was_open:
+            job.status = JobStatus.submitted.value
+            add_event(db, "submitted", message, job.id)
+        changed += 1
+    return changed
+
+
 def upsert_applications(db: Session, rows: list[dict[str, str]]) -> int:
     keep: set[str] = set()
     for row in rows:
         posting_id = row["posting_id"]
-        keep.add(posting_id)
+        keep.update(job_ref_keys(posting_id))
         existing = db.query(UpworkApplication).filter(UpworkApplication.posting_id == posting_id).one_or_none()
         if existing is None:
             existing = UpworkApplication(posting_id=posting_id)
@@ -276,12 +300,7 @@ def upsert_applications(db: Session, rows: list[dict[str, str]]) -> int:
         existing.status = row["status"]
         existing.rate = row["rate"]
         existing.synced_at = datetime.now(UTC)
-    if keep:
-        stale = db.query(UpworkApplication).filter(~UpworkApplication.posting_id.in_(keep)).all()
-        for item in stale:
-            db.delete(item)
-    for job in db.query(Job).all():
-        job.applied_on_upwork = job.upwork_id in keep or job.status == "submitted"
+    mark_jobs_applied(db, keep, "Matched an Upwork proposal")
     return len(keep)
 
 

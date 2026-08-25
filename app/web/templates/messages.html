@@ -1,0 +1,219 @@
+{% extends "base.html" %}
+{% block title %}{% if room %}{{ room.counterpart or room.title }} · Messages{% else %}Messages · {{ app_name }}{% endif %}{% endblock %}
+{% block body_class %}chat-mode{% endblock %}
+{% block content %}
+<div class="chat">
+  <aside class="chat-list">
+    <div class="chat-list-head">
+      <h1>Messages</h1>
+      <p class="sub">Poll now also refreshes chats.</p>
+    </div>
+    <div class="chat-list-scroll">
+      {% if rooms %}
+        {% for item in rooms %}
+        <a class="chat-row{% if room and room.room_id == item.room_id %} on{% endif %}" href="/messages/{{ item.room_id }}">
+          <span class="avatar" style="background: hsl({{ item.avatar_hue }}, 42%, 52%)">{{ item.initials }}</span>
+          <span class="chat-row-body">
+            <span class="chat-row-top">
+              <span class="chat-row-name">{{ item.counterpart or item.title }}</span>
+              {% if item.last_ago %}<span class="chat-row-time">{{ item.last_ago }}</span>{% endif %}
+            </span>
+            <span class="chat-row-snippet">{{ item.snippet }}</span>
+            <span class="chat-row-meta">
+              {% if item.context_type %}<span class="chip">{{ item.context_type }}</span>{% endif %}
+              {% if item.unread %}<span class="badge pending_review">{{ item.unread }} unread</span>{% endif %}
+            </span>
+          </span>
+        </a>
+        {% endfor %}
+      {% else %}
+        <p class="chat-list-empty">No chats yet. Refresh after a client messages you, or run Poll now.</p>
+      {% endif %}
+    </div>
+  </aside>
+
+  <section class="chat-pane">
+    {% if room %}
+    <header class="chat-head">
+      <div>
+        <div class="chat-head-name">{{ room.counterpart or room.title }}</div>
+        <div class="chat-head-sub">
+          {% if room.context_type %}<span class="chip">{{ room.context_type }}</span>{% endif %}
+          {% if room.last_ago %}<span>{{ room.last_ago }}</span>{% endif %}
+          {% if room.related_job_id %}<a href="/jobs/{{ room.related_job_id }}">Related job</a>{% endif %}
+        </div>
+      </div>
+      <form method="post" action="/messages/sync">
+        <input type="hidden" name="next" value="{{ room.room_id }}">
+        <button class="btn secondary" type="submit">Refresh chats</button>
+      </form>
+    </header>
+
+    <div class="chat-transcript" id="chat-transcript">
+      {% if messages %}
+        {% for item in messages %}
+          {% if item.show_day %}<div class="day-sep">{{ item.day_label }}</div>{% endif %}
+          <div class="bubble {{ item.sender }}{% if item.grouped %} grouped{% endif %}">
+            {% if not item.grouped and item.sender != 'system' %}
+            <div class="bubble-meta">{% if item.sender == 'you' %}You{% else %}Client{% endif %}</div>
+            {% endif %}
+            <div class="bubble-body{% if item.is_long %} clamp{% endif %}" data-long="{{ '1' if item.is_long else '0' }}">{{ item.body }}</div>
+            {% if item.is_long %}<button type="button" class="show-more">Show more</button>{% endif %}
+            {% for file in item.attachments %}
+            <span class="file-chip">{% if file.url %}<a href="{{ file.url }}" target="_blank" rel="noreferrer">{{ file.name }}</a>{% else %}{{ file.name }}{% endif %}</span>
+            {% endfor %}
+            {% if item.sent_ago and item.show_time %}<div class="bubble-time">{{ item.sent_ago }}</div>{% endif %}
+          </div>
+        {% endfor %}
+      {% else %}
+        <p class="chat-empty-copy">No messages in this room yet. If this is a proposal, wait until the client writes first.</p>
+      {% endif %}
+    </div>
+
+    <div class="composer">
+      {% if request.query_params.get('sent') %}
+      <div class="banner ok compact">Message sent on Upwork.</div>
+      {% elif request.query_params.get('draft') %}
+      <div class="banner ok compact">Suggested reply ready. Edit it, then Send.</div>
+      {% elif synced %}
+      <div class="banner ok compact">Chats updated from Upwork.</div>
+      {% elif error == 'first' %}
+      <div class="banner compact">The client has to message first on a proposal thread.</div>
+      {% elif error == 'connect' %}
+      <div class="banner compact">Upwork login expired. <a class="btn" href="/upwork/connect?force=1">Connect Upwork</a></div>
+      {% elif error == 'empty' %}
+      <div class="banner compact">Add a message or a file.</div>
+      {% elif error == 'long' %}
+      <div class="banner compact">Keep the message under 10,240 characters.</div>
+      {% elif error == 'suggest' %}
+      <div class="banner compact">Could not draft a suggested reply.</div>
+      {% elif error == 'sync' %}
+      <div class="banner compact">Could not refresh chats.</div>
+      {% elif error == 'send' %}
+      <div class="banner compact">Send failed. {{ room.send_error }}</div>
+      {% elif room.send_error %}
+      <div class="banner compact">{{ room.send_error }}</div>
+      {% endif %}
+
+      <div class="intent-row">
+        <form method="post" action="/messages/{{ room.room_id }}/suggest">
+          <button class="btn ghost" type="submit">Suggest reply</button>
+        </form>
+        {% if room.suggested_intents %}
+        <script type="application/json" id="intent-data">{{ room.suggested_intents | tojson }}</script>
+        {% for intent in room.suggested_intents %}
+        <button type="button" class="intent-chip{% if intent.text == room.suggested_text %} selected{% endif %}" data-kind="{{ intent.kind }}">{{ intent.label }}</button>
+        {% endfor %}
+        {% endif %}
+      </div>
+      <form method="post" action="/messages/{{ room.room_id }}/send" enctype="multipart/form-data" class="send-form">
+        <label for="body" class="sr-only">Your message</label>
+        <textarea id="body" name="body" rows="2" maxlength="10240" placeholder="Write a reply…">{{ room.suggested_text }}</textarea>
+        <div class="file-chips" id="file-chips"></div>
+        <div class="composer-row">
+          <button type="button" class="btn secondary" id="copy-reply">Copy</button>
+          <label class="btn secondary file-btn">Attach
+            <input type="file" name="chat_files" id="chat-files" multiple>
+          </label>
+          <span class="char-count" id="char-count">0 / 10240</span>
+          <button class="btn" type="submit" {% if not room.can_send or room.client_first_required or room.send_status == 'sending' %}disabled{% endif %}>
+            {% if room.send_status == 'sending' %}Sending…{% else %}Send{% endif %}
+          </button>
+        </div>
+        {% if room.client_first_required %}
+        <p class="composer-note">The client has to message first on a proposal thread.</p>
+        {% elif not room.can_send and room.send_status != 'sending' %}
+        <p class="composer-note">Sending is disabled for this room.</p>
+        {% endif %}
+      </form>
+    </div>
+    {% else %}
+    <div class="chat-empty">
+      {% if error == 'connect' or not connected %}
+      <p>Connect Upwork to load chats.</p>
+      <a class="btn" href="/upwork/connect">Connect Upwork</a>
+      {% elif error == 'sync' %}
+      <p>Could not refresh chats. Try again or check History.</p>
+      {% elif synced %}
+      <p>Chats updated. Pick a thread on the left.</p>
+      {% elif rooms %}
+      <p>Select a conversation</p>
+      <span>Replies send to Upwork only after you click Send.</span>
+      {% else %}
+      <p>No chat rooms yet.</p>
+      <span>Refresh after a client messages you, or run Poll now.</span>
+      {% endif %}
+      <form method="post" action="/messages/sync" class="empty-refresh">
+        <button class="btn secondary" type="submit">Refresh chats</button>
+      </form>
+    </div>
+    {% endif %}
+  </section>
+</div>
+<script>
+(function () {
+  const transcript = document.getElementById("chat-transcript");
+  if (transcript) transcript.scrollTop = transcript.scrollHeight;
+
+  const body = document.getElementById("body");
+  const count = document.getElementById("char-count");
+  function grow() {
+    if (!body) return;
+    body.style.height = "auto";
+    body.style.height = Math.min(body.scrollHeight, 200) + "px";
+    if (count) count.textContent = (body.value || "").length + " / 10240";
+  }
+  if (body) {
+    body.addEventListener("input", grow);
+    grow();
+  }
+
+  const intentData = document.getElementById("intent-data");
+  let intents = [];
+  if (intentData) {
+    try { intents = JSON.parse(intentData.textContent || "[]"); } catch (err) { intents = []; }
+  }
+  document.querySelectorAll(".intent-chip").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      const kind = btn.getAttribute("data-kind");
+      const intent = intents.find(function (item) { return item.kind === kind; });
+      if (!intent || !body) return;
+      body.value = intent.text || "";
+      grow();
+      document.querySelectorAll(".intent-chip").forEach(function (chip) { chip.classList.remove("selected"); });
+      btn.classList.add("selected");
+    });
+  });
+
+  const copy = document.getElementById("copy-reply");
+  if (copy && body) {
+    copy.addEventListener("click", function () {
+      navigator.clipboard.writeText(body.value || "");
+    });
+  }
+
+  const files = document.getElementById("chat-files");
+  const chips = document.getElementById("file-chips");
+  if (files && chips) {
+    files.addEventListener("change", function () {
+      chips.innerHTML = "";
+      Array.from(files.files || []).forEach(function (file) {
+        const chip = document.createElement("span");
+        chip.className = "file-chip";
+        chip.textContent = file.name;
+        chips.appendChild(chip);
+      });
+    });
+  }
+
+  document.querySelectorAll(".show-more").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      const target = btn.previousElementSibling;
+      if (!target) return;
+      const open = target.classList.toggle("clamp");
+      btn.textContent = open ? "Show more" : "Show less";
+    });
+  });
+})();
+</script>
+{% endblock %}

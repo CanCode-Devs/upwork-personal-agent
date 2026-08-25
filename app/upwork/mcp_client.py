@@ -6,6 +6,7 @@ import json
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 import httpx2
@@ -19,6 +20,46 @@ from app.models import ApplyHighlight, ConnectsPanel, JobPayload, McpStatus, Pro
 from app.proposal_writer import clean_screening_question
 from app.upwork.oauth import build_oauth_provider
 from app.upwork.token_store import token_storage
+
+
+def format_mcp_error(exc: BaseException) -> str:
+    parts: list[str] = []
+    seen: set[int] = set()
+
+    def is_wrapper(err: BaseException) -> bool:
+        name = type(err).__name__
+        if name in {"ExceptionGroup", "BaseExceptionGroup", "TaskGroupError"}:
+            return True
+        text = str(err).strip().lower()
+        return "unhandled errors in a taskgroup" in text
+
+    def walk(err: BaseException) -> None:
+        if id(err) in seen:
+            return
+        seen.add(id(err))
+        nested = getattr(err, "exceptions", None)
+        if nested:
+            for item in nested:
+                if isinstance(item, BaseException):
+                    walk(item)
+            if is_wrapper(err):
+                return
+        text = str(err).strip()
+        if is_wrapper(err) or not text:
+            cause = err.__cause__ or err.__context__
+            if isinstance(cause, BaseException):
+                walk(cause)
+            return
+        if text not in parts:
+            parts.append(text)
+
+    walk(exc)
+    return "; ".join(parts) or type(exc).__name__
+
+
+def oauth_needs_login(message: str) -> bool:
+    lower = (message or "").lower()
+    return "interactive oauth" in lower or "connect from the dashboard" in lower
 
 
 def _sanitize_list_tools_raw(raw: Any) -> dict[str, Any]:
@@ -73,6 +114,44 @@ def _as_dict(value: Any) -> dict[str, Any]:
         if isinstance(dumped, dict):
             return dumped
     return {}
+
+
+def public_job_url(value: str | None) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"(~0[12]\d+)", text)
+    if match:
+        return f"https://www.upwork.com/jobs/{match.group(1)}"
+    digits = re.search(r"(?:/jobs/)?(\d{10,})", text)
+    if digits:
+        return f"https://www.upwork.com/jobs/~02{digits.group(1)}"
+    if text.startswith("http"):
+        return text
+    return f"https://www.upwork.com/jobs/{text}"
+
+
+def job_ref_keys(value: str | None) -> set[str]:
+    text = (value or "").strip()
+    keys = {text} if text else set()
+    if text.startswith("~0") and len(text) > 3 and text[3:].isdigit():
+        keys.add(text[3:])
+    elif text.isdigit():
+        keys.add(f"~02{text}")
+        keys.add(f"~01{text}")
+    return keys
+
+
+def already_applied(message: str) -> bool:
+    lower = (message or "").lower()
+    return (
+        "vj-ja-10" in lower
+        or "already applied" in lower
+        or "already have a proposal" in lower
+        or "existing proposal" in lower
+        or "prior proposal" in lower
+        or "invitation exists" in lower
+    )
 
 
 def _tool_text(result: Any) -> str:
@@ -258,6 +337,24 @@ def _first_date(*values: Any) -> str:
         text = _clean_text(value)
         if text:
             return text.split("T", 1)[0][:10]
+    return ""
+
+
+def _iso_datetime(*values: Any) -> str:
+    for value in values:
+        text = _clean_text(value)
+        if not text:
+            continue
+        normalized = text.replace("Z", "+00:00")
+        if re.search(r"[+-]\d{4}$", normalized):
+            normalized = normalized[:-2] + ":" + normalized[-2:]
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC).isoformat()
     return ""
 
 
@@ -556,6 +653,19 @@ def _client_blob(raw: dict[str, Any]) -> dict[str, Any]:
         "can_apply": raw.get("can_apply"),
         "search_client": search_client,
     }
+    posted = _iso_datetime(
+        raw.get("published_date"),
+        raw.get("publishedDate"),
+        posting.get("publishedDateTime"),
+        posting.get("publishedOn"),
+        content.get("publishedDateTime"),
+        raw.get("created_date"),
+        raw.get("createdDate"),
+        posting.get("createdDateTime"),
+        content.get("createdDateTime"),
+    )
+    if posted:
+        blob["published_date"] = posted
     if hire_rate is not None:
         blob["hire_rate"] = hire_rate
     if avg_hourly is not None:
@@ -582,6 +692,11 @@ def normalize_job(raw: dict[str, Any]) -> JobPayload | None:
     title = blob.get("title") or _clean_text(_pick(raw, "title", "jobTitle") or "")
     if not job_id or not title:
         return None
+    posting = raw.get("data", {}).get("marketplaceJobPosting") if isinstance(raw.get("data"), dict) else {}
+    if not isinstance(posting, dict):
+        posting = raw.get("marketplaceJobPosting") if isinstance(raw.get("marketplaceJobPosting"), dict) else {}
+    cipher = str(_pick(raw, "ciphertext") or posting.get("ciphertext") or "")
+    link = public_job_url(cipher or str(job_id))
     job_type = str(blob.get("job_type") or "")
     hourly_min = blob.get("hourly_min") if isinstance(blob.get("hourly_min"), (int, float)) else None
     hourly_max = blob.get("hourly_max") if isinstance(blob.get("hourly_max"), (int, float)) else None
@@ -599,7 +714,7 @@ def normalize_job(raw: dict[str, Any]) -> JobPayload | None:
         "title": str(title),
         "description": str(blob.get("description") or ""),
         "raw": json.dumps(raw, default=str),
-        "url": f"https://www.upwork.com/jobs/{job_id}",
+        "url": link,
         "budget": price,
         "price_label": price,
         "timezone": str(blob.get("timezone") or ""),
@@ -851,6 +966,23 @@ def parse_connects_balance(value: Any) -> int | None:
     return None
 
 
+def connects_required_from_text(text: str) -> int | None:
+    if not text:
+        return None
+    match = re.search(r"costs?\s+(\d+)\s+Connects", text, re.I)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"need\s+(\d+)", text, re.I)
+    if match and "connect" in text.lower():
+        return int(match.group(1))
+    return None
+
+
+def connects_shortage(text: str) -> bool:
+    lower = (text or "").lower()
+    return "enough connects" in lower or "don't have enough" in lower
+
+
 def parse_proposal_preview(raw: Any) -> ConnectsPanel:
     payload = _as_dict(raw)
     preview = payload.get("preview") if isinstance(payload.get("preview"), dict) else payload
@@ -863,12 +995,29 @@ def parse_proposal_preview(raw: Any) -> ConnectsPanel:
     top_bids = [_as_int(item) for item in raw_bids] if isinstance(raw_bids, list) else []
     bids = [item for item in top_bids if item is not None]
     boost_available = bool(boost) and boost.get("available") is not False and boost.get("recommendation") != "skip"
+    error = ""
+    for key in ("error", "message", "detail"):
+        found = payload.get(key) or preview.get(key)
+        if found:
+            error = str(found).strip()
+            break
+    blob = json.dumps(payload, default=str)
+    if isinstance(raw, str) and not payload:
+        error = raw[:2000]
+        blob = raw
+    if not error and connects_shortage(blob):
+        error = blob[:2000]
+    required = connects_required_from_text(error or blob)
+    if required is not None:
+        apply_cost = required
     remaining = None
     if available is not None and apply_cost is not None:
         remaining = available - apply_cost
     charged = preview.get("charged_amount")
     charged_amount = float(charged) if isinstance(charged, (int, float)) else None
     can_apply = preview.get("can_apply")
+    if connects_shortage(error) or (remaining is not None and remaining < 0):
+        can_apply = False
     return ConnectsPanel(
         available=available,
         apply_cost=apply_cost,
@@ -880,6 +1029,7 @@ def parse_proposal_preview(raw: Any) -> ConnectsPanel:
         bid_count=len(bids),
         bids_unknown=boost.get("current_top_bids_available") is False,
         rationale=str(boost.get("rationale") or ""),
+        error=error if isinstance(error, str) else "",
         charged_amount=charged_amount,
         remaining_after_apply=remaining,
         milestones_allowed=preview.get("milestones_allowed") is True,
@@ -966,6 +1116,74 @@ def _file_uids(raw: Any) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+def _write_draft(payload: dict[str, Any]) -> tuple[str, str]:
+    data = payload
+    nested = payload.get("preview") if isinstance(payload.get("preview"), dict) else None
+    inner = payload.get("data") if isinstance(payload.get("data"), dict) else None
+    for blob in (payload, nested, inner):
+        item = _as_dict(blob)
+        draft_id = _first_str(item, "draft_id", "draftId")
+        kind = _first_str(item, "type", "draft_type", "entity_type")
+        if draft_id:
+            return draft_id, kind
+    return "", ""
+
+
+def _looks_sent(payload: dict[str, Any], text: str) -> bool:
+    status = str(payload.get("status") or "").lower()
+    if status in {"ok", "success", "sent"} and payload.get("draft_id"):
+        return False
+    if status == "sent":
+        return True
+    story = str(payload.get("story_id") or payload.get("id") or "")
+    if story.startswith("story_"):
+        return True
+    return False
+
+
+def _rooms_page(payload: Any) -> tuple[list[dict[str, Any]], str, bool]:
+    data = payload
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+        data = payload["data"]
+    blob = _as_dict(data)
+    raw = blob.get("rooms")
+    if not isinstance(raw, list):
+        raw = blob.get("items") if isinstance(blob.get("items"), list) else []
+    rooms = [item for item in raw if isinstance(item, dict)]
+    cursor = ""
+    more = False
+    if isinstance(payload, dict):
+        cursor = str(payload.get("next_cursor") or payload.get("cursor") or "")
+        more = bool(payload.get("hasMore") or payload.get("has_more"))
+    if not cursor:
+        cursor = str(blob.get("next_cursor") or "")
+    if not more:
+        more = bool(blob.get("hasMore") or blob.get("has_more"))
+    return rooms, cursor, more
+
+
+def _stories_page(payload: Any) -> list[dict[str, Any]]:
+    data = payload
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+        data = payload["data"]
+    blob = _as_dict(data)
+    stories = blob.get("roomStories") or blob.get("room_stories") or blob.get("messages")
+    if isinstance(stories, dict):
+        edges = stories.get("edges")
+        if isinstance(edges, list):
+            nodes: list[dict[str, Any]] = []
+            for edge in edges:
+                node = _as_dict(edge).get("node") if isinstance(edge, dict) else None
+                if isinstance(node, dict):
+                    nodes.append(node)
+                elif isinstance(edge, dict) and edge.get("id"):
+                    nodes.append(edge)
+            return nodes
+    if isinstance(stories, list):
+        return [item for item in stories if isinstance(item, dict)]
+    return []
+
+
 class UpworkMcpClient:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
@@ -1009,7 +1227,7 @@ class UpworkMcpClient:
                 names = [getattr(tool, "name", "") for tool in listed]
                 return McpStatus(connected=True, tools=names, error="")
         except Exception as exc:
-            return McpStatus(connected=False, tools=[], error=str(exc))
+            return McpStatus(connected=False, tools=[], error=format_mcp_error(exc))
 
     async def login(
         self,
@@ -1132,15 +1350,18 @@ class UpworkMcpClient:
         return enriched
 
     async def get_connects_balance(self) -> int | None:
-        async with self._session(interactive=False) as session:
-            await list_session_tools(session)
-            org_uid = await self._resolve_org_uid(session)
-            result = await call_session_tool(
-                session,
-                "upwork__get_freelancer_financials",
-                {"action": "connects_balance", "org_uid": org_uid, "params": {}},
-            )
-            return parse_connects_balance(_parse_jsonish(_tool_text(result)))
+        try:
+            async with self._session(interactive=False) as session:
+                await list_session_tools(session)
+                org_uid = await self._resolve_org_uid(session)
+                result = await call_session_tool(
+                    session,
+                    "upwork__get_freelancer_financials",
+                    {"action": "connects_balance", "org_uid": org_uid, "params": {}},
+                )
+                return parse_connects_balance(_parse_jsonish(_tool_text(result)))
+        except Exception:
+            return None
 
     async def preview_proposal(
         self,
@@ -1149,46 +1370,45 @@ class UpworkMcpClient:
         charged_amount: float,
         boost_connects: int = 0,
     ) -> ConnectsPanel:
-        async with self._session(interactive=False) as session:
-            await list_session_tools(session)
-            org_uid = await self._resolve_org_uid(session)
-            try:
-                balance = parse_connects_balance(
-                    _parse_jsonish(
-                        _tool_text(
-                            await call_session_tool(
-                                session,
-                                "upwork__get_freelancer_financials",
-                                {"action": "connects_balance", "org_uid": org_uid, "params": {}},
-                            )
-                        )
-                    )
-                )
-            except Exception:
-                balance = None
-            if not cover_letter.strip():
-                return ConnectsPanel(available=balance, charged_amount=charged_amount, error="Cover letter is empty")
-            params: dict[str, Any] = {
-                "job_reference": job_id,
-                "cover_letter": cover_letter[:5000],
-                "charged_amount": charged_amount,
-            }
-            if boost_connects > 0:
-                params["boost_connects"] = boost_connects
-            try:
+        balance = await self.get_connects_balance()
+        if not cover_letter.strip():
+            return ConnectsPanel(available=balance, charged_amount=charged_amount, error="Cover letter is empty")
+        try:
+            async with self._session(interactive=False) as session:
+                await list_session_tools(session)
+                org_uid = await self._resolve_org_uid(session)
+                params: dict[str, Any] = {
+                    "job_reference": job_id,
+                    "cover_letter": cover_letter[:5000],
+                    "charged_amount": charged_amount,
+                }
+                if boost_connects > 0:
+                    params["boost_connects"] = boost_connects
                 result = await call_session_tool(
                     session,
                     "upwork__manage_proposals",
                     {"action": "create", "org_uid": org_uid, "params": params},
                 )
-            except Exception as exc:
-                return ConnectsPanel(available=balance, charged_amount=charged_amount, error=str(exc))
             panel = parse_proposal_preview(_parse_jsonish(_tool_text(result)))
             if panel.available is None:
                 panel.available = balance
             if panel.charged_amount is None:
                 panel.charged_amount = charged_amount
             return panel
+        except Exception as exc:
+            detail = format_mcp_error(exc)
+            required = connects_required_from_text(detail)
+            remaining = None
+            if balance is not None and required is not None:
+                remaining = balance - required
+            return ConnectsPanel(
+                available=balance,
+                apply_cost=required,
+                can_apply=False if connects_shortage(detail) or (remaining is not None and remaining < 0) else None,
+                charged_amount=charged_amount,
+                error=detail,
+                remaining_after_apply=remaining,
+            )
 
     async def list_highlights(self) -> list[ApplyHighlight]:
         async with self._session(interactive=False) as session:
@@ -1202,19 +1422,33 @@ class UpworkMcpClient:
             return parse_highlights(_parse_jsonish(_tool_text(result)))
 
     async def upload_proposal_files(self, files: list[tuple[str, bytes, str]]) -> list[str]:
+        uploaded = await self.upload_files(files, context="proposals")
+        return [item["file_id"] for item in uploaded if item.get("file_id")]
+
+    async def upload_files(
+        self,
+        files: list[tuple[str, bytes, str]],
+        *,
+        context: str = "proposals",
+        room_id: str = "",
+    ) -> list[dict[str, str]]:
         if not files:
             return []
         async with self._session(interactive=False) as session:
             await list_session_tools(session)
             org_uid = await self._resolve_org_uid(session)
+            params: dict[str, Any] = {
+                "context": context,
+                "reason": "Dashboard file upload",
+            }
+            if context == "messages":
+                if not room_id:
+                    raise RuntimeError("Message attachments need a room_id")
+                params["room_id"] = room_id
             started = await call_session_tool(
                 session,
                 "upwork__start_attachment_upload",
-                {
-                    "action": "upload",
-                    "org_uid": org_uid,
-                    "params": {"context": "proposals", "reason": "Proposal attachments from dashboard"},
-                },
+                {"action": "upload", "org_uid": org_uid, "params": params},
             )
             parsed = _as_dict(_parse_jsonish(_tool_text(started)))
             nested = parsed.get("preview") if isinstance(parsed.get("preview"), dict) else parsed
@@ -1258,16 +1492,149 @@ class UpworkMcpClient:
                 uids = _file_uids(_parse_jsonish(_tool_text(status)))
             if not uids:
                 raise RuntimeError(_tool_text(stored) or "Upwork did not return file ids for the upload")
+            confirm_params: dict[str, Any] = {"context": context, "file_ids": uids}
+            if context == "messages":
+                confirm_params["room_id"] = room_id
             await call_session_tool(
                 session,
                 "upwork__confirm_attachment_upload",
+                {"action": "confirm", "org_uid": org_uid, "params": confirm_params},
+            )
+            refs: list[dict[str, str]] = []
+            for index, uid in enumerate(uids):
+                name = files[index][0] if index < len(files) else uid
+                refs.append({"file_id": uid, "file_name": name})
+            return refs
+
+    async def list_message_rooms(self, *, max_rooms: int = 40) -> list[dict[str, Any]]:
+        collected: list[dict[str, Any]] = []
+        cursor = ""
+        async with self._session(interactive=False) as session:
+            await list_session_tools(session)
+            org_uid = await self._resolve_org_uid(session)
+            for _ in range(8):
+                params: dict[str, Any] = {"limit": 10, "room_type": "ALL"}
+                if cursor:
+                    params["cursor"] = cursor
+                result = await call_session_tool(
+                    session,
+                    "upwork__get_messages",
+                    {"action": "list_rooms", "org_uid": org_uid, "params": params},
+                )
+                payload = _parse_jsonish(_tool_text(result))
+                rooms, next_cursor, has_more = _rooms_page(payload)
+                collected.extend(rooms)
+                if len(collected) >= max_rooms or not has_more or not next_cursor:
+                    break
+                cursor = next_cursor
+        return collected[:max_rooms]
+
+    async def list_room_messages(self, room_id: str, *, limit: int = 40) -> list[dict[str, Any]]:
+        async with self._session(interactive=False) as session:
+            await list_session_tools(session)
+            org_uid = await self._resolve_org_uid(session)
+            result = await call_session_tool(
+                session,
+                "upwork__get_messages",
                 {
-                    "action": "confirm",
+                    "action": "list_messages",
                     "org_uid": org_uid,
-                    "params": {"context": "proposals", "file_ids": uids},
+                    "params": {"room_id": room_id, "limit": min(100, max(1, limit))},
                 },
             )
-            return uids
+            return _stories_page(_parse_jsonish(_tool_text(result)))
+
+    async def find_message_room(self, context_type: str, context_id: str) -> dict[str, Any] | None:
+        async with self._session(interactive=False) as session:
+            await list_session_tools(session)
+            org_uid = await self._resolve_org_uid(session)
+            result = await call_session_tool(
+                session,
+                "upwork__get_messages",
+                {
+                    "action": "find_room",
+                    "org_uid": org_uid,
+                    "params": {"context_type": context_type, "context_id": context_id},
+                },
+            )
+            parsed = _as_dict(_parse_jsonish(_tool_text(result)))
+            data = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
+            room = data.get("room") if isinstance(data, dict) else None
+            if isinstance(room, dict):
+                return room
+            rooms = data.get("rooms") if isinstance(data, dict) else None
+            if isinstance(rooms, list) and rooms and isinstance(rooms[0], dict):
+                return rooms[0]
+            return None
+
+    async def send_room_message(
+        self,
+        room_id: str,
+        message: str,
+        attachments: list[dict[str, str]] | None = None,
+    ) -> str:
+        outcome = ""
+        try:
+            async with self._session(interactive=False) as session:
+                await list_session_tools(session)
+                org_uid = await self._resolve_org_uid(session)
+                params: dict[str, Any] = {"room_id": room_id}
+                text = message.strip()
+                if text:
+                    params["message"] = text[:10240]
+                files = [item for item in (attachments or []) if item.get("file_id")]
+                if files:
+                    packed: list[dict[str, str]] = []
+                    for item in files:
+                        row: dict[str, str] = {
+                            "file_id": item["file_id"],
+                            "file_name": item.get("file_name") or item["file_id"],
+                        }
+                        if item.get("image_id"):
+                            row["image_id"] = item["image_id"]
+                        packed.append(row)
+                    params["file_attachments"] = packed
+                if not params.get("message") and not params.get("file_attachments"):
+                    raise RuntimeError("Message is empty")
+                created = await call_session_tool(
+                    session,
+                    "upwork__send_message",
+                    {"action": "send", "org_uid": org_uid, "params": params},
+                )
+                created_text = _tool_text(created)
+                parsed = _as_dict(_parse_jsonish(created_text))
+                draft_id, draft_type = _write_draft(parsed)
+                if not draft_id:
+                    if _looks_sent(parsed, created_text):
+                        outcome = created_text or "sent"
+                        return outcome
+                    raise RuntimeError(created_text or "Upwork did not return a message draft")
+                types = [draft_type] if draft_type else []
+                for fallback in ("message", "send_message", "room_message"):
+                    if fallback not in types:
+                        types.append(fallback)
+                last_error = ""
+                for kind in types:
+                    try:
+                        confirmed = await call_session_tool(
+                            session,
+                            "upwork__confirm_draft",
+                            {
+                                "action": "confirm",
+                                "org_uid": org_uid,
+                                "params": {"type": kind, "draft_id": draft_id},
+                            },
+                        )
+                        outcome = _tool_text(confirmed) or "sent"
+                        return outcome
+                    except Exception as exc:
+                        last_error = format_mcp_error(exc)
+                        continue
+                raise RuntimeError(last_error or created_text or "Could not confirm the message draft")
+        except Exception as exc:
+            if outcome:
+                return outcome
+            raise RuntimeError(format_mcp_error(exc)) from exc
 
     async def submit_proposal(
         self,
@@ -1281,77 +1648,94 @@ class UpworkMcpClient:
         certificate_ids: list[str] | None = None,
         attachments: list[str] | None = None,
     ) -> str:
-        async with self._session(interactive=False) as session:
-            await list_session_tools(session)
-            org_uid = await self._resolve_org_uid(session)
-            params: dict[str, Any] = {
-                "job_reference": job_id,
-                "cover_letter": cover_letter[:5000],
-                "charged_amount": charged_amount,
-            }
-            if boost_connects > 0:
-                params["boost_connects"] = boost_connects
-            if answers:
-                params["answers"] = [
-                    {"question": item.question, "answer": item.answer}
-                    for item in answers
-                    if item.question.strip() and item.answer.strip()
-                ]
-            if portfolio_project_ids:
-                params["portfolio_project_ids"] = [item for item in portfolio_project_ids if item]
-            if certificate_ids:
-                params["certificate_ids"] = [item for item in certificate_ids if item]
-            if attachments:
-                params["attachments"] = [item for item in attachments if item]
-            created = await call_session_tool(
-                session,
-                "upwork__manage_proposals",
-                {"action": "create", "org_uid": org_uid, "params": params},
-            )
-            parsed = _as_dict(_parse_jsonish(_tool_text(created)))
-            preview = parse_proposal_preview(parsed)
-            apply_cost = preview.apply_cost or 0
-            available = preview.available
-            total = apply_cost + max(0, boost_connects)
-            if available is not None and total > available:
-                raise RuntimeError(f"Not enough Connects: need {total}, have {available}")
-            draft_id = str(parsed.get("draft_id") or "")
-            if not draft_id:
-                raise RuntimeError(_tool_text(created) or "Upwork did not return a proposal draft")
-            milestone_payload = mcp_milestone_params(milestones or [])
-            attached = 0
-            if milestone_payload and preview.milestones_allowed:
-                updated = await call_session_tool(
+        outcome = ""
+        try:
+            async with self._session(interactive=False) as session:
+                await list_session_tools(session)
+                org_uid = await self._resolve_org_uid(session)
+                params: dict[str, Any] = {
+                    "job_reference": job_id,
+                    "cover_letter": cover_letter[:5000],
+                    "charged_amount": charged_amount,
+                }
+                if boost_connects > 0:
+                    params["boost_connects"] = boost_connects
+                if answers:
+                    params["answers"] = [
+                        {"question": item.question, "answer": item.answer}
+                        for item in answers
+                        if item.question.strip() and item.answer.strip()
+                    ]
+                if portfolio_project_ids:
+                    params["portfolio_project_ids"] = [item for item in portfolio_project_ids if item]
+                if certificate_ids:
+                    params["certificate_ids"] = [item for item in certificate_ids if item]
+                if attachments:
+                    params["attachments"] = [item for item in attachments if item]
+                created = await call_session_tool(
                     session,
-                    "upwork__update_draft",
-                    {
-                        "action": "update",
-                        "org_uid": org_uid,
-                        "params": {
-                            "type": "proposal",
-                            "id": draft_id,
-                            "content": {"milestones": milestone_payload},
-                            "mode": "merge",
+                    "upwork__manage_proposals",
+                    {"action": "create", "org_uid": org_uid, "params": params},
+                )
+                created_text = _tool_text(created)
+                if already_applied(created_text):
+                    outcome = "already_applied"
+                    return outcome
+                parsed = _as_dict(_parse_jsonish(created_text))
+                preview = parse_proposal_preview(parsed)
+                if already_applied(preview.error):
+                    outcome = "already_applied"
+                    return outcome
+                apply_cost = preview.apply_cost or 0
+                available = preview.available
+                total = apply_cost + max(0, boost_connects)
+                if available is not None and total > available:
+                    raise RuntimeError(f"Not enough Connects: need {total}, have {available}")
+                draft_id = str(parsed.get("draft_id") or "")
+                if not draft_id:
+                    raise RuntimeError(created_text or "Upwork did not return a proposal draft")
+                milestone_payload = mcp_milestone_params(milestones or [])
+                attached = 0
+                if milestone_payload and preview.milestones_allowed:
+                    updated = await call_session_tool(
+                        session,
+                        "upwork__update_draft",
+                        {
+                            "action": "update",
+                            "org_uid": org_uid,
+                            "params": {
+                                "type": "proposal",
+                                "id": draft_id,
+                                "content": {"milestones": milestone_payload},
+                                "mode": "merge",
+                            },
                         },
+                    )
+                    updated_parsed = _as_dict(_parse_jsonish(_tool_text(updated)))
+                    new_id = str(updated_parsed.get("draft_id") or "")
+                    if not new_id:
+                        raise RuntimeError(_tool_text(updated) or "Upwork did not return an updated proposal draft")
+                    draft_id = new_id
+                    attached = len(milestone_payload)
+                confirmed = await call_session_tool(
+                    session,
+                    "upwork__confirm_draft",
+                    {
+                        "action": "confirm",
+                        "org_uid": org_uid,
+                        "params": {"type": "proposal", "draft_id": draft_id},
                     },
                 )
-                updated_parsed = _as_dict(_parse_jsonish(_tool_text(updated)))
-                new_id = str(updated_parsed.get("draft_id") or "")
-                if not new_id:
-                    raise RuntimeError(_tool_text(updated) or "Upwork did not return an updated proposal draft")
-                draft_id = new_id
-                attached = len(milestone_payload)
-            confirmed = await call_session_tool(
-                session,
-                "upwork__confirm_draft",
-                {
-                    "action": "confirm",
-                    "org_uid": org_uid,
-                    "params": {"type": "proposal", "draft_id": draft_id},
-                },
-            )
-            text = _tool_text(confirmed) or "submitted"
-            return f"apply={apply_cost} boost={boost_connects} milestones={attached} {text}"
+                text = _tool_text(confirmed) or "submitted"
+                outcome = f"apply={apply_cost} boost={boost_connects} milestones={attached} {text}"
+                return outcome
+        except Exception as exc:
+            if outcome:
+                return outcome
+            detail = format_mcp_error(exc)
+            if already_applied(detail):
+                return "already_applied"
+            raise
 
     async def dump_tools(self, *needles: str) -> list[tuple[str, Any]]:
         dumps: list[tuple[str, Any]] = []
@@ -1416,7 +1800,7 @@ class UpworkMcpClient:
                     break
                 offset += 10
             proposals: list[Any] = []
-            for status in ("Accepted", "Submitted", "Active"):
+            for status in ("Pending", "Accepted", "Submitted", "Active"):
                 cursor = ""
                 for _ in range(8):
                     params: dict[str, Any] = {

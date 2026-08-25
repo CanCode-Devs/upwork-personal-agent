@@ -28,6 +28,7 @@ Built by [CanCode Devs](https://github.com/CanCode-Devs). [MIT License](LICENSE)
 
 **Submit**
 - Inbox on `127.0.0.1:8000`: edit, approve, or reject
+- **Messages** tab: poll Upwork chats, suggest a reply, send with optional file attachments
 - Default **manual** mode: nothing goes to Upwork until you click **Approve & submit**
 - Optional auto-submit above a score threshold if you explicitly enable it
 

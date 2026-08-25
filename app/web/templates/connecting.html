@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Connecting Upwork · {{ app_name }}{% endblock %}
 {% block extra_head %}
-<meta http-equiv="refresh" content="1;url=/upwork/connect">
+<meta http-equiv="refresh" content="1;url={{ connect_path }}">
 {% endblock %}
 {% block content %}
 <div class="top">
@@ -11,5 +11,5 @@
   </div>
 </div>
 <div class="banner">{{ status_message }}</div>
-<p class="empty">If this is still here after a minute, go back to the <a href="/">Inbox</a>.</p>
+<p class="empty">If this is still here after a minute, go back to the <a href="/">Inbox</a>. Login continues in this tab so the inbox stays open.</p>
 {% endblock %}

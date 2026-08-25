@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypedDict
@@ -8,7 +9,7 @@ from urllib.parse import quote
 
 from app.db.models import Job, UpworkApplication
 from app.models import InboxSort
-from app.upwork.mcp_client import derive_client_stats, fold_search_client
+from app.upwork.mcp_client import derive_client_stats, fold_search_client, public_job_url
 
 
 class ClientFact(TypedDict):
@@ -57,6 +58,11 @@ class JobCard(TypedDict):
     attachments: list[JobAttachmentCard]
     local: bool
     created_at: datetime | None
+    posted_ago: str
+    posted_local: str
+    posted_kind: str
+    proposal_count: int | None
+    interviewing: int | None
 
 
 def _as_dict(raw: str | None) -> dict[str, Any]:
@@ -67,6 +73,89 @@ def _as_dict(raw: str | None) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {"raw": raw}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def parse_upwork_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    if re.search(r"[+-]\d{4}$", text):
+        text = text[:-2] + ":" + text[-2:]
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def relative_ago(when: datetime, now: datetime | None = None) -> str:
+    current = now or datetime.now().astimezone()
+    stamp = when.astimezone(current.tzinfo)
+    seconds = int((current - stamp).total_seconds())
+    if seconds < 0:
+        seconds = 0
+    if seconds < 45:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h ago"
+    days = hours // 24
+    return f"{days}d ago"
+
+
+def _nested_posting(raw: dict[str, Any]) -> dict[str, Any]:
+    data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+    posting = data.get("marketplaceJobPosting") if isinstance(data.get("marketplaceJobPosting"), dict) else None
+    if posting is None and isinstance(raw.get("marketplaceJobPosting"), dict):
+        posting = raw["marketplaceJobPosting"]
+    return posting if isinstance(posting, dict) else raw
+
+
+def _job_activity(job: Job) -> dict[str, Any]:
+    posting = _nested_posting(_as_dict(job.raw_json))
+    activity = posting.get("activityStat") if isinstance(posting.get("activityStat"), dict) else {}
+    job_act = activity.get("jobActivity") if isinstance(activity.get("jobActivity"), dict) else {}
+    return job_act if isinstance(job_act, dict) else {}
+
+
+def _as_int(value: Any) -> int | None:
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    try:
+        return int(float(str(value)))
+    except ValueError:
+        return None
+
+
+def _posted_at(job: Job, data: dict[str, Any]) -> datetime | None:
+    raw = _as_dict(job.raw_json)
+    posting = _nested_posting(raw)
+    content = posting.get("content") if isinstance(posting.get("content"), dict) else {}
+    for value in (
+        data.get("published_date"),
+        data.get("created_date"),
+        raw.get("published_date"),
+        raw.get("created_date"),
+        posting.get("publishedDateTime"),
+        posting.get("createdDateTime"),
+        content.get("publishedDateTime"),
+        content.get("createdDateTime"),
+    ):
+        parsed = parse_upwork_datetime(value)
+        if parsed is not None:
+            return parsed
+    return None
 
 
 def _fmt(value: Any) -> str:
@@ -190,6 +279,28 @@ def job_card(job: Job, applied_status: str = "") -> JobCard:
     location_parts = [data.get("city"), data.get("state"), data.get("country")]
     location = ", ".join(str(part) for part in location_parts if part)
     timezone = job.timezone or _fmt(data.get("timezone"))
+    activity = _job_activity(job)
+    proposal_count = _as_int(data.get("proposal_count"))
+    if proposal_count is None:
+        proposal_count = _as_int(activity.get("applicationsCount"))
+    if proposal_count is None:
+        proposal_count = _as_int(activity.get("proposal_count"))
+    interviewing = _as_int(data.get("interviewing"))
+    if interviewing is None:
+        interviewing = _as_int(activity.get("totalInvitedToInterview"))
+    if interviewing is None:
+        interviewing = _as_int(activity.get("interviewing"))
+    posted = _posted_at(job, data)
+    local_now = datetime.now().astimezone()
+    if posted is not None:
+        posted_kind = "Posted"
+        posted_ago = relative_ago(posted, local_now)
+        posted_local = posted.astimezone(local_now.tzinfo).strftime("%Y-%m-%d %H:%M")
+    else:
+        found = parse_upwork_datetime(job.created_at) if job.created_at else None
+        posted_kind = "Found"
+        posted_ago = relative_ago(found, local_now) if found else ""
+        posted_local = found.astimezone(local_now.tzinfo).strftime("%Y-%m-%d %H:%M") if found else ""
     facts: list[ClientFact] = []
     mapping = [
         ("Company", data.get("company")),
@@ -202,7 +313,8 @@ def job_card(job: Job, applied_status: str = "") -> JobCard:
         ("Hours billed", data.get("hours_total")),
         ("Active contracts", data.get("contracts_active")),
         ("Lifetime contracts", data.get("contracts_total")),
-        ("Proposals on this job", data.get("proposal_count")),
+        ("Posted" if posted is not None else "Found in inbox", posted_ago),
+        ("Proposals on this job", proposal_count if proposal_count is not None else ""),
         ("Avg bid", _money(data.get("avg_bid")) if data.get("avg_bid") else ""),
         ("Experience", str(data.get("experience_level") or "").replace("_", " ").title()),
         ("Duration", data.get("duration")),
@@ -214,7 +326,7 @@ def job_card(job: Job, applied_status: str = "") -> JobCard:
         ("Avg spent / hire", _money(data.get("avg_spend")) if data.get("avg_spend") not in (None, "") else ""),
         ("Avg hourly paid", _money(data.get("avg_hourly_paid")) if data.get("avg_hourly_paid") not in (None, "") else ""),
         ("Invites sent", data.get("invites_sent") if data.get("invites_sent") is not None else ""),
-        ("Interviewing", data.get("interviewing") if data.get("interviewing") is not None else ""),
+        ("Interviewing", interviewing if interviewing is not None else ""),
         ("Unanswered invites", data.get("unanswered_invites") if data.get("unanswered_invites") not in (None, 0) else ""),
         ("Hired on this job", data.get("hired_on_job") if data.get("hired_on_job") not in (None, 0) else ""),
         ("English", quals.get("english_proficiency") if quals else ""),
@@ -236,7 +348,7 @@ def job_card(job: Job, applied_status: str = "") -> JobCard:
         "status": job.status,
         "applied": bool(job.applied_on_upwork) or job.status == "submitted",
         "applied_status": applied_status,
-        "url": job.url or "",
+        "url": public_job_url(job.url or job.upwork_id),
         "description": job.description or "",
         "facts": facts,
         "open_contracts": _history_items(data.get("open_contracts")),
@@ -245,6 +357,11 @@ def job_card(job: Job, applied_status: str = "") -> JobCard:
         "attachments": _attachment_cards(job, data.get("attachments")),
         "local": True,
         "created_at": job.created_at,
+        "posted_ago": posted_ago,
+        "posted_local": posted_local,
+        "posted_kind": posted_kind,
+        "proposal_count": proposal_count,
+        "interviewing": interviewing,
     }
 
 
@@ -265,7 +382,7 @@ def application_card(row: UpworkApplication) -> JobCard:
         "status": row.status or "applied",
         "applied": True,
         "applied_status": row.status,
-        "url": f"https://www.upwork.com/jobs/{row.posting_id}" if row.posting_id else "",
+        "url": public_job_url(row.posting_id) if row.posting_id else "",
         "description": "",
         "facts": facts,
         "open_contracts": [],
@@ -274,6 +391,11 @@ def application_card(row: UpworkApplication) -> JobCard:
         "attachments": [],
         "local": False,
         "created_at": row.synced_at,
+        "posted_ago": "",
+        "posted_local": "",
+        "posted_kind": "",
+        "proposal_count": None,
+        "interviewing": None,
     }
 
 

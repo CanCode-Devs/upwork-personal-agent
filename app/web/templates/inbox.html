@@ -11,13 +11,19 @@
 {% if oauth_notice %}
 <div class="banner {% if oauth == 'ok' %}ok{% endif %}">{{ oauth_notice }}</div>
 {% endif %}
-{% if mcp and not mcp.connected %}
+{% if mcp and mcp.stale %}
+<div class="banner">
+  Upwork login expired, so polls cannot search. Sign in again on this machine.
+  <a class="btn" href="/upwork/connect?force=1" target="_blank" rel="noopener noreferrer">Connect Upwork</a>
+  {% if mcp.error %}<div class="sub">{{ mcp.error }}</div>{% endif %}
+</div>
+{% elif mcp and not mcp.connected %}
 <div class="banner">
   Upwork is not connected, so polls skip. Sign in with Upwork on this machine.
-  <a class="btn" href="/upwork/connect">Connect Upwork</a>
+  <a class="btn" href="/upwork/connect" target="_blank" rel="noopener noreferrer">Connect Upwork</a>
   {% if oauth_detail %}<div class="sub">{{ oauth_detail }}</div>{% endif %}
 </div>
-{% elif mcp and mcp.connected %}
+{% elif mcp and mcp.connected and oauth != 'ok' %}
 <div class="banner ok">Upwork MCP token on disk. Polling is active.</div>
 {% endif %}
 
@@ -60,7 +66,7 @@
             {% else %}
             <span class="job-title">{{ job.title }}</span>
             {% endif %}
-            <span class="job-inline">{{ job.price_label }} · {{ job.timezone }}{% if job.location %} · {{ job.location }}{% endif %}</span>
+            <span class="job-inline">{{ job.price_label }}{% if job.posted_ago %} · {{ job.posted_kind }} {{ job.posted_ago }}{% endif %} · {{ job.timezone }}{% if job.location %} · {{ job.location }}{% endif %}{% if job.proposal_count is not none %} · {{ job.proposal_count }} proposals{% endif %}{% if job.interviewing is not none %} · {{ job.interviewing }} interviewing{% endif %}</span>
           </span>
           <span class="job-summary-meta">
             {% if job.applied %}<span class="badge submitted">Applied{% if job.applied_status %} · {{ job.applied_status }}{% endif %}</span>{% endif %}

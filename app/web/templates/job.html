@@ -4,7 +4,7 @@
 <div class="top">
   <div>
     <h1>{{ job.title }}</h1>
-    <div class="sub"><span class="badge {{ job.status }}">{{ job.status }}</span></div>
+    <div class="sub"><span class="badge {{ job.status }}">{{ job.status }}</span>{% if engagement == 'role' %} <span class="badge">Role hire</span>{% else %} <span class="badge">Project</span>{% endif %}</div>
   </div>
   <a href="/">Back to inbox</a>
 </div>
@@ -12,10 +12,11 @@
 <div class="meta">
   <div>Score: <strong>{{ job.score if job.score is not none else "—" }}</strong> — {{ job.score_reason or "" }}</div>
   <div>Price: {{ card.price_label if card else job.budget or "—" }}</div>
+  {% if card and card.posted_ago %}<div>{{ card.posted_kind }}: <strong>{{ card.posted_ago }}</strong>{% if card.posted_local %} · {{ card.posted_local }}{% endif %}</div>{% endif %}
   <div>Timezone: {{ card.timezone if card else "—" }}{% if card and card.location %} · {{ card.location }}{% endif %}</div>
   <div>Upwork id: {{ job.upwork_id }}</div>
   {% if job.applied_on_upwork %}<div><span class="badge submitted">Already applied on Upwork</span></div>{% endif %}
-  {% if job.url %}<div><a href="{{ job.url }}" target="_blank" rel="noreferrer">Open on Upwork</a></div>{% endif %}
+  {% if job.url or job.upwork_id %}<div><a href="{{ (job.url or job.upwork_id)|upwork_job }}" target="_blank" rel="noreferrer">Open on Upwork</a></div>{% endif %}
   <div>Expires: {{ job.expires_at|dt }}</div>
 </div>
 
@@ -29,6 +30,8 @@
 <div class="banner">Could not regenerate the proposal. Check the log on this page.</div>
 {% elif request.query_params.get('saved') %}
 <div class="banner ok">Edits saved.</div>
+{% elif job.status == 'submit_failed' %}
+<div class="banner">Submit to Upwork failed. {{ submit_error or "Check the log on this page." }}{% if oauth_stale %} Open Connect Upwork in a new tab, then retry.{% endif %}</div>
 {% endif %}
 
 {% if card and card.facts %}
@@ -124,7 +127,10 @@
       >
         <h3>Connects</h3>
         {% if connects.error %}
-        <p class="muted">{{ connects.error }}</p>
+        <p class="connects-warn">{{ connects.error }}</p>
+        {% endif %}
+        {% if connects.listing_cost is not none and connects.apply_cost is not none and connects.listing_cost != connects.apply_cost %}
+        <p class="muted">Job listing showed {{ connects.listing_cost }} Connects; Upwork will charge {{ connects.apply_cost }}.</p>
         {% endif %}
         <dl class="connects-stats">
           <div><dt>Available</dt><dd>{% if connects.available is not none %}{{ connects.available }}{% else %}not available from Upwork{% endif %}</dd></div>
@@ -239,7 +245,7 @@
     </form>
     {% endif %}
 
-    <form method="post" action="/jobs/{{ job.id }}/outcome" style="margin-top:24px">
+    <form id="outcome-form" method="post" action="/jobs/{{ job.id }}/outcome" style="margin-top:24px">
       <h2>Outcome log</h2>
       <label for="outcome">What happened after apply?</label>
       <select id="outcome" name="outcome">
@@ -252,7 +258,7 @@
       <label for="client_notes">Notes</label>
       <input id="client_notes" name="client_notes" type="text" placeholder="Client said they wanted a video intro">
       <div class="actions" style="margin-top:12px">
-        <button class="btn secondary" type="submit">Save outcome</button>
+        <button id="outcome-btn" class="btn secondary" type="submit">Save outcome</button>
       </div>
     </form>
     {% if outcomes %}
@@ -300,6 +306,7 @@
   const shortEl = document.getElementById("connects-short");
   const approveBtn = document.getElementById("approve-btn");
   if (!panel || !form || !approveBtn) return;
+  let submitting = false;
 
   function num(value) {
     if (value === "" || value == null) return null;
@@ -329,7 +336,7 @@
     const short = available != null && apply != null && available < apply + boost;
     const blocked = short || canApply === "0";
     if (shortEl) shortEl.hidden = !short;
-    approveBtn.disabled = blocked;
+    if (!submitting) approveBtn.disabled = blocked;
   }
 
   if (boostInput && boostInput.type !== "hidden") {
@@ -362,10 +369,28 @@
     const applyLabel = apply == null ? "?" : String(apply);
     const total = apply == null ? "?" : String(apply + boost);
     const ok = window.confirm("Submit for " + total + " Connects (" + applyLabel + " apply + " + boost + " boost)?");
-    if (!ok) event.preventDefault();
+    if (!ok) {
+      event.preventDefault();
+      return;
+    }
+    approveBtn.disabled = true;
+    approveBtn.textContent = "Submitting…";
+    submitting = true;
   });
   sync();
 })();
 </script>
 {% endif %}
+<script>
+(function () {
+  const form = document.getElementById("outcome-form");
+  if (!form) return;
+  form.addEventListener("submit", function () {
+    const btn = document.getElementById("outcome-btn");
+    if (!btn) return;
+    btn.disabled = true;
+    btn.textContent = "Saving…";
+  });
+})();
+</script>
 {% endblock %}

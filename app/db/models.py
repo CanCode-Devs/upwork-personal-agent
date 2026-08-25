@@ -180,6 +180,7 @@ class ProposalSettings(Base):
     enforce_opening_hook: Mapped[bool] = mapped_column(Boolean, default=True)
     tone: Mapped[str] = mapped_column(String(32), default="consultative")
     letter_structure: Mapped[str] = mapped_column(Text, default="")
+    role_letter_structure: Mapped[str] = mapped_column(Text, default="")
     must_include: Mapped[str] = mapped_column(Text, default="")
     never_say: Mapped[str] = mapped_column(Text, default="")
     extra_instructions: Mapped[str] = mapped_column(Text, default="")
@@ -205,3 +206,50 @@ class ProposalExample(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class MessageRoom(Base):
+    __tablename__ = "message_rooms"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    room_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    context_type: Mapped[str] = mapped_column(String(64), default="")
+    context_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    title: Mapped[str] = mapped_column(String(512), default="")
+    counterpart: Mapped[str] = mapped_column(String(256), default="")
+    snippet: Mapped[str] = mapped_column(Text, default="")
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    unread: Mapped[int] = mapped_column(Integer, default=0)
+    send_status: Mapped[str] = mapped_column(String(32), default="idle")
+    send_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    messages: Mapped[list["ChatMessage"]] = relationship(back_populates="room")
+    draft: Mapped["MessageDraft | None"] = relationship(back_populates="room", uselist=False)
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    room_pk: Mapped[int] = mapped_column(ForeignKey("message_rooms.id"), index=True)
+    upwork_message_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    sender: Mapped[str] = mapped_column(String(32), default="client")
+    body: Mapped[str] = mapped_column(Text, default="")
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    room: Mapped[MessageRoom] = relationship(back_populates="messages")
+
+
+class MessageDraft(Base):
+    __tablename__ = "message_drafts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    room_pk: Mapped[int] = mapped_column(ForeignKey("message_rooms.id"), unique=True, index=True)
+    suggested_text: Mapped[str] = mapped_column(Text, default="")
+    suggested_intents: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    room: Mapped[MessageRoom] = relationship(back_populates="draft")

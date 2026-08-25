@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class JobStatus(StrEnum):
@@ -135,6 +135,7 @@ class WriterConfig(BaseModel):
     enforce_opening_hook: bool = False
     tone: str = "consultative"
     letter_structure: str = ""
+    role_letter_structure: str = ""
     must_include: str = ""
     never_say: str = ""
     extra_instructions: str = ""
@@ -191,6 +192,66 @@ class DraftResult(BaseModel):
     certificate_ids: list[str] = Field(default_factory=list)
     job_history_ids: list[str] = Field(default_factory=list)
     profile_history_ids: list[str] = Field(default_factory=list)
+
+
+class ReplyIntentKind(StrEnum):
+    follow_up = "follow_up"
+    set_meeting = "set_meeting"
+    general_answer = "general_answer"
+
+
+_INTENT_KIND_ALIASES = {
+    "follow_up": ReplyIntentKind.follow_up,
+    "followup": ReplyIntentKind.follow_up,
+    "set_meeting": ReplyIntentKind.set_meeting,
+    "set_a_meeting": ReplyIntentKind.set_meeting,
+    "meeting": ReplyIntentKind.set_meeting,
+    "general_answer": ReplyIntentKind.general_answer,
+    "general": ReplyIntentKind.general_answer,
+    "answer": ReplyIntentKind.general_answer,
+}
+
+INTENT_LABELS: dict[ReplyIntentKind, str] = {
+    ReplyIntentKind.follow_up: "Follow up",
+    ReplyIntentKind.set_meeting: "Set a meeting",
+    ReplyIntentKind.general_answer: "General answer",
+}
+
+
+def display_intent_label(kind: ReplyIntentKind | str, raw: str = "") -> str:
+    resolved: ReplyIntentKind | None
+    if isinstance(kind, ReplyIntentKind):
+        resolved = kind
+    else:
+        try:
+            resolved = ReplyIntentKind(str(kind))
+        except ValueError:
+            key = str(kind or "").strip().lower().replace("-", "_").replace(" ", "_")
+            resolved = _INTENT_KIND_ALIASES.get(key)
+    fallback = INTENT_LABELS.get(resolved, "Reply") if resolved else "Reply"
+    label = " ".join((raw or "").split())
+    if not label or "_" in label or " " not in label:
+        return fallback
+    return label[:48]
+
+
+class ReplyIntent(BaseModel):
+    kind: ReplyIntentKind
+    label: str = ""
+    text: str = ""
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def coerce_kind(cls, value: object) -> object:
+        if isinstance(value, ReplyIntentKind):
+            return value
+        key = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        return _INTENT_KIND_ALIASES.get(key, value)
+
+
+class SuggestReplyResult(BaseModel):
+    intents: list[ReplyIntent] = Field(default_factory=list)
+    text: str = ""
 
 
 class LearnPreferenceArgs(BaseModel):
@@ -280,6 +341,7 @@ class ConnectsPanel(BaseModel):
     error: str = ""
     charged_amount: float | None = None
     remaining_after_apply: int | None = None
+    listing_cost: int | None = None
     milestones_allowed: bool = False
     screening_questions: list[str] = Field(default_factory=list)
 
@@ -405,3 +467,53 @@ class ToolSpec(TypedDict):
     name: str
     description: str
     parameters: dict[str, Any]
+
+
+class ChatFileRef(TypedDict, total=False):
+    file_id: str
+    file_name: str
+    url: str
+
+
+class ChatAttachment(TypedDict, total=False):
+    name: str
+    url: str
+
+
+class ChatMessageView(TypedDict, total=False):
+    story_id: str
+    sender: str
+    body: str
+    sent_at: datetime | None
+    sent_ago: str
+    attachments: list[ChatAttachment]
+    day_label: str
+    show_day: bool
+    grouped: bool
+    is_long: bool
+    show_time: bool
+
+
+class ChatReplyIntent(TypedDict):
+    kind: str
+    label: str
+    text: str
+
+
+class ChatThreadCard(TypedDict, total=False):
+    room_id: str
+    title: str
+    counterpart: str
+    snippet: str
+    last_ago: str
+    unread: int
+    context_type: str
+    related_job_id: int | None
+    send_status: str
+    send_error: str
+    can_send: bool
+    client_first_required: bool
+    suggested_text: str
+    suggested_intents: list[ChatReplyIntent]
+    initials: str
+    avatar_hue: int
