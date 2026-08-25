@@ -25,6 +25,7 @@ from app.models import (
 )
 from app.profile import load_profile
 from app.runtime import load_runtime
+from app.scoring import load_scoring_config
 from app.tools import register_tool
 from app.upwork.mcp_client import UpworkMcpClient
 
@@ -401,11 +402,12 @@ async def execute_scoring_matrix(
     session, own = _session(db)
     try:
         runtime = load_runtime(session, settings)
+        matrix = load_scoring_config(settings)
         profile = load_profile(settings)
         blob = f"{args.title}\n{args.job_text}\n{args.attachment_text}".lower()
         breakdown: list[str] = []
         blocked = False
-        score = 55
+        score = matrix.base_score
 
         rules = session.query(PreferenceRule).filter(PreferenceRule.active.is_(True)).all()
         for rule in rules:
@@ -415,7 +417,7 @@ async def execute_scoring_matrix(
                 blocked = True
                 breakdown.append(f"strict_block: {rule.rule}")
             else:
-                score -= 12
+                score -= matrix.soft_penalty
                 breakdown.append(f"soft_penalty: {rule.rule}")
 
         for word in profile.exclude_keywords:
@@ -425,7 +427,7 @@ async def execute_scoring_matrix(
 
         hits = [skill for skill in profile.skills if skill.lower() in blob]
         if hits:
-            score += min(30, 8 * len(hits))
+            score += min(matrix.skill_bonus_cap, matrix.skill_bonus_per_hit * len(hits))
             breakdown.append("skills: " + ", ".join(hits))
 
         min_hourly = runtime.min_hourly if runtime.min_hourly is not None else profile.hourly_rate
@@ -441,21 +443,21 @@ async def execute_scoring_matrix(
             blocked = True
             breakdown.append("requires verified payment")
         elif args.client_payment_status.lower() in {"unverified", "not verified", "false"}:
-            score -= 10
+            score += matrix.payment_unverified
             breakdown.append("payment unverified")
         elif args.client_payment_status.lower() in {"verified", "true"}:
-            score += 6
+            score += matrix.payment_verified
             breakdown.append("payment verified")
 
         if args.client_rating is not None:
             if runtime.min_client_rating is not None and args.client_rating < runtime.min_client_rating:
                 blocked = True
                 breakdown.append(f"client rating below {runtime.min_client_rating}")
-            elif args.client_rating < 4.0:
-                score -= 10
+            elif args.client_rating < matrix.low_rating_below:
+                score += matrix.low_rating
                 breakdown.append(f"low client rating {args.client_rating}")
-            elif args.client_rating >= 4.8:
-                score += 4
+            elif args.client_rating >= matrix.strong_rating_at:
+                score += matrix.strong_rating
                 breakdown.append("strong client rating")
 
         if runtime.min_client_hires is not None and args.client_hires is not None and args.client_hires < runtime.min_client_hires:
@@ -463,32 +465,32 @@ async def execute_scoring_matrix(
             breakdown.append(f"client hires {args.client_hires} below {runtime.min_client_hires}")
 
         if runtime.max_proposal_count is not None and args.proposal_count is not None and args.proposal_count > runtime.max_proposal_count:
-            score -= 8
+            score += matrix.over_proposal_cap
             breakdown.append(f"{args.proposal_count} proposals already")
 
         if args.hire_rate is not None:
-            if args.hire_rate >= 50:
-                score += 4
+            if args.hire_rate >= matrix.hire_rate_high_at:
+                score += matrix.hire_rate_high
                 breakdown.append(f"hire rate {args.hire_rate:g}%")
-            elif args.hire_rate < 20 and (args.client_hires or 0) >= 5:
-                score -= 8
+            elif args.hire_rate < matrix.hire_rate_low_below and (args.client_hires or 0) >= matrix.hire_rate_low_min_hires:
+                score += matrix.hire_rate_low
                 breakdown.append(f"low hire rate {args.hire_rate:g}%")
 
-        if args.interviewing is not None and args.interviewing >= 5:
-            score -= 6
+        if args.interviewing is not None and args.interviewing >= matrix.interviewing_at:
+            score += matrix.interviewing
             breakdown.append(f"{args.interviewing} already interviewing")
-        elif args.invites_sent is not None and args.invites_sent >= 10:
-            score -= 4
+        elif args.invites_sent is not None and args.invites_sent >= matrix.invites_at:
+            score += matrix.invites
             breakdown.append(f"{args.invites_sent} invites already sent")
 
         if args.attachment_text.strip():
-            score += 2
+            score += matrix.attachments
             breakdown.append("posting has attachments")
 
         preferred = [part.strip().lower() for part in runtime.prefer_timezones.split(",") if part.strip()]
         tz = args.timezone.lower()
         if preferred and tz and any(item in tz or tz in item for item in preferred):
-            score += 6
+            score += matrix.preferred_timezone
             breakdown.append(f"preferred timezone {args.timezone}")
 
         nudge, learned_reason = _learned_term_nudge(session, blob)
@@ -498,11 +500,11 @@ async def execute_scoring_matrix(
         matches = query_similar(session, blob, top_k=3, source_type="job")
         if matches:
             avg = sum(item.score for item in matches) / len(matches)
-            if avg > 0.55:
-                score += 8
+            if avg > matrix.similar_wins_above:
+                score += matrix.similar_wins
                 breakdown.append("similar to past wins")
-            elif avg < 0.25:
-                score -= 4
+            elif avg < matrix.unlike_wins_below:
+                score += matrix.unlike_wins
                 breakdown.append("unlike past wins")
 
         score = max(0, min(100, score))

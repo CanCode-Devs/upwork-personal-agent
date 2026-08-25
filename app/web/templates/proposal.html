@@ -1,0 +1,172 @@
+{% extends "base.html" %}
+{% block title %}Proposal · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="top">
+  <div>
+    <h1>Proposal writer</h1>
+    <div class="sub">Shape how cover letters, milestones, and screening answers are written. Safety rules (JSON shape, no invented proof, milestones stay out of the letter) stay in code.</div>
+  </div>
+</div>
+
+{% if request.query_params.get('saved') %}
+<div class="banner ok">Proposal settings saved. They apply to the next draft or Regenerate.</div>
+{% elif request.query_params.get('reset') %}
+<div class="banner ok">Restored the default writer instructions.</div>
+{% elif request.query_params.get('example') %}
+<div class="banner ok">Example saved.</div>
+{% elif request.query_params.get('error') == 'example' %}
+<div class="banner">Add both a job post and the cover letter you would send.</div>
+{% endif %}
+
+<form method="post" action="/proposal/settings">
+  <div class="job-grid">
+    <div class="card">
+      <h2>Voice and opening</h2>
+      <p class="muted">The first sentence of every letter, plus overall tone.</p>
+      <label for="opening_hook">Opening hook</label>
+      <textarea id="opening_hook" name="opening_hook" class="short">{{ writer.opening_hook }}</textarea>
+      <label class="check">
+        <input type="checkbox" name="enforce_opening_hook" value="1" {% if writer.enforce_opening_hook %}checked{% endif %}>
+        Always start the letter with this exact sentence
+      </label>
+      <label for="tone">Tone</label>
+      <select id="tone" name="tone">
+        {% for item in tones %}
+        <option value="{{ item.value }}" {% if writer.tone == item.value %}selected{% endif %}>{{ item.value | replace('_', ' ') }}</option>
+        {% endfor %}
+      </select>
+      <label for="target_words">Target length (words, optional)</label>
+      <input id="target_words" name="target_words" type="text" value="{{ writer.target_words or '' }}" placeholder="e.g. 220">
+    </div>
+    <div class="card">
+      <h2>Letter structure</h2>
+      <p class="muted">One section per line, in the order they should appear.</p>
+      <label for="letter_structure">Sections</label>
+      <textarea id="letter_structure" name="letter_structure" class="medium">{{ writer.letter_structure }}</textarea>
+    </div>
+  </div>
+
+  <div class="job-grid" style="margin-top:20px">
+    <div class="card">
+      <h2>Always include</h2>
+      <p class="muted">One item per line. These become must-do rules in the prompt.</p>
+      <textarea name="must_include" class="medium">{{ writer.must_include }}</textarea>
+    </div>
+    <div class="card">
+      <h2>Never say</h2>
+      <p class="muted">One phrase per line. Default list is the filler the writer already bans.</p>
+      <textarea name="never_say" class="medium">{{ writer.never_say }}</textarea>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:20px">
+    <h2>Extra instructions</h2>
+    <p class="muted">Anything else the model should follow for every letter.</p>
+    <textarea name="extra_instructions" class="medium">{{ writer.extra_instructions }}</textarea>
+  </div>
+
+  <div class="card" style="margin-top:20px">
+    <h2>Milestones</h2>
+    <p class="muted">Fallback stages if the model does not return a plan. Weights should add to 100. They never go in the cover letter.</p>
+    <label for="milestone_instructions">Instructions for the model</label>
+    <textarea id="milestone_instructions" name="milestone_instructions" class="short">{{ writer.milestone_instructions }}</textarea>
+    <div class="milestone-head"><span>Title</span><span>Description</span><span>Weight %</span></div>
+    {% for item in writer.milestone_stages %}
+    <div class="milestone-row">
+      <input name="ms_title" type="text" value="{{ item.title }}">
+      <input name="ms_description" type="text" value="{{ item.description }}">
+      <input name="ms_weight" type="number" min="0" step="0.1" value="{{ item.weight }}">
+    </div>
+    {% endfor %}
+    <div class="milestone-row">
+      <input name="ms_title" type="text" placeholder="Optional extra">
+      <input name="ms_description" type="text" placeholder="Leave blank to skip">
+      <input name="ms_weight" type="number" min="0" step="0.1" placeholder="0">
+    </div>
+    <p class="muted">Current weights: {{ stage_total }}%</p>
+    <label for="milestone_min">Min stages</label>
+    <input id="milestone_min" name="milestone_min" type="text" value="{{ writer.milestone_min }}">
+    <label for="milestone_max">Max stages</label>
+    <input id="milestone_max" name="milestone_max" type="text" value="{{ writer.milestone_max }}">
+  </div>
+
+  <div class="job-grid" style="margin-top:20px">
+    <div class="card">
+      <h2>Screening questions</h2>
+      <p class="muted">Official Upwork fields on the job form, not the letter.</p>
+      <textarea name="screening_instructions" class="medium">{{ writer.screening_instructions }}</textarea>
+    </div>
+    <div class="card">
+      <h2>Posting “please include” items</h2>
+      <p class="muted">Lists in the job description that belong in the cover letter as labeled sections.</p>
+      <textarea name="apply_questions_instructions" class="medium">{{ writer.apply_questions_instructions }}</textarea>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:20px">
+    <h2>How many examples to send</h2>
+    <p class="muted">The agent picks the most similar active examples for each job.</p>
+    <label for="example_count">Examples per draft</label>
+    <input id="example_count" name="example_count" type="text" value="{{ writer.example_count }}">
+  </div>
+
+  <div class="actions" style="margin-top:16px">
+    <button class="btn" type="submit">Save proposal settings</button>
+  </div>
+</form>
+
+<form method="post" action="/proposal/reset" style="margin-top:12px">
+  <button class="btn secondary" type="submit">Restore defaults</button>
+</form>
+
+<div class="card" style="margin-top:28px">
+  <h2>Examples</h2>
+  <p class="muted">Paste a job post and the letter you would actually send. At draft time we send the closest matches as style references only — the model must not copy their domain or claims.</p>
+  <form method="post" action="/proposal/examples">
+    <label for="ex_title">Title</label>
+    <input id="ex_title" name="title" type="text" placeholder="e.g. 7-day RAG build">
+    <label for="ex_job">Job post</label>
+    <textarea id="ex_job" name="job_post" class="medium" placeholder="Paste the client’s posting"></textarea>
+    <label for="ex_letter">Cover letter you would send</label>
+    <textarea id="ex_letter" name="cover_letter" class="medium"></textarea>
+    <label for="ex_notes">Notes (optional)</label>
+    <input id="ex_notes" name="notes" type="text" placeholder="What to copy: structure, CTA, not the stack">
+    <div class="actions" style="margin-top:12px">
+      <button class="btn secondary" type="submit">Add example</button>
+    </div>
+  </form>
+</div>
+
+{% for item in examples %}
+<div class="card" style="margin-top:16px">
+  <h2>{{ item.title }} {% if not item.active %}<span class="badge skipped">off</span>{% endif %}</h2>
+  <form method="post" action="/proposal/examples/{{ item.id }}">
+    <label>Title</label>
+    <input name="title" type="text" value="{{ item.title }}">
+    <label>Job post</label>
+    <textarea name="job_post" class="medium">{{ item.job_post }}</textarea>
+    <label>Cover letter</label>
+    <textarea name="cover_letter" class="medium">{{ item.cover_letter }}</textarea>
+    <label>Notes</label>
+    <input name="notes" type="text" value="{{ item.notes }}">
+    <div class="actions" style="margin-top:12px">
+      <button class="btn secondary" type="submit">Save example</button>
+    </div>
+  </form>
+  <div class="actions" style="margin-top:8px">
+    <form method="post" action="/proposal/examples/{{ item.id }}/toggle">
+      <button class="btn secondary" type="submit">{% if item.active %}Turn off{% else %}Turn on{% endif %}</button>
+    </form>
+    <form method="post" action="/proposal/examples/{{ item.id }}/delete">
+      <button class="btn danger" type="submit">Delete</button>
+    </form>
+  </div>
+</div>
+{% endfor %}
+
+<div class="card" style="margin-top:28px">
+  <h2>Prompt preview</h2>
+  <p class="muted">Exact instructions assembled from the fields above, plus your agent voice and any proposal-style rules from Settings.</p>
+  <textarea class="preview" readonly>{{ prompt_preview }}</textarea>
+</div>
+{% endblock %}

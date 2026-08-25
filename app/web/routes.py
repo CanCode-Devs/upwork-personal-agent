@@ -17,14 +17,22 @@ from sqlalchemy.orm import Session, selectinload
 from app.actions import approve_and_submit, cover_letter_for, latest_proposal, reject_job, save_edit
 from app.auth import COOKIE_NAME, create_session_value, current_user, verify_password
 from app.config import Settings, get_settings
-from app.db.models import Event, FeedbackLog, Job, PortfolioItem, PreferenceRule, UpworkApplication, UpworkProfile, User
+from app.models import ApplyHighlight, ConnectsPanel, FreelancerProfile, InboxCounts, InboxSort, JobStatus, MilestoneStageConfig, PitchTone, ScreeningAnswer, SessionUser, WorkKind, WorkOrigin, WriterConfig
+from app.db.models import Event, FeedbackLog, Job, PortfolioItem, PreferenceRule, ProposalExample, UpworkApplication, UpworkProfile, User
 from app.db.session import SessionLocal, get_db
 from app.events import add_event
 from app.job_attachments import safe_filename
 from app.job_display import application_card, job_card, sort_job_cards
 from app.milestones import heuristic_milestones, job_needs_milestones, load_milestones, parse_milestone_form
-from app.models import ApplyHighlight, ConnectsPanel, FreelancerProfile, InboxCounts, InboxSort, JobStatus, ScreeningAnswer, SessionUser, WorkKind, WorkOrigin
 from app.profile import load_overlay, save_overlay
+from app.proposal_settings import (
+    apply_config_to_row,
+    build_system_prompt,
+    get_or_create_proposal_settings,
+    load_proposal_settings,
+    reset_proposal_settings,
+    style_rules_for_prompt,
+)
 from app.proposal_writer import dump_apply, finalize_letter, load_apply, load_screening, parse_screening_form
 from app.runtime import get_or_create_runtime
 from app.tools.discovery import apply_runtime_filters
@@ -60,8 +68,11 @@ templates.env.filters["dt"] = _fmt_dt
 
 
 def render(request: Request, name: str, context: dict | None = None, status_code: int = 200) -> Response:
+    settings = get_settings()
     payload = dict(context or {})
     payload.pop("request", None)
+    payload.setdefault("app_name", settings.app_name)
+    payload.setdefault("app_tagline", settings.app_tagline)
     return templates.TemplateResponse(request, name, payload, status_code=status_code)
 
 
@@ -247,7 +258,8 @@ async def job_detail(request: Request, job_id: int, db: Session = Depends(get_db
         .all()
     )
     can_act = job.status in {JobStatus.pending_review.value, JobStatus.submit_failed.value}
-    letter = cover_letter_for(job)
+    writer = load_proposal_settings(db)
+    letter = cover_letter_for(job, db)
     overlay = load_overlay(get_settings())
     bid = bid_amount_for_job(job, overlay.hourly_rate)
     panel = ConnectsPanel(charged_amount=bid)
@@ -294,7 +306,7 @@ async def job_detail(request: Request, job_id: int, db: Session = Depends(get_db
     proposal = latest_proposal(job)
     milestones = load_milestones(proposal)
     if can_act and not milestones and job_needs_milestones(job, bid, allowed):
-        milestones = heuristic_milestones(job, bid)
+        milestones = heuristic_milestones(job, bid, [item.model_dump() for item in writer.milestone_stages])
     stored_answers = load_screening(proposal)
     questions = panel.screening_questions or [item.question for item in stored_answers]
     by_question = {item.question: item.answer for item in stored_answers}
@@ -317,7 +329,7 @@ async def job_detail(request: Request, job_id: int, db: Session = Depends(get_db
             apply_payload["profile_history_ids"] = []
             if proposal is not None:
                 proposal.apply_json = dump_apply(apply_payload)
-    formatted = finalize_letter(letter)
+    formatted = finalize_letter(letter, hook=writer.opening_hook, enforce=writer.enforce_opening_hook)
     if can_act and proposal is not None and formatted != letter:
         proposal.edited_text = formatted
         letter = formatted
@@ -665,6 +677,215 @@ def settings_alias() -> Response:
     return RedirectResponse("/preferences", status_code=303)
 
 
+def _opt_int(value: str) -> int | None:
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
+
+
+def _writer_from_form(
+    opening_hook: str,
+    enforce_opening_hook: str | None,
+    tone: str,
+    letter_structure: str,
+    must_include: str,
+    never_say: str,
+    extra_instructions: str,
+    target_words: str,
+    milestone_instructions: str,
+    ms_title: list[str],
+    ms_weight: list[str],
+    ms_description: list[str],
+    milestone_min: str,
+    milestone_max: str,
+    screening_instructions: str,
+    apply_questions_instructions: str,
+    example_count: str,
+) -> WriterConfig:
+    stages: list[MilestoneStageConfig] = []
+    count = max(len(ms_title), len(ms_weight), len(ms_description))
+    for index in range(count):
+        title = ms_title[index].strip() if index < len(ms_title) else ""
+        description = ms_description[index].strip() if index < len(ms_description) else ""
+        raw_weight = ms_weight[index].strip() if index < len(ms_weight) else ""
+        if not title and not description and not raw_weight:
+            continue
+        try:
+            weight = float(raw_weight.replace("%", ""))
+        except ValueError:
+            continue
+        if not title:
+            continue
+        stages.append(MilestoneStageConfig(title=title, weight=weight, description=description))
+    try:
+        PitchTone(tone)
+        tone_value = tone
+    except ValueError:
+        tone_value = PitchTone.consultative.value
+    return WriterConfig(
+        opening_hook=opening_hook.strip(),
+        enforce_opening_hook=bool(enforce_opening_hook),
+        tone=tone_value,
+        letter_structure=letter_structure,
+        must_include=must_include,
+        never_say=never_say,
+        extra_instructions=extra_instructions,
+        target_words=_opt_int(target_words),
+        milestone_instructions=milestone_instructions.strip(),
+        milestone_stages=stages,
+        milestone_min=_opt_int(milestone_min) or 3,
+        milestone_max=_opt_int(milestone_max) or 5,
+        screening_instructions=screening_instructions.strip(),
+        apply_questions_instructions=apply_questions_instructions.strip(),
+        example_count=max(0, _opt_int(example_count) or 0),
+    )
+
+
+@router.get("/proposal", response_class=HTMLResponse)
+def proposal_page(request: Request, db: Session = Depends(get_db)) -> Response:
+    user = _user(request)
+    writer = load_proposal_settings(db)
+    overlay = load_overlay(get_settings())
+    examples = db.query(ProposalExample).order_by(ProposalExample.created_at.desc()).all()
+    preview = build_system_prompt(writer, overlay, style_rules_for_prompt(db))
+    return render(
+        request,
+        "proposal.html",
+        {
+            "user": user,
+            "writer": writer,
+            "examples": examples,
+            "prompt_preview": preview,
+            "tones": list(PitchTone),
+            "counts": _counts(db),
+            "stage_total": round(sum(item.weight for item in writer.milestone_stages), 1),
+        },
+    )
+
+
+@router.post("/proposal/settings")
+def save_proposal_settings(
+    request: Request,
+    opening_hook: str = Form(""),
+    enforce_opening_hook: str | None = Form(default=None),
+    tone: str = Form("consultative"),
+    letter_structure: str = Form(""),
+    must_include: str = Form(""),
+    never_say: str = Form(""),
+    extra_instructions: str = Form(""),
+    target_words: str = Form(""),
+    milestone_instructions: str = Form(""),
+    ms_title: list[str] = Form(default=[]),
+    ms_weight: list[str] = Form(default=[]),
+    ms_description: list[str] = Form(default=[]),
+    milestone_min: str = Form("3"),
+    milestone_max: str = Form("5"),
+    screening_instructions: str = Form(""),
+    apply_questions_instructions: str = Form(""),
+    example_count: str = Form("2"),
+    db: Session = Depends(get_db),
+) -> Response:
+    _user(request)
+    row = get_or_create_proposal_settings(db)
+    apply_config_to_row(
+        row,
+        _writer_from_form(
+            opening_hook,
+            enforce_opening_hook,
+            tone,
+            letter_structure,
+            must_include,
+            never_say,
+            extra_instructions,
+            target_words,
+            milestone_instructions,
+            ms_title,
+            ms_weight,
+            ms_description,
+            milestone_min,
+            milestone_max,
+            screening_instructions,
+            apply_questions_instructions,
+            example_count,
+        ),
+    )
+    return RedirectResponse("/proposal?saved=1", status_code=303)
+
+
+@router.post("/proposal/reset")
+def reset_proposal(request: Request, db: Session = Depends(get_db)) -> Response:
+    _user(request)
+    reset_proposal_settings(db)
+    return RedirectResponse("/proposal?reset=1", status_code=303)
+
+
+@router.post("/proposal/examples")
+def add_proposal_example(
+    request: Request,
+    title: str = Form(""),
+    job_post: str = Form(""),
+    cover_letter: str = Form(""),
+    notes: str = Form(""),
+    db: Session = Depends(get_db),
+) -> Response:
+    _user(request)
+    if not job_post.strip() or not cover_letter.strip():
+        return RedirectResponse("/proposal?error=example", status_code=303)
+    db.add(
+        ProposalExample(
+            title=title.strip() or "Untitled example",
+            job_post=job_post.strip(),
+            cover_letter=cover_letter.strip(),
+            notes=notes.strip(),
+            active=True,
+        )
+    )
+    return RedirectResponse("/proposal?example=1", status_code=303)
+
+
+@router.post("/proposal/examples/{example_id}")
+def update_proposal_example(
+    request: Request,
+    example_id: int,
+    title: str = Form(""),
+    job_post: str = Form(""),
+    cover_letter: str = Form(""),
+    notes: str = Form(""),
+    db: Session = Depends(get_db),
+) -> Response:
+    _user(request)
+    row = db.query(ProposalExample).filter(ProposalExample.id == example_id).one_or_none()
+    if row is None:
+        return RedirectResponse("/proposal", status_code=303)
+    row.title = title.strip() or row.title
+    row.job_post = job_post.strip()
+    row.cover_letter = cover_letter.strip()
+    row.notes = notes.strip()
+    return RedirectResponse("/proposal?example=1", status_code=303)
+
+
+@router.post("/proposal/examples/{example_id}/delete")
+def delete_proposal_example(request: Request, example_id: int, db: Session = Depends(get_db)) -> Response:
+    _user(request)
+    row = db.query(ProposalExample).filter(ProposalExample.id == example_id).one_or_none()
+    if row is not None:
+        db.delete(row)
+    return RedirectResponse("/proposal", status_code=303)
+
+
+@router.post("/proposal/examples/{example_id}/toggle")
+def toggle_proposal_example(request: Request, example_id: int, db: Session = Depends(get_db)) -> Response:
+    _user(request)
+    row = db.query(ProposalExample).filter(ProposalExample.id == example_id).one_or_none()
+    if row is not None:
+        row.active = not row.active
+    return RedirectResponse("/proposal", status_code=303)
+
+
 @router.get("/preferences", response_class=HTMLResponse)
 def preferences_page(request: Request, db: Session = Depends(get_db)) -> Response:
     user = _user(request)
@@ -693,16 +914,6 @@ def preferences_page(request: Request, db: Session = Depends(get_db)) -> Respons
             "upwork_skills": upwork_skills,
         },
     )
-
-
-def _opt_int(value: str) -> int | None:
-    text = value.strip()
-    if not text:
-        return None
-    try:
-        return int(float(text))
-    except ValueError:
-        return None
 
 
 @router.post("/preferences/runtime")

@@ -180,7 +180,7 @@ def build_oauth_provider(
         return AuthorizationCodeResult(code=cb_state.code, state=cb_state.state)
 
     metadata = OAuthClientMetadata(
-        client_name="Upwork Job Watcher",
+        client_name=settings.app_name,
         redirect_uris=[AnyUrl(redirect_uri)],
         grant_types=["authorization_code", "refresh_token"],
         response_types=["code"],

@@ -7,6 +7,7 @@ from app.events import add_event
 from app.milestones import dump_milestones
 from app.models import EmbeddingSource, FeedbackOutcome, JobStatus, ProposalMilestone, ScreeningAnswer
 from app.profile import load_overlay
+from app.proposal_settings import load_proposal_settings
 from app.proposal_writer import dump_apply, dump_screening, finalize_letter, load_apply
 from app.tools.execution import bid_amount_for_job, cap_highlight_picks, submit_proposal
 from app.tools.memory import log_interaction_feedback
@@ -19,11 +20,16 @@ def latest_proposal(job: Job) -> Proposal | None:
     return sorted(job.proposals, key=lambda item: item.id)[-1]
 
 
-def cover_letter_for(job: Job) -> str:
+def cover_letter_for(job: Job, db: Session | None = None) -> str:
     proposal = latest_proposal(job)
     if proposal is None:
         return ""
-    return finalize_letter((proposal.edited_text or proposal.draft_text or "").strip())
+    writer = load_proposal_settings(db)
+    return finalize_letter(
+        (proposal.edited_text or proposal.draft_text or "").strip(),
+        hook=writer.opening_hook,
+        enforce=writer.enforce_opening_hook,
+    )
 
 
 async def approve_and_submit(
@@ -110,7 +116,8 @@ def save_edit(
     job_history_ids: list[str] | None = None,
     profile_history_ids: list[str] | None = None,
 ) -> Proposal:
-    letter = finalize_letter(cover_letter)
+    writer = load_proposal_settings(db)
+    letter = finalize_letter(cover_letter, hook=writer.opening_hook, enforce=writer.enforce_opening_hook)
     proposal = latest_proposal(job)
     if proposal is None:
         proposal = Proposal(job_id=job.id, draft_text=letter, edited_text=letter)

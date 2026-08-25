@@ -9,6 +9,22 @@ from app.db.models import UpworkProfile
 from app.db.session import SessionLocal
 from app.models import FreelancerProfile
 
+_EXAMPLE_PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "example.yaml"
+
+
+def ensure_profile_file(settings: Settings | None = None) -> Path:
+    settings = settings or get_settings()
+    path: Path = settings.profile_path
+    if path.exists():
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    source = _EXAMPLE_PROFILE
+    if not source.exists():
+        source = Path("profiles/example.yaml")
+    if source.exists():
+        path.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    return path
+
 
 def _skills(raw: object) -> list[str]:
     if not isinstance(raw, list):
@@ -25,6 +41,7 @@ def _snapshot_skills(raw: str) -> list[str]:
 
 
 def load_overlay(settings: Settings) -> FreelancerProfile:
+    ensure_profile_file(settings)
     path = settings.profile_path
     if not path.exists():
         queries = [q.strip() for q in settings.search_queries.split(",") if q.strip()]

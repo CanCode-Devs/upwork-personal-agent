@@ -1,0 +1,18 @@
+name: Alex Rivera
+title: Full-stack engineer
+hourly_rate: 75
+working_hours: 09:00-17:00 America/New_York
+voice: concise, specific, no fluff. Lead with what you would build. Cite only work from the provided proof.
+skills:
+  - Python
+  - JavaScript
+  - TypeScript
+  - APIs
+  - PostgreSQL
+exclude_keywords:
+  - wordpress
+  - data entry
+search_queries:
+  - Python API backend
+  - TypeScript full stack
+  - PostgreSQL

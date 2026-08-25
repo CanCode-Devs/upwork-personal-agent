@@ -14,6 +14,7 @@ import app.tools.memory  # noqa: F401
 from app.auth import SessionMiddleware, bootstrap_user, is_public_path
 from app.config import get_settings
 from app.db.session import SessionLocal, init_db
+from app.profile import ensure_profile_file
 from app.runtime import get_or_create_runtime
 from app.web.routes import router
 from app.worker import poll_loop
@@ -34,16 +35,18 @@ class AuthGateMiddleware(BaseHTTPMiddleware):
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     init_db()
+    ensure_profile_file(settings)
     db = SessionLocal()
     try:
         bootstrap_user(db, settings)
         get_or_create_runtime(db, settings)
-        try:
-            from app.memory_seed import seed_agent_case_studies
+        if settings.seed_demo_portfolio:
+            try:
+                from app.memory_seed import seed_agent_case_studies
 
-            await seed_agent_case_studies(db)
-        except Exception:
-            logging.getLogger(__name__).exception("Agent case study seed failed")
+                await seed_agent_case_studies(db)
+            except Exception:
+                logging.getLogger(__name__).exception("Agent case study seed failed")
         db.commit()
     finally:
         db.close()
@@ -58,7 +61,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="Upwork Job Watcher", lifespan=lifespan)
+    app = FastAPI(title=settings.app_name, lifespan=lifespan)
     app.add_middleware(AuthGateMiddleware)
     app.add_middleware(SessionMiddleware, settings=settings)
     app.mount("/static", StaticFiles(directory="app/web/static"), name="static")

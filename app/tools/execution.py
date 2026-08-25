@@ -39,6 +39,7 @@ from app.models import (
     WorkKind,
 )
 from app.profile import load_overlay, load_profile
+from app.proposal_settings import build_system_prompt, load_proposal_settings, select_examples, style_rules_for_prompt
 from app.proposal_writer import dump_apply, dump_screening, finalize_letter, load_apply, load_screening
 from app.tools import register_tool
 from app.tools.discovery import settings_block_reasons_for_job
@@ -357,6 +358,15 @@ async def generate_tailored_pitch(
                 session.commit()
             raise PitchSkipped(note)
         profile = load_profile(settings)
+        writer = load_proposal_settings(session)
+        try:
+            args = GeneratePitchArgs(
+                job_id=job_id,
+                tone=PitchTone(writer.tone),
+                focus_points=focus_points or [],
+            )
+        except ValueError:
+            args = GeneratePitchArgs(job_id=job_id, tone=PitchTone.consultative, focus_points=focus_points or [])
         try:
             details = json.loads(job.client_json or "{}")
         except json.JSONDecodeError:
@@ -368,6 +378,9 @@ async def generate_tailored_pitch(
         payload = _job_payload(job)
         bid = bid_amount_for_job(job, profile.hourly_rate)
         need_plan = job_needs_milestones(job, bid)
+        style_examples = select_examples(session, blob, writer.example_count)
+        system_prompt = build_system_prompt(writer, profile, style_rules_for_prompt(session))
+        stage_payload = [item.model_dump() for item in writer.milestone_stages]
         drafted = llm_draft(
             payload,
             profile,
@@ -376,11 +389,25 @@ async def generate_tailored_pitch(
             tone=args.tone.value,
             focus_points=args.focus_points,
             milestones_budget=bid if need_plan else None,
+            system_prompt=system_prompt,
+            style_examples=style_examples,
+            milestone_min=writer.milestone_min,
+            milestone_max=writer.milestone_max,
+            apply_questions_instructions=writer.apply_questions_instructions,
+            screening_instructions=writer.screening_instructions,
+            opening_hook=writer.opening_hook,
+            enforce_hook=writer.enforce_opening_hook,
         )
         if need_plan:
-            planned = coerce_milestones([item.model_dump() for item in drafted.milestones], bid) or heuristic_milestones(job, bid)
+            planned = coerce_milestones([item.model_dump() for item in drafted.milestones], bid) or heuristic_milestones(
+                job, bid, stage_payload
+            )
             drafted.milestones = planned
-        drafted.cover_letter = finalize_letter(drafted.cover_letter)
+        drafted.cover_letter = finalize_letter(
+            drafted.cover_letter,
+            hook=writer.opening_hook,
+            enforce=writer.enforce_opening_hook,
+        )
         drafted.matched_context = [proof_text] if proof_text else []
         portfolio_ids: list[str] = []
         certificate_ids: list[str] = []
@@ -409,7 +436,14 @@ async def generate_tailored_pitch(
             preview = await client.preview_proposal(job.upwork_id, drafted.cover_letter, bid)
             questions = preview.screening_questions
             if questions:
-                screening = await llm_screening_answers(payload, profile, settings, drafted.cover_letter, questions)
+                screening = await llm_screening_answers(
+                    payload,
+                    profile,
+                    settings,
+                    drafted.cover_letter,
+                    questions,
+                    screening_instructions=writer.screening_instructions,
+                )
         except Exception:
             logger.exception("proposal preview/screening failed for job %s", job.id)
         drafted.screening_answers = screening
@@ -557,11 +591,12 @@ async def submit_proposal(
         client = UpworkMcpClient()
         proposal = _latest_proposal(job)
         planned = args.milestones or load_milestones(proposal)
+        writer = load_proposal_settings(session)
         if not planned and job_needs_milestones(job, bid):
-            planned = heuristic_milestones(job, bid)
+            planned = heuristic_milestones(job, bid, [item.model_dump() for item in writer.milestone_stages])
         if planned:
             planned = align_milestone_total(planned, bid)
-        letter = finalize_letter(letter)
+        letter = finalize_letter(letter, hook=writer.opening_hook, enforce=writer.enforce_opening_hook)
         answers = args.screening_answers or load_screening(proposal)
         apply_payload = load_apply(proposal)
         portfolio_ids = args.portfolio_project_ids or [str(item) for item in apply_payload.get("portfolio_project_ids") or [] if item]

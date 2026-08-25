@@ -83,25 +83,41 @@ def align_milestone_total(items: list[ProposalMilestone], total: float) -> list[
     return scaled
 
 
-def heuristic_milestones(job: Job, total: float) -> list[ProposalMilestone]:
+def heuristic_milestones(
+    job: Job,
+    total: float,
+    stages: list[dict[str, Any]] | None = None,
+) -> list[ProposalMilestone]:
     title = (job.title or "this project").strip()
-    items = [
-        ProposalMilestone(
-            title="Discovery",
-            description=f"Confirm scope, sample data, and success checks for {title}.",
-            amount=round(total * 0.2, 2),
-        ),
-        ProposalMilestone(
-            title="Core delivery",
-            description="Build and validate the working system against the agreed sample.",
-            amount=round(total * 0.55, 2),
-        ),
-        ProposalMilestone(
-            title="Handoff",
-            description="Docs, deploy notes, and a walkthrough so you can run it.",
-            amount=round(total * 0.25, 2),
-        ),
+    fallback = [
+        {"title": "Discovery", "weight": 20.0, "description": f"Confirm scope, sample data, and success checks for {title}."},
+        {"title": "Core delivery", "weight": 55.0, "description": "Build and validate the working system against the agreed sample."},
+        {"title": "Handoff", "weight": 25.0, "description": "Docs, deploy notes, and a walkthrough so you can run it."},
     ]
+    source = stages if stages else fallback
+    items: list[ProposalMilestone] = []
+    for row in source:
+        try:
+            weight = float(row.get("weight") or 0)
+        except (TypeError, ValueError):
+            continue
+        if weight <= 0:
+            continue
+        stage_title = str(row.get("title") or "").strip() or "Stage"
+        description = str(row.get("description") or "").strip()
+        if not description:
+            description = f"{stage_title} for {title}."
+        items.append(
+            ProposalMilestone(
+                title=stage_title,
+                description=description,
+                amount=round(total * (weight / 100.0), 2),
+            )
+        )
+    if not items:
+        if stages:
+            return heuristic_milestones(job, total, None)
+        items = [ProposalMilestone(title="Delivery", description=f"Deliver {title}.", amount=total)]
     return align_milestone_total(items, total)
 
 

@@ -1,0 +1,27 @@
+# Copy to profiles/scoring.yaml to override. If scoring.yaml is missing, these defaults apply.
+base_score: 55
+skill_bonus_per_hit: 8
+skill_bonus_cap: 30
+soft_penalty: 12
+payment_unverified: -10
+payment_verified: 6
+low_rating_below: 4.0
+low_rating: -10
+strong_rating_at: 4.8
+strong_rating: 4
+hire_rate_high_at: 50
+hire_rate_high: 4
+hire_rate_low_below: 20
+hire_rate_low_min_hires: 5
+hire_rate_low: -8
+interviewing_at: 5
+interviewing: -6
+invites_at: 10
+invites: -4
+attachments: 2
+preferred_timezone: 6
+similar_wins_above: 0.55
+similar_wins: 8
+unlike_wins_below: 0.25
+unlike_wins: -4
+over_proposal_cap: -8

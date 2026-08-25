@@ -170,3 +170,38 @@ class AppRuntimeSettings(Base):
     max_proposal_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     prefer_timezones: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class ProposalSettings(Base):
+    __tablename__ = "proposal_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    opening_hook: Mapped[str] = mapped_column(Text, default="")
+    enforce_opening_hook: Mapped[bool] = mapped_column(Boolean, default=True)
+    tone: Mapped[str] = mapped_column(String(32), default="consultative")
+    letter_structure: Mapped[str] = mapped_column(Text, default="")
+    must_include: Mapped[str] = mapped_column(Text, default="")
+    never_say: Mapped[str] = mapped_column(Text, default="")
+    extra_instructions: Mapped[str] = mapped_column(Text, default="")
+    target_words: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    milestone_instructions: Mapped[str] = mapped_column(Text, default="")
+    milestone_stages: Mapped[str] = mapped_column(Text, default="[]")
+    milestone_min: Mapped[int] = mapped_column(Integer, default=3)
+    milestone_max: Mapped[int] = mapped_column(Integer, default=5)
+    screening_instructions: Mapped[str] = mapped_column(Text, default="")
+    apply_questions_instructions: Mapped[str] = mapped_column(Text, default="")
+    example_count: Mapped[int] = mapped_column(Integer, default=2)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class ProposalExample(Base):
+    __tablename__ = "proposal_examples"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(256), default="")
+    job_post: Mapped[str] = mapped_column(Text, default="")
+    cover_letter: Mapped[str] = mapped_column(Text, default="")
+    notes: Mapped[str] = mapped_column(Text, default="")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

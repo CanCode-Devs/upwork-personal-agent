@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     openai_base_url: str | None = None
     openai_model: str = "gpt-4o-mini"
 
+    app_name: str = "Upwork Personal Agent"
+    app_tagline: str = "Adaptive agent"
+    seed_demo_portfolio: bool = False
+    scoring_path: Path = Field(default=Path("./profiles/scoring.yaml"))
+
     search_queries: str = "python fastapi"
     min_score: int = 70
     poll_interval_minutes: int = 15

@@ -293,6 +293,8 @@ textarea[name="cover_letter"] {
   white-space: pre-wrap;
 }
 textarea.short { min-height: 96px; }
+textarea.medium { min-height: 140px; }
+textarea.preview { min-height: 240px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; }
 select {
   width: 100%;
   background: #12100d;

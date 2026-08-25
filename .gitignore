@@ -13,6 +13,8 @@ data/*
 *.db
 .DS_Store
 docs/*.pdf
+profiles/default.yaml
+profiles/scoring.yaml
 *.pem
 *.key
 credentials.json

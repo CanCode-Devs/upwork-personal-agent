@@ -7,44 +7,29 @@ from typing import Any
 from app.db.models import Proposal
 from app.models import FreelancerProfile, JobPayload, ScreeningAnswer
 
-OPENING_HOOK = (
-    "Hey, you'll probably get a lot of AI-generated proposals, so I'll try to write this one manually."
-)
+OPENING_HOOK = ""
 
 SYSTEM_PROMPT = """You write Upwork proposals for a technical freelancer.
 
 Core goal: make the client think this person understands the problem, knows the difficult part, already has a plan, and is worth a conversation. Sound like a technical expert presenting a solution, not a freelancer asking for a job.
 
 Formula (use this order):
-1. Opening hook: the cover_letter MUST start with this exact sentence, then a blank line:
-Hey, you'll probably get a lot of AI-generated proposals, so I'll try to write this one manually.
-Do not paraphrase it. Do not skip it. Do not add any line before it.
-2. Technical hook: 1-2 lines on what you would actually build for THIS job.
-3. Hardest part: the risk or engineering effort beyond the job-post happy path.
-4. Solution: 1-3 sentences on the approach.
-5. Relevant work: ONE project from the provided proof. Do not invent contracts, metrics, or clients.
-6. Posting apply items: if job.apply_questions is non-empty, add one labeled section per item AFTER relevant work and BEFORE the offer/CTA. Use the item text as the heading. Answer with real proof from the provided profile/proof only. Never invent GitHub URLs, repos, demos, case studies, or metrics. If you cannot prove an item, say so in one sentence and name the closest real work. These answers belong in cover_letter, not in screening_answers.
-7. Offer: a low-risk reason to start talking, only when the job is substantial.
-8. Direct CTA: tell them what to send or do next. If a client timezone and working hours are provided, make availability specific to those. Do not invent hours.
-If job.attachment_text is present, use those requirements in the technical hook. Do not quote long passages.
-If job.client_first_name is provided, you may use it in the CTA. Never invent a name.
-Never put escrow milestones, numbered delivery stages, or dollar amounts for stages in the cover letter. Upwork has a dedicated milestones form; return those only in the milestones JSON field.
+1. Technical hook: 1-2 lines on what you would actually build for THIS job.
+2. Hardest part: the risk or engineering effort beyond the job-post happy path.
+3. Solution: 1-3 sentences on the approach.
+4. Relevant work: ONE project from the provided proof. Do not invent contracts, metrics, or clients.
+5. Posting apply items: if job.apply_questions is non-empty, add one labeled section per item AFTER relevant work and BEFORE the offer/CTA.
+6. Offer: a low-risk reason to start talking, only when the job is substantial.
+7. Direct CTA: tell them what to send or do next.
 
 Mix roughly 70% client problem + how you would build it, 20% proof, 10% you + availability + CTA.
 
 Style:
 - Short scannable sections. Short sentences.
-- Separate every section with a blank line. The cover_letter MUST contain real paragraph breaks (newline + newline). Never return a single wall of text.
+- Separate every section with a blank line.
 - No em dashes. No decorative quotation marks around ordinary phrases.
-- No other greetings besides the required opening hook (no Hope you are well, no extra Hi).
 - Forbidden filler: excited to apply, would love to work, perfect candidate, great fit, extensive experience, looking forward to hearing, passionate about, proven track record, cutting-edge, revolutionary, seamless, robust, next-generation, innovative, world-class.
 - Never paste the client's job description back at them.
-
-The following are EXAMPLES OF TECHNIQUE ONLY. Do not copy them, paraphrase them, or reuse their domain (CRM, n8n, appointment booking, OpenAI-to-CRM). Write a version that fits THIS job. The required opening hook above is the one exception: copy it exactly.
-
-EXAMPLE (do not copy) technical hook technique: name the actual architecture (trigger, agent, where qualified work goes) instead of "I can build your AI system".
-EXAMPLE (do not copy) hardest-part technique: name the failure mode (state, duplicates, async, messy data) rather than the easy integration.
-EXAMPLE (do not copy) CTA technique: ask for a concrete artifact (current workflow, sample, architecture) and a short call, tied to their timezone.
 
 Return JSON only with keys:
 - cover_letter (string)
@@ -165,8 +150,8 @@ def sanitize_proposal(text: str) -> str:
     return ensure_paragraphs(strip_milestone_section(cleaned.strip()))
 
 
-def finalize_letter(text: str) -> str:
-    return ensure_opening_hook(sanitize_proposal(text))
+def finalize_letter(text: str, hook: str | None = None, enforce: bool = True) -> str:
+    return ensure_opening_hook(sanitize_proposal(text), hook=hook, enforce=enforce)
 
 
 def ensure_paragraphs(text: str) -> str:
@@ -220,16 +205,34 @@ _AI_HOOK = re.compile(
 )
 
 
-def ensure_opening_hook(letter: str) -> str:
+def ensure_opening_hook(letter: str, hook: str | None = None, enforce: bool = True) -> str:
+    hook_text = (OPENING_HOOK if hook is None else hook).strip()
     body = (letter or "").strip()
+    if not enforce or not hook_text:
+        return body
     if not body:
-        return OPENING_HOOK
-    body = _AI_HOOK.sub("", body).lstrip()
-    if body.lower().startswith(OPENING_HOOK.lower()):
-        body = body[len(OPENING_HOOK) :].lstrip()
+        return hook_text
+    suffixes = [part.strip() for part in re.split(r"(?<=\.)\s+", hook_text) if part.strip()]
+    changed = True
+    while body and changed:
+        changed = False
+        if body.lower().startswith(hook_text.lower()):
+            body = body[len(hook_text) :].lstrip()
+            changed = True
+            continue
+        stripped = _AI_HOOK.sub("", body, count=1)
+        if stripped != body:
+            body = stripped.lstrip()
+            changed = True
+            continue
+        for suffix in reversed(suffixes):
+            if len(suffix) > 12 and body.lower().startswith(suffix.lower()):
+                body = body[len(suffix) :].lstrip()
+                changed = True
+                break
     if not body:
-        return OPENING_HOOK
-    return f"{OPENING_HOOK}\n\n{body}"
+        return hook_text
+    return f"{hook_text}\n\n{body}"
 
 
 def letter_has_plan(letter: str) -> bool:

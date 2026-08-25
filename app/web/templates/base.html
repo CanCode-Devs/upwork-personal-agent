@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}Job Watcher{% endblock %}</title>
+  <title>{% block title %}{{ app_name }}{% endblock %}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@500&display=swap">
     <link rel="stylesheet" href="/static/style.css">
@@ -18,12 +18,13 @@
         <p id="poll-status" class="poll-status" hidden>Searching Upwork for new jobs…</p>
       </form>
       <div class="brand">
-        Job Watcher
-        <span>Adaptive agent</span>
+        {{ app_name }}
+        <span>{{ app_tagline }}</span>
       </div>
       <nav>
         <a href="/?status=pending_review" class="{% if request.url.path == '/' %}active{% endif %}">Inbox</a>
         <a href="/portfolio" class="{% if request.url.path.startswith('/portfolio') %}active{% endif %}">Portfolio</a>
+        <a href="/proposal" class="{% if request.url.path.startswith('/proposal') %}active{% endif %}">Proposal</a>
         <a href="/preferences" class="{% if request.url.path.startswith('/preferences') or request.url.path.startswith('/settings') %}active{% endif %}">Settings</a>
         <a href="/history" class="{% if request.url.path == '/history' %}active{% endif %}">History</a>
         <form action="/logout" method="post">

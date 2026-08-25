@@ -95,6 +95,66 @@ class FreelancerProfile(BaseModel):
     upwork_overview: str = ""
 
 
+class MilestoneStageConfig(BaseModel):
+    title: str = ""
+    weight: float = 0.0
+    description: str = ""
+
+
+class ScoringConfig(BaseModel):
+    base_score: int = 55
+    skill_bonus_per_hit: int = 8
+    skill_bonus_cap: int = 30
+    soft_penalty: int = 12
+    payment_unverified: int = -10
+    payment_verified: int = 6
+    low_rating_below: float = 4.0
+    low_rating: int = -10
+    strong_rating_at: float = 4.8
+    strong_rating: int = 4
+    hire_rate_high_at: float = 50
+    hire_rate_high: int = 4
+    hire_rate_low_below: float = 20
+    hire_rate_low_min_hires: int = 5
+    hire_rate_low: int = -8
+    interviewing_at: int = 5
+    interviewing: int = -6
+    invites_at: int = 10
+    invites: int = -4
+    attachments: int = 2
+    preferred_timezone: int = 6
+    similar_wins_above: float = 0.55
+    similar_wins: int = 8
+    unlike_wins_below: float = 0.25
+    unlike_wins: int = -4
+    over_proposal_cap: int = -8
+
+
+class WriterConfig(BaseModel):
+    opening_hook: str = ""
+    enforce_opening_hook: bool = False
+    tone: str = "consultative"
+    letter_structure: str = ""
+    must_include: str = ""
+    never_say: str = ""
+    extra_instructions: str = ""
+    target_words: int | None = None
+    milestone_instructions: str = ""
+    milestone_stages: list[MilestoneStageConfig] = Field(default_factory=list)
+    milestone_min: int = 3
+    milestone_max: int = 5
+    screening_instructions: str = ""
+    apply_questions_instructions: str = ""
+    example_count: int = 2
+
+
+class StyleExample(TypedDict):
+    title: str
+    job_post: str
+    cover_letter: str
+    notes: str
+
+
 class ScoreResult(BaseModel):
     score: int = Field(ge=0, le=100)
     reason: str
