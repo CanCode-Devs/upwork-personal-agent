@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+{% block title %}Preferences · Job Watcher{% endblock %}
+{% block content %}
+<div class="top">
+  <div>
+    <h1>Settings</h1>
+    <div class="sub">These preferences score every polled job. Agent profile text is editable; Upwork profile is read-only.</div>
+  </div>
+</div>
+
+<div class="job-grid">
+  <div class="card">
+    <h2>Scoring</h2>
+    <p class="muted">Floors and minimums skip jobs. Soft items only change the score. Saving re-filters Pending.</p>
+    <form method="post" action="/preferences/runtime">
+      <label for="min_score">Minimum score to show in Pending (skip below)</label>
+      <input id="min_score" name="min_score" type="text" value="{{ runtime.min_score }}">
+      <label for="min_hourly">Min hourly rate (skip hourly jobs below; ignore if no rate listed)</label>
+      <input id="min_hourly" name="min_hourly" type="text" value="{{ runtime.min_hourly or overlay.hourly_rate or '' }}">
+      <label for="min_fixed">Min fixed budget (skip fixed jobs below; ignore if no budget listed)</label>
+      <input id="min_fixed" name="min_fixed" type="text" value="{{ runtime.min_fixed or '' }}">
+      <label for="min_client_rating">Min client rating (skip below; blank = off)</label>
+      <input id="min_client_rating" name="min_client_rating" type="text" value="{{ runtime.min_client_rating or '' }}">
+      <label for="min_client_hires">Min client hires (skip below; blank = off)</label>
+      <input id="min_client_hires" name="min_client_hires" type="text" value="{{ runtime.min_client_hires or '' }}">
+      <label for="max_proposal_count">Soft-penalize jobs with more than this many proposals</label>
+      <input id="max_proposal_count" name="max_proposal_count" type="text" value="{{ runtime.max_proposal_count or '' }}">
+      <label for="prefer_timezones">Preferred timezones (comma-separated)</label>
+      <input id="prefer_timezones" name="prefer_timezones" type="text" value="{{ runtime.prefer_timezones or '' }}" placeholder="Asia/Karachi, UTC+05:00">
+      <label class="check">
+        <input type="checkbox" name="require_verified_payment" value="1" {% if runtime.require_verified_payment %}checked{% endif %}>
+        Only verified payment clients
+      </label>
+      <label for="autonomy_mode">Autonomy</label>
+      <select id="autonomy_mode" name="autonomy_mode">
+        <option value="manual" {% if runtime.autonomy_mode == "manual" %}selected{% endif %}>Manual — approve every submit</option>
+        <option value="auto_above_threshold" {% if runtime.autonomy_mode == "auto_above_threshold" %}selected{% endif %}>Auto above threshold</option>
+        <option value="fully_auto" {% if runtime.autonomy_mode == "fully_auto" %}selected{% endif %}>Fully auto — submit at min score</option>
+      </select>
+      <label for="auto_submit_threshold">Auto-submit threshold</label>
+      <input id="auto_submit_threshold" name="auto_submit_threshold" type="text" value="{{ runtime.auto_submit_threshold }}">
+      <div class="actions" style="margin-top:16px">
+        <button class="btn" type="submit">Save scoring</button>
+      </div>
+    </form>
+  </div>
+  <div class="card">
+    <h2>Learn a rule</h2>
+    <form method="post" action="/preferences/rules">
+      <label for="category">Category</label>
+      <select id="category" name="category">
+        <option value="budget">Budget</option>
+        <option value="tech_stack">Tech stack</option>
+        <option value="client_metrics">Client metrics</option>
+        <option value="proposal_style">Proposal style</option>
+      </select>
+      <label for="rule">Rule</label>
+      <input id="rule" name="rule" type="text" placeholder="Never apply to jobs requiring video introductions.">
+      <label for="enforcement_level">Enforcement</label>
+      <select id="enforcement_level" name="enforcement_level">
+        <option value="soft_penalty">Soft penalty</option>
+        <option value="strict_block">Strict block</option>
+      </select>
+      <div class="actions" style="margin-top:16px">
+        <button class="btn" type="submit">Add rule</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="card" style="margin-top:24px">
+  <h2>Agent profile (editable)</h2>
+  <p class="sub">Voice, queries, and extra skills for drafts. This is not your Upwork profile.</p>
+  <form method="post" action="/preferences/overlay">
+    <label for="name">Name</label>
+    <input id="name" name="name" type="text" value="{{ overlay.name }}">
+    <label for="title">Title</label>
+    <input id="title" name="title" type="text" value="{{ overlay.title }}">
+    <label for="hourly_rate">Hourly floor for scoring</label>
+    <input id="hourly_rate" name="hourly_rate" type="text" value="{{ overlay.hourly_rate or '' }}">
+    <label for="working_hours">Working hours (used in the proposal CTA)</label>
+    <input id="working_hours" name="working_hours" type="text" value="{{ overlay.working_hours }}" placeholder="10:00-18:00 Asia/Karachi">
+    <label for="voice">Voice</label>
+    <textarea id="voice" name="voice" class="short">{{ overlay.voice }}</textarea>
+    <label for="skills">Extra skills (comma-separated)</label>
+    <input id="skills" name="skills" type="text" value="{{ overlay.skills | join(', ') }}">
+    <label for="exclude_keywords">Exclude keywords</label>
+    <input id="exclude_keywords" name="exclude_keywords" type="text" value="{{ overlay.exclude_keywords | join(', ') }}">
+    <label for="search_queries">Search queries (one per line)</label>
+    <textarea id="search_queries" name="search_queries" class="short">{% for q in overlay.search_queries %}{{ q }}{% if not loop.last %}
+{% endif %}{% endfor %}</textarea>
+    <div class="actions" style="margin-top:16px">
+      <button class="btn" type="submit">Save agent profile</button>
+    </div>
+  </form>
+</div>
+
+{% if upwork_profile %}
+<div class="card" style="margin-top:24px">
+  <h2>Upwork profile (read-only)</h2>
+  <p class="sub">Imported from Upwork. Refresh it with Sync from Upwork on the Portfolio page.</p>
+  <div class="meta">
+    <div>{{ upwork_profile.title or "—" }}</div>
+    {% if upwork_profile.hourly_rate %}<div>${{ upwork_profile.hourly_rate }}/hr on Upwork</div>{% endif %}
+  </div>
+  <div class="prose">{{ upwork_profile.overview or "No overview imported yet." }}</div>
+  {% if upwork_skills %}
+  <p class="sub" style="margin-top:12px">{{ upwork_skills | join(", ") }}</p>
+  {% endif %}
+</div>
+{% else %}
+<div class="card" style="margin-top:24px">
+  <h2>Upwork profile (read-only)</h2>
+  <p class="empty">Not imported yet. Connect Upwork, then click Sync from Upwork on the Portfolio page.</p>
+</div>
+{% endif %}
+
+<h2 style="margin-top:32px">Active rules</h2>
+{% if rules %}
+<table>
+  <thead>
+    <tr>
+      <th>Category</th>
+      <th>Rule</th>
+      <th>Level</th>
+      <th>State</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rules %}
+    <tr>
+      <td>{{ row.category }}</td>
+      <td>{{ row.rule }}</td>
+      <td>{{ row.enforcement_level }}</td>
+      <td>{% if row.active %}on{% else %}off{% endif %}</td>
+      <td class="actions">
+        <form method="post" action="/preferences/rules/{{ row.id }}/toggle">
+          <button class="btn secondary" type="submit">Toggle</button>
+        </form>
+        <form method="post" action="/preferences/rules/{{ row.id }}/delete">
+          <button class="btn danger" type="submit">Delete</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No rules yet. Add one above or reject jobs with a reason.</p>
+{% endif %}
+{% endblock %}

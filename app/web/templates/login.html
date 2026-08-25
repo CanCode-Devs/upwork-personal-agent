@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · Job Watcher</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@500&display=swap">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="login-wrap">
+    <form class="login" method="post" action="/login">
+      <h1>Job Watcher</h1>
+      <p class="sub">Sign in to review drafts and approve submissions.</p>
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" autocomplete="username" required>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      {% if error %}<p class="error">{{ error }}</p>{% endif %}
+      <p style="margin-top:20px"><button class="btn" type="submit">Sign in</button></p>
+    </form>
+  </div>
+</body>
+</html>

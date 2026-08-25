@@ -1,0 +1,371 @@
+{% extends "base.html" %}
+{% block title %}{{ job.title }} · Job Watcher{% endblock %}
+{% block content %}
+<div class="top">
+  <div>
+    <h1>{{ job.title }}</h1>
+    <div class="sub"><span class="badge {{ job.status }}">{{ job.status }}</span></div>
+  </div>
+  <a href="/">Back to inbox</a>
+</div>
+
+<div class="meta">
+  <div>Score: <strong>{{ job.score if job.score is not none else "—" }}</strong> — {{ job.score_reason or "" }}</div>
+  <div>Price: {{ card.price_label if card else job.budget or "—" }}</div>
+  <div>Timezone: {{ card.timezone if card else "—" }}{% if card and card.location %} · {{ card.location }}{% endif %}</div>
+  <div>Upwork id: {{ job.upwork_id }}</div>
+  {% if job.applied_on_upwork %}<div><span class="badge submitted">Already applied on Upwork</span></div>{% endif %}
+  {% if job.url %}<div><a href="{{ job.url }}" target="_blank" rel="noreferrer">Open on Upwork</a></div>{% endif %}
+  <div>Expires: {{ job.expires_at|dt }}</div>
+</div>
+
+{% if request.query_params.get('regenerated') %}
+<div class="banner ok">Proposal regenerated. Review the letter and milestones before submit.</div>
+{% elif request.query_params.get('skipped') %}
+<div class="banner">This job no longer passes Settings, so it was skipped instead of drafting a letter.</div>
+{% elif request.query_params.get('error') == 'blocked' %}
+<div class="banner">This job cannot be regenerated (already applied or not in Pending).</div>
+{% elif request.query_params.get('error') %}
+<div class="banner">Could not regenerate the proposal. Check the log on this page.</div>
+{% elif request.query_params.get('saved') %}
+<div class="banner ok">Edits saved.</div>
+{% endif %}
+
+{% if card and card.facts %}
+<div class="card" style="margin-bottom:20px">
+  <h2>Client</h2>
+  <div class="facts">
+    {% for fact in card.facts %}
+    <div><span>{{ fact.label }}</span><b>{{ fact.value }}</b></div>
+    {% endfor %}
+  </div>
+  {% if card.open_contracts %}
+  <h2 style="margin-top:16px">Open contracts</h2>
+  {% for item in card.open_contracts %}
+  <div class="event"><b>{{ item.title }}</b> — {{ item.detail }}</div>
+  {% endfor %}
+  {% endif %}
+  {% if card.closed_contracts %}
+  <h2 style="margin-top:16px">Recent closed contracts</h2>
+  {% for item in card.closed_contracts %}
+  <div class="event"><b>{{ item.title }}</b> — {{ item.detail }}</div>
+  {% endfor %}
+  {% endif %}
+  {% if card.client_reviews %}
+  <h2 style="margin-top:16px">Freelancer reviews of this client</h2>
+  {% for item in card.client_reviews %}
+  <div class="event">
+    {% if item.reviewer %}<b>{{ item.reviewer }}</b> — {% endif %}
+    {% if item.rating is not none %}{{ item.rating }}★ · {% endif %}
+    {{ item.title }}
+    {% if item.comment %}<div>{{ item.comment }}</div>{% endif %}
+  </div>
+  {% endfor %}
+  {% endif %}
+  {% if card.attachments %}
+  <h2 style="margin-top:16px">Posting attachments</h2>
+  {% for item in card.attachments %}
+  <div class="event">
+    {% if item.local_url %}<a href="{{ item.local_url }}">{{ item.filename }}</a>
+    {% elif item.url %}<a href="{{ item.url }}" target="_blank" rel="noreferrer">{{ item.filename }}</a>
+    {% else %}{{ item.filename }}{% endif %}
+    {% if item.error %} — {{ item.error }}{% endif %}
+    {% if item.text %}<div class="prose job-snippet">{{ item.text[:800] }}</div>{% endif %}
+  </div>
+  {% endfor %}
+  {% endif %}
+</div>
+{% endif %}
+
+{% if breakdown %}
+<div class="card" style="margin-bottom:20px">
+  <h2>Score breakdown</h2>
+  {% for item in breakdown %}
+  <div class="event">{{ item }}</div>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if matched_context %}
+<div class="card" style="margin-bottom:20px">
+  <h2>Matched portfolio / history</h2>
+  {% for item in matched_context %}
+  <div class="event">{{ item }}</div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="job-grid">
+  <div>
+    <h2>Posting</h2>
+    <div class="prose">{{ job.description or "No description stored." }}</div>
+  </div>
+  <div>
+    <h2>Cover letter</h2>
+    {% if can_act and not job.applied_on_upwork %}
+    <form method="post" action="/jobs/{{ job.id }}/regenerate" style="margin-bottom:16px">
+      <label for="regen_comments">Regenerate proposal</label>
+      <textarea id="regen_comments" name="comments" class="short" placeholder="Optional comments, e.g. stress n8n, answer the 5 apply items, shorter CTA"></textarea>
+      <p class="muted">Rewrites the letter, milestones (if fixed-price), screening answers, and highlights. Does not submit.</p>
+      <div class="actions" style="margin-top:8px">
+        <button class="btn secondary" type="submit">Regenerate</button>
+      </div>
+    </form>
+    {% endif %}
+    <form id="proposal-form" method="post" action="/jobs/{{ job.id }}/edit" enctype="multipart/form-data">
+      <textarea name="cover_letter" {% if not can_act %}readonly{% endif %}>{{ cover_letter }}</textarea>
+      {% if can_act %}
+      <div
+        id="connects-panel"
+        class="connects-panel"
+        data-available="{% if connects.available is not none %}{{ connects.available }}{% endif %}"
+        data-apply="{% if connects.apply_cost is not none %}{{ connects.apply_cost }}{% endif %}"
+        data-can-apply="{% if connects.can_apply is sameas true %}1{% elif connects.can_apply is sameas false %}0{% endif %}"
+      >
+        <h3>Connects</h3>
+        {% if connects.error %}
+        <p class="muted">{{ connects.error }}</p>
+        {% endif %}
+        <dl class="connects-stats">
+          <div><dt>Available</dt><dd>{% if connects.available is not none %}{{ connects.available }}{% else %}not available from Upwork{% endif %}</dd></div>
+          <div><dt>To apply</dt><dd>{% if connects.apply_cost is not none %}{{ connects.apply_cost }}{% else %}not available from Upwork{% endif %}</dd></div>
+          <div><dt id="connects-remaining-label">Remaining after apply</dt><dd id="connects-remaining">{% if connects.remaining_after_apply is not none %}{{ connects.remaining_after_apply }}{% else %}—{% endif %}</dd></div>
+        </dl>
+        {% if connects.boost_available %}
+        <label for="boost_connects">Boost (optional Connects)</label>
+        <input id="boost_connects" name="boost_connects" type="number" min="0" step="1" placeholder="leave empty — no boost">
+        {% if connects.recommended_connects is not none %}
+        <p class="muted">Recommended: {{ connects.recommended_connects }}{% if connects.rationale %} — {{ connects.rationale }}{% endif %}</p>
+        {% endif %}
+        {% if connects.bids_unknown %}
+        <p class="muted">Current boost bids are not available from Upwork.</p>
+        {% elif connects.top_bids %}
+        <p class="muted">{{ connects.bid_count }} bids in boost. Top boosts: {{ connects.top_bids|join(", ") }}</p>
+        {% else %}
+        <p class="muted">No current top boost bids returned.</p>
+        {% endif %}
+        {% else %}
+        <input type="hidden" name="boost_connects" value="">
+        <p class="muted">{% if connects.boost_reason %}{{ connects.boost_reason }}{% else %}Boost is not available for this job.{% endif %}</p>
+        {% endif %}
+        <p id="connects-short" class="connects-warn" hidden>Not enough Connects for apply + boost.</p>
+      </div>
+      {% if screening %}
+      <div class="milestones-panel">
+        <h3>Screening questions</h3>
+        <p class="muted">Required. Answers go with the proposal.</p>
+        {% for item in screening %}
+        <div class="screening-row">
+          <label>{{ item.question }}</label>
+          <input type="hidden" name="sq_question" value="{{ item.question }}">
+          <textarea name="sq_answer" class="short" data-screening-required>{{ item.answer }}</textarea>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+      {% if highlights %}
+      <div class="milestones-panel" id="highlights-panel">
+        <h3>Portfolio, jobs, and certificates</h3>
+        <p class="muted">AI pre-checked up to 4 closest matches. <b>Upwork contract</b> means work actually done on Upwork. <b>Profile history</b> is employment you added to your profile and is listed for context only — it is never selected as a proposal highlight. Upwork attaches projects and certificates on submit.</p>
+        {% for item in highlights %}
+        <label class="check">
+          {% if item.kind == "certificate" %}
+          <input type="checkbox" name="certificate_ids" value="{{ item.id }}" {% if item.selected %}checked{% endif %}>
+          Certificate: {{ item.title }}
+          {% elif item.kind == "upwork_job" %}
+          <input type="checkbox" name="job_history_ids" value="{{ item.id }}" {% if item.selected %}checked{% endif %}>
+          Upwork contract: {{ item.title }}
+          {% elif item.kind == "profile_history" %}
+          <input type="checkbox" name="profile_history_ids" value="{{ item.id }}" disabled>
+          Profile history: {{ item.title }}
+          {% else %}
+          <input type="checkbox" name="portfolio_project_ids" value="{{ item.id }}" {% if item.selected %}checked{% endif %}>
+          Project: {{ item.title }}
+          {% endif %}
+        </label>
+        {% endfor %}
+      </div>
+      {% endif %}
+      <div class="milestones-panel">
+        <h3>Attachments</h3>
+        <p class="muted">Optional. Default is no files. If you attach files they upload to Upwork on submit.</p>
+        <label class="check">
+          <input type="radio" name="attach_choice" value="skip" checked>
+          Skip, no files
+        </label>
+        <label class="check">
+          <input type="radio" name="attach_choice" value="files" id="attach-files-choice">
+          Attach files
+        </label>
+        <input id="proposal-files" name="proposal_files" type="file" multiple>
+      </div>
+      {% if show_milestones %}
+      <div class="milestones-panel">
+        <h3>Milestones</h3>
+        <input type="hidden" name="milestones_present" value="1">
+        {% if connects.milestones_allowed %}
+        <p class="muted">This fixed-price job allows escrow milestones. Review the breakdown before submit — totals should match the bid.</p>
+        {% else %}
+        <p class="muted">Upwork did not confirm escrow milestones for this job. This plan is included in the proposal for review.</p>
+        {% endif %}
+        <div class="milestone-head"><span>Title</span><span>Description</span><span>Amount</span></div>
+        {% for item in milestones %}
+        <div class="milestone-row">
+          <input name="ms_title" type="text" value="{{ item.title }}">
+          <input name="ms_description" type="text" value="{{ item.description }}">
+          <input name="ms_amount" type="number" min="0" step="0.01" value="{{ item.amount }}">
+        </div>
+        {% endfor %}
+        <div class="milestone-row">
+          <input name="ms_title" type="text" placeholder="Optional extra">
+          <input name="ms_description" type="text" placeholder="Leave blank to skip">
+          <input name="ms_amount" type="number" min="0" step="0.01" placeholder="0">
+        </div>
+      </div>
+      {% endif %}
+      <div class="actions" style="margin-top:12px">
+        <button class="btn secondary" type="submit">Save edit</button>
+        <button id="approve-btn" class="btn" type="submit" formaction="/jobs/{{ job.id }}/approve">Approve &amp; submit</button>
+      </div>
+      {% endif %}
+    </form>
+    {% if can_act %}
+    <form method="post" action="/jobs/{{ job.id }}/reject" style="margin-top:16px">
+      <label for="reason">Reject reason (helps the agent learn)</label>
+      <input id="reason" name="reason" type="text" placeholder="e.g. no budget, WordPress, too junior">
+      <div class="actions" style="margin-top:12px">
+        <button class="btn danger" type="submit">Reject</button>
+      </div>
+    </form>
+    {% endif %}
+
+    <form method="post" action="/jobs/{{ job.id }}/outcome" style="margin-top:24px">
+      <h2>Outcome log</h2>
+      <label for="outcome">What happened after apply?</label>
+      <select id="outcome" name="outcome">
+        <option value="viewed">Viewed</option>
+        <option value="shortlisted">Shortlisted</option>
+        <option value="hired">Hired</option>
+        <option value="ignored">Ignored</option>
+        <option value="rejected">Rejected by client</option>
+      </select>
+      <label for="client_notes">Notes</label>
+      <input id="client_notes" name="client_notes" type="text" placeholder="Client said they wanted a video intro">
+      <div class="actions" style="margin-top:12px">
+        <button class="btn secondary" type="submit">Save outcome</button>
+      </div>
+    </form>
+    {% if outcomes %}
+    <div class="card" style="margin-top:16px">
+      {% for row in outcomes %}
+      <div class="event">
+        <time>{{ row.created_at|dt }}</time>
+        {{ row.outcome }} — {{ row.client_notes }}
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    <div class="card" style="margin-top:20px">
+      <h2>Log</h2>
+      {% for event in events %}
+      <div class="event">
+        <time>{{ event.created_at|dt }}</time>
+        {{ event.kind }} — {{ event.message }}
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+{% if can_act %}
+<script>
+(function () {
+  const boxes = document.querySelectorAll("#highlights-panel input[type=checkbox]:not([disabled])");
+  const limit = 4;
+  boxes.forEach((box) => {
+    box.addEventListener("change", () => {
+      if (!box.checked) return;
+      const checked = [...boxes].filter((el) => el.checked);
+      if (checked.length <= limit) return;
+      box.checked = false;
+    });
+  });
+})();
+(function () {
+  const panel = document.getElementById("connects-panel");
+  const form = document.getElementById("proposal-form");
+  const boostInput = document.getElementById("boost_connects");
+  const remainingEl = document.getElementById("connects-remaining");
+  const remainingLabel = document.getElementById("connects-remaining-label");
+  const shortEl = document.getElementById("connects-short");
+  const approveBtn = document.getElementById("approve-btn");
+  if (!panel || !form || !approveBtn) return;
+
+  function num(value) {
+    if (value === "" || value == null) return null;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function boostValue() {
+    if (!boostInput || boostInput.type === "hidden") return 0;
+    const raw = String(boostInput.value || "").trim();
+    if (!raw) return 0;
+    const parsed = parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+
+  function sync() {
+    const available = num(panel.dataset.available);
+    const apply = num(panel.dataset.apply);
+    const boost = boostValue();
+    const canApply = panel.dataset.canApply;
+    if (remainingLabel) {
+      remainingLabel.textContent = boost > 0 ? "Remaining after apply + boost" : "Remaining after apply";
+    }
+    if (remainingEl && available != null && apply != null) {
+      remainingEl.textContent = String(available - apply - boost);
+    }
+    const short = available != null && apply != null && available < apply + boost;
+    const blocked = short || canApply === "0";
+    if (shortEl) shortEl.hidden = !short;
+    approveBtn.disabled = blocked;
+  }
+
+  if (boostInput && boostInput.type !== "hidden") {
+    boostInput.addEventListener("input", sync);
+  }
+  form.addEventListener("submit", function (event) {
+    const submitter = event.submitter;
+    if (!submitter || submitter.id !== "approve-btn") return;
+    if (approveBtn.disabled) {
+      event.preventDefault();
+      return;
+    }
+    const screening = form.querySelectorAll("[data-screening-required]");
+    for (const field of screening) {
+      if (!String(field.value || "").trim()) {
+        event.preventDefault();
+        window.alert("Answer every screening question before submit.");
+        return;
+      }
+    }
+    const attachChoice = form.querySelector('input[name="attach_choice"]:checked');
+    const fileInput = document.getElementById("proposal-files");
+    if (attachChoice && attachChoice.value === "files" && (!fileInput || !fileInput.files || fileInput.files.length === 0)) {
+      event.preventDefault();
+      window.alert("Choose files or select Skip, no files.");
+      return;
+    }
+    const apply = num(panel.dataset.apply);
+    const boost = boostValue();
+    const applyLabel = apply == null ? "?" : String(apply);
+    const total = apply == null ? "?" : String(apply + boost);
+    const ok = window.confirm("Submit for " + total + " Connects (" + applyLabel + " apply + " + boost + " boost)?");
+    if (!ok) event.preventDefault();
+  });
+  sync();
+})();
+</script>
+{% endif %}
+{% endblock %}

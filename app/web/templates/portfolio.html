@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+{% block title %}Portfolio · Job Watcher{% endblock %}
+{% block content %}
+<div class="top">
+  <div>
+    <h1>Work memory</h1>
+    <div class="sub">Upwork history is imported read-only. Agent notes (outside Upwork) are what you edit for drafts.</div>
+  </div>
+  <form method="post" action="/portfolio/sync-upwork">
+    <button class="btn secondary" type="submit">Sync from Upwork</button>
+  </form>
+</div>
+
+<div class="card" style="margin-bottom:24px">
+  <h2>Add agent note</h2>
+  <p class="sub">Editable case studies, jobs, and outcomes from outside Upwork. The proposal writer retrieves these alongside Upwork history.</p>
+  <form method="post" action="/portfolio">
+    <label for="project_title">Title</label>
+    <input id="project_title" name="project_title" type="text" required>
+    <label for="tech_stack">Tech stack (comma-separated)</label>
+    <input id="tech_stack" name="tech_stack" type="text" placeholder="Python, LangGraph, AWS">
+    <label for="outcomes_achieved">Outcomes</label>
+    <input id="outcomes_achieved" name="outcomes_achieved" type="text" placeholder="Cut review time 60%">
+    <label for="associated_keywords">Keywords (comma-separated)</label>
+    <input id="associated_keywords" name="associated_keywords" type="text" placeholder="OCR, RAG, medical">
+    <label for="description">Description</label>
+    <textarea id="description" name="description" class="short" placeholder="What you built, for whom, and what shipped."></textarea>
+    <div class="actions" style="margin-top:16px">
+      <button class="btn" type="submit">Save agent note</button>
+    </div>
+  </form>
+</div>
+
+<h2>Agent notes (editable)</h2>
+{% if agent_items %}
+{% for item in agent_items %}
+<div class="card" style="margin-bottom:16px">
+  <form method="post" action="/portfolio/{{ item.id }}/edit">
+    <label>Title</label>
+    <input name="project_title" type="text" value="{{ item.project_title }}" required>
+    <label>Tech stack</label>
+    <input name="tech_stack" type="text" value="{{ item.tech_stack | join(', ') }}">
+    <label>Outcomes</label>
+    <input name="outcomes_achieved" type="text" value="{{ item.outcomes_achieved }}">
+    <label>Keywords</label>
+    <input name="associated_keywords" type="text" value="{{ item.associated_keywords | join(', ') }}">
+    <label>Description</label>
+    <textarea name="description" class="short">{{ item.description }}</textarea>
+    <div class="actions" style="margin-top:12px">
+      <button class="btn" type="submit">Save</button>
+    </div>
+  </form>
+  <form method="post" action="/portfolio/{{ item.id }}/delete" style="margin-top:8px">
+    <button class="btn danger" type="submit">Delete</button>
+  </form>
+</div>
+{% endfor %}
+{% else %}
+<p class="empty">No agent notes yet. Add work from outside Upwork above.</p>
+{% endif %}
+
+<h2 style="margin-top:32px">From Upwork (read-only)</h2>
+<p class="sub">Imported history, employment, and portfolio. These cannot be edited here. Drafts retrieve this alongside your agent notes.</p>
+{% if upwork_items %}
+<table>
+  <thead>
+    <tr>
+      <th>Type</th>
+      <th>Title</th>
+      <th>Outcomes</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for item in upwork_items %}
+    <tr>
+      <td><span class="badge">{% if item.kind == "employment" %}profile history{% elif item.kind == "job_history" %}Upwork contract{% else %}{{ item.kind }}{% endif %}</span></td>
+      <td class="title">{{ item.project_title }}</td>
+      <td>{{ item.outcomes_achieved or "—" }}</td>
+      <td>{{ item.description[:220] }}{% if item.description|length > 220 %}…{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">Nothing imported yet. Connect Upwork, then click Sync from Upwork.</p>
+{% endif %}
+
+<h2 style="margin-top:32px">Upwork proposals (read-only)</h2>
+<p class="sub">Application history. Shown for context, not treated as completed work in drafts.</p>
+{% if upwork_proposals %}
+<table>
+  <thead>
+    <tr>
+      <th>Status</th>
+      <th>Job</th>
+      <th>Notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for item in upwork_proposals %}
+    <tr>
+      <td><span class="badge">{{ item.outcomes_achieved or item.kind }}</span></td>
+      <td class="title">{{ item.project_title }}</td>
+      <td>{{ item.description[:220] }}{% if item.description|length > 220 %}…{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No proposals imported yet.</p>
+{% endif %}
+{% endblock %}

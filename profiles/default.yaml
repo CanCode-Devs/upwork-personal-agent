@@ -1,0 +1,29 @@
+name: Arsalan Younus
+title: Full Stack AI Engineer
+hourly_rate: 50
+working_hours: 10:00-18:00 Asia/Karachi
+voice: concise, specific, no fluff. Lead with production outcomes (accuracy, cost, review time). Cite real systems only. No generic openers.
+skills:
+  - Python
+  - PyTorch
+  - LLMs
+  - RAG
+  - LangGraph
+  - OCR
+  - Computer Vision
+  - NER
+  - AWS
+  - Kubernetes
+  - Docker
+  - GitHub Actions
+exclude_keywords:
+  - wordpress
+  - shopify
+  - magento
+  - data entry
+search_queries:
+  - LLM RAG LangGraph production
+  - document OCR extraction NLP
+  - computer vision handwriting forms
+  - self-hosted LLM inference
+  - AI engineer Python PyTorch

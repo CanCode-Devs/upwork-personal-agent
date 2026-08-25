@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Connecting Upwork · Job Watcher{% endblock %}
+{% block extra_head %}
+<meta http-equiv="refresh" content="1;url=/upwork/connect">
+{% endblock %}
+{% block content %}
+<div class="top">
+  <div>
+    <h1>Connecting Upwork</h1>
+    <div class="sub">Waiting for Upwork to return an authorization URL.</div>
+  </div>
+</div>
+<div class="banner">{{ status_message }}</div>
+<p class="empty">If this is still here after a minute, go back to the <a href="/">Inbox</a>.</p>
+{% endblock %}
