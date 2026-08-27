@@ -46,6 +46,9 @@ def load_runtime(db: Session | None = None, settings: Settings | None = None) ->
             min_client_hires=getattr(row, "min_client_hires", None),
             max_proposal_count=getattr(row, "max_proposal_count", None),
             prefer_timezones=getattr(row, "prefer_timezones", "") or "",
+            skip_us_work_auth=bool(getattr(row, "skip_us_work_auth", True)),
+            skip_w2_only=bool(getattr(row, "skip_w2_only", True)),
+            skip_onsite=bool(getattr(row, "skip_onsite", True)),
         )
     finally:
         if own:

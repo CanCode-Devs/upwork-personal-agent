@@ -271,7 +271,12 @@ async def log_interaction_feedback(
         session.flush()
         if job is not None:
             add_event(session, "feedback", f"{args.outcome.value}: {args.client_notes[:400]}", job.id)
-            if args.outcome in {FeedbackOutcome.hired, FeedbackOutcome.shortlisted, FeedbackOutcome.approved}:
+            if args.outcome in {
+                FeedbackOutcome.hired,
+                FeedbackOutcome.shortlisted,
+                FeedbackOutcome.messaged,
+                FeedbackOutcome.approved,
+            }:
                 add_embedding(
                     session,
                     EmbeddingSource.job,
@@ -346,7 +351,7 @@ register_tool(
                 "job_id": {"type": "string"},
                 "outcome": {
                     "type": "string",
-                    "enum": ["hired", "shortlisted", "viewed", "ignored", "rejected", "approved", "edited", "expired"],
+                    "enum": ["hired", "shortlisted", "messaged", "viewed", "ignored", "rejected", "approved", "edited", "expired"],
                 },
                 "client_notes": {"type": "string"},
             },

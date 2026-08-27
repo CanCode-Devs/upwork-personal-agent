@@ -231,27 +231,43 @@ def cap_highlight_picks(
     }
 
 
+_PROOF_KINDS = {
+    WorkKind.job_history.value,
+    WorkKind.project.value,
+    WorkKind.employment.value,
+}
+
+
+def _is_employment(item: PortfolioItem) -> bool:
+    status = (item.outcomes_achieved or "").strip().lower()
+    return item.kind == WorkKind.employment.value or status == "employment"
+
+
+def _proof_origin_label(item: PortfolioItem) -> str:
+    if _is_employment(item):
+        return "profile employment history"
+    if item.kind == WorkKind.job_history.value:
+        return "completed Upwork contract"
+    return "portfolio project"
+
+
 def _pick_proof(session: Session, matches: list[ContextMatch]) -> tuple[str, PortfolioItem | None]:
-    ranked = [item for item in matches if item.source_type != EmbeddingSource.proposal.value]
-    preferred = [item for item in ranked if item.origin == "upwork"] or ranked or matches[:1]
-    if not preferred:
+    ranked: list[tuple[ContextMatch, PortfolioItem]] = []
+    for match in matches:
+        if match.source_type != EmbeddingSource.portfolio.value:
+            continue
+        item = session.query(PortfolioItem).filter(PortfolioItem.id == match.source_id).one_or_none()
+        if item is None or item.kind not in _PROOF_KINDS:
+            continue
+        ranked.append((match, item))
+    if not ranked:
         return "", None
-    chosen = preferred[0]
-    item = None
-    if chosen.source_type == EmbeddingSource.portfolio.value:
-        item = session.query(PortfolioItem).filter(PortfolioItem.id == chosen.source_id).one_or_none()
-    label = chosen.title or (item.project_title if item else "relevant work")
-    origin = "case study"
-    if item is not None:
-        status = (item.outcomes_achieved or "").lower()
-        if item.kind == WorkKind.employment.value or status == "employment":
-            origin = "profile employment history"
-        elif item.kind == WorkKind.job_history.value:
-            origin = "Upwork contract"
-        elif chosen.origin == "upwork":
-            origin = "Upwork history"
-    elif chosen.origin == "upwork":
-        origin = "Upwork history"
+    preferred = [
+        pair for pair in ranked if pair[1].kind == WorkKind.job_history.value and not _is_employment(pair[1])
+    ]
+    chosen, item = (preferred or ranked)[0]
+    label = chosen.title or item.project_title or "relevant work"
+    origin = _proof_origin_label(item)
     return f"[{origin}] {label}: {chosen.text[:1200]}", item
 
 
@@ -374,7 +390,7 @@ async def generate_tailored_pitch(
             details = {}
         attachment_text = str(details.get("attachment_text") or "") if isinstance(details, dict) else ""
         blob = f"{job.title}\n{job.description}\n{attachment_text}"
-        matches = query_similar(session, blob, top_k=16)
+        matches = query_similar(session, blob, top_k=8, source_type=EmbeddingSource.portfolio.value)
         proof_text, proof_item = _pick_proof(session, matches)
         payload = _job_payload(job)
         bid = bid_amount_for_job(job, profile.hourly_rate)
@@ -436,18 +452,20 @@ async def generate_tailored_pitch(
             profile_ids = picks["profile_history_ids"]
         try:
             preview = await client.preview_proposal(job.upwork_id, drafted.cover_letter, bid)
-            questions = preview.screening_questions
-            if questions:
-                screening = await llm_screening_answers(
+        except Exception:
+            logger.exception("proposal preview failed for job %s", job.id)
+            preview = None
+        questions = preview.screening_questions if preview is not None else []
+        if questions:
+                screening = llm_screening_answers(
                     payload,
                     profile,
                     settings,
                     drafted.cover_letter,
                     questions,
                     screening_instructions=writer.screening_instructions,
+                    proof=proof_text,
                 )
-        except Exception:
-            logger.exception("proposal preview/screening failed for job %s", job.id)
         drafted.screening_answers = screening
         drafted.portfolio_project_ids = portfolio_ids
         drafted.certificate_ids = certificate_ids

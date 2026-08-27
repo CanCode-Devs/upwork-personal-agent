@@ -1,8 +1,8 @@
 import json
+from typing import Any, TypedDict
 
+from openai import BadRequestError, OpenAI
 from pydantic import ValidationError
-
-from openai import OpenAI
 
 from app.config import Settings
 from app.milestones import coerce_milestones
@@ -14,6 +14,7 @@ from app.models import (
     ReplyIntentKind,
     ScoreResult,
     ScreeningAnswer,
+    SearchQueryContext,
     StyleExample,
     SuggestReplyResult,
     display_intent_label,
@@ -29,6 +30,11 @@ from app.proposal_writer import (
 )
 
 
+class ChatMessage(TypedDict):
+    role: str
+    content: str
+
+
 def _client(settings: Settings) -> OpenAI:
     kwargs: dict[str, object] = {"api_key": settings.openai_api_key}
     base = (settings.openai_base_url or "").strip()
@@ -39,6 +45,41 @@ def _client(settings: Settings) -> OpenAI:
 def _require_key(settings: Settings) -> None:
     if not settings.openai_api_key:
         raise RuntimeError("OpenAI API key is required to draft proposals")
+
+
+def _temperature_supported(model: str) -> bool:
+    name = model.strip().lower()
+    return not name.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
+def _complete_json(
+    client: OpenAI,
+    model: str,
+    messages: list[ChatMessage],
+    temperature: float,
+) -> dict[str, Any]:
+    kwargs: dict[str, object] = {
+        "model": model,
+        "messages": messages,
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        if _temperature_supported(model):
+            response = client.chat.completions.create(**kwargs, temperature=temperature)
+        else:
+            response = client.chat.completions.create(**kwargs)
+    except BadRequestError as exc:
+        if "temperature" not in str(exc).lower():
+            raise
+        response = client.chat.completions.create(**kwargs)
+    content = response.choices[0].message.content or "{}"
+    parsed = json.loads(content)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def draft_model(settings: Settings) -> str:
+    value = (settings.openai_draft_model or "").strip()
+    return value or settings.openai_model
 
 
 def llm_score(job: JobPayload, profile: FreelancerProfile, settings: Settings) -> ScoreResult:
@@ -52,17 +93,17 @@ def llm_score(job: JobPayload, profile: FreelancerProfile, settings: Settings) -
         f"Profile:\n{profile.model_dump_json(indent=2)}\n\n"
         f"Job:\n{json.dumps(job_context(job), ensure_ascii=False, indent=2)}"
     )
-    response = client.chat.completions.create(
-        model=settings.openai_model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.2,
+    parsed = ScoreResult.model_validate(
+        _complete_json(
+            client,
+            settings.openai_model,
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            0.2,
+        )
     )
-    content = response.choices[0].message.content or "{}"
-    parsed = ScoreResult.model_validate_json(content)
     parsed.go = parsed.should_apply
     return parsed
 
@@ -103,12 +144,15 @@ def llm_draft(
     proof_block = ""
     if proof.strip():
         proof_block = (
-            "\n\nONE relevant project. Cite this as evidence. Do not invent contracts, metrics, or clients:\n"
+            "\n\nONE completed project/contract from YOUR work history. Cite only this. "
+            "Never claim you worked a job posting you applied to. "
+            "Do not invent contracts, metrics, clients, or employers:\n"
             + proof.strip()
         )
     elif examples:
         proof_block = (
-            "\n\nONE relevant project from this context. Cite only what is here:\n" + "\n---\n".join(examples[:1])
+            "\n\nONE completed project from this context. Cite only what is here. "
+            "Never treat a job posting as work you did:\n" + "\n---\n".join(examples[:1])
         )
     focus_block = ""
     if focus_points:
@@ -149,17 +193,15 @@ def llm_draft(
         f"Job:\n{json.dumps(job_context(job), ensure_ascii=False, indent=2)}"
         f"{proof_block}{focus_block}{apply_block}{screening_block}{style_block}"
     )
-    response = client.chat.completions.create(
-        model=settings.openai_model,
-        messages=[
+    parsed = _complete_json(
+        client,
+        draft_model(settings),
+        [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        response_format={"type": "json_object"},
-        temperature=0.4,
+        0.4,
     )
-    content = response.choices[0].message.content or "{}"
-    parsed = json.loads(content)
     letter = finalize_letter(str(parsed.get("cover_letter") or ""), hook=opening_hook, enforce=enforce_hook)
     if not letter:
         raise RuntimeError("LLM returned an empty cover letter")
@@ -175,6 +217,7 @@ def llm_screening_answers(
     letter: str,
     questions: list[str],
     screening_instructions: str = "",
+    proof: str = "",
 ) -> list[ScreeningAnswer]:
     cleaned = [item.strip() for item in questions if item.strip()]
     if not cleaned:
@@ -182,32 +225,88 @@ def llm_screening_answers(
     _require_key(settings)
     client = _client(settings)
     extra = screening_instructions.strip() or "Be specific to this job. No buzzwords. No em dashes."
+    numbered = "\n".join(f"{index}. {item}" for index, item in enumerate(cleaned, 1))
+    proof_block = ""
+    if proof.strip():
+        proof_block = (
+            "Completed work you may cite. Do not cite job postings or applications:\n"
+            + proof.strip()
+            + "\n\n"
+        )
     user = (
         f"Profile:\n{json.dumps(profile_for_prompt(profile), ensure_ascii=False, indent=2)}\n\n"
         f"Job:\n{json.dumps(job_context(job), ensure_ascii=False, indent=2)}\n\n"
+        f"{proof_block}"
         f"Cover letter already written:\n{letter[:4000]}\n\n"
-        "Answer each screening question in JSON {\"screening_answers\": [{\"question\", \"answer\"}]}. "
+        f"Official Upwork screening questions:\n{numbered}\n\n"
+        "Answer every question in JSON {\"screening_answers\": [{\"question\", \"answer\"}]}. "
+        "Copy each question text exactly. Do not return an empty array. "
+        "Only cite completed contracts, portfolio projects, or employment. "
+        "Never claim you worked a job you only applied to. "
         + extra
     )
-    response = client.chat.completions.create(
-        model=settings.openai_model,
-        messages=[
+    parsed = _complete_json(
+        client,
+        draft_model(settings),
+        [
             {
                 "role": "system",
                 "content": "Answer Upwork screening questions for a technical freelancer. Return JSON only.",
             },
             {"role": "user", "content": user},
         ],
-        response_format={"type": "json_object"},
-        temperature=0.3,
+        0.3,
     )
-    content = response.choices[0].message.content or "{}"
-    parsed = json.loads(content)
     answers = parse_screening_answers(parsed.get("screening_answers"), cleaned)
-    return [
+    filled = [
         ScreeningAnswer(question=item.question, answer=sanitize_proposal(item.answer))
         for item in answers
     ]
+    if any(not item.answer.strip() for item in filled):
+        raise RuntimeError("LLM returned empty screening answers")
+    return filled
+
+
+def llm_suggest_search_queries(context: SearchQueryContext, settings: Settings) -> list[str]:
+    _require_key(settings)
+    client = _client(settings)
+    system = (
+        "You propose Upwork job-search keyword queries for one freelancer. "
+        "Return JSON only with key queries: an array of 6 to 10 short strings. "
+        "Each query is 3 to 7 keywords like 'LLM RAG LangGraph production'. "
+        "Use only skills and work that appear in the profile or history. "
+        "Never suggest excluded keywords. Do not repeat current_queries. "
+        "Prefer specific stacks over generic titles like AI engineer."
+    )
+    user = json.dumps(context, ensure_ascii=False, indent=2)
+    parsed = _complete_json(
+        client,
+        settings.openai_model,
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        0.3,
+    )
+    raw = parsed.get("queries")
+    if not isinstance(raw, list):
+        raw = parsed.get("search_queries")
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        text = " ".join(str(item or "").split())
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+        if len(out) >= 10:
+            break
+    return out
 
 
 def clamp_reply_intents(result: SuggestReplyResult) -> list[ReplyIntent]:
@@ -280,16 +379,16 @@ def llm_suggest_reply(
         f"Transcript (oldest first):\n{transcript[:12000]}\n\n"
         "Return {\"intents\": [{\"kind\", \"label\", \"text\"}, ...]}."
     )
-    response = client.chat.completions.create(
-        model=settings.openai_model,
-        messages=[
+    parsed = _complete_json(
+        client,
+        settings.openai_model,
+        [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        response_format={"type": "json_object"},
-        temperature=0.4,
+        0.4,
     )
-    result = parse_suggest_reply(response.choices[0].message.content or "{}")
+    result = parse_suggest_reply(json.dumps(parsed))
     if not result.intents:
         raise RuntimeError("LLM returned no reply intents")
     return result

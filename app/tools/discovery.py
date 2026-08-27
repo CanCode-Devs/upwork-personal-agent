@@ -10,6 +10,7 @@ from app.config import Settings, get_settings
 from app.db.models import FeedbackLog, Job, PreferenceRule
 from app.db.session import SessionLocal
 from app.embeddings import query_similar
+from app.eligibility import hard_block_reasons
 from app.events import add_event
 from app.models import (
     ContextMatch,
@@ -153,6 +154,19 @@ def _job_client_fields(job: Job) -> tuple[str, float | None, int | None]:
     return payment, rating, hires
 
 
+def _eligibility_fields(job: Job) -> tuple[str, str]:
+    try:
+        data = json.loads(job.client_json or "{}")
+    except json.JSONDecodeError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    attachment = str(data.get("attachment_text") or "")
+    quals = data.get("preferred_qualifications") if isinstance(data.get("preferred_qualifications"), dict) else {}
+    contractor = str(quals.get("contractor_type") or "") if isinstance(quals, dict) else ""
+    return attachment, contractor
+
+
 def hard_gate_reasons(
     runtime: RuntimeSettings,
     profile: FreelancerProfile,
@@ -165,6 +179,7 @@ def hard_gate_reasons(
     rating: float | None,
     hires: int | None,
     blob: str,
+    contractor_type: str = "",
 ) -> list[str]:
     reasons: list[str] = []
     if score is not None and score < runtime.min_score:
@@ -188,6 +203,7 @@ def hard_gate_reasons(
     for rule in rules:
         if rule.enforcement_level == "strict_block" and _rule_matches(rule.rule, lowered):
             reasons.append(f"strict_block: {rule.rule}")
+    reasons.extend(hard_block_reasons(blob, runtime, contractor_type))
     return reasons
 
 
@@ -198,6 +214,7 @@ def settings_block_reasons_for_job(job: Job, session: Session, settings: Setting
     rules = session.query(PreferenceRule).filter(PreferenceRule.active.is_(True)).all()
     kind, amount = parse_price_amount(job.job_type or "", job.price_label or job.budget or "", None)
     payment, rating, hires = _job_client_fields(job)
+    attachment, contractor_type = _eligibility_fields(job)
     return hard_gate_reasons(
         runtime,
         profile,
@@ -208,7 +225,8 @@ def settings_block_reasons_for_job(job: Job, session: Session, settings: Setting
         payment_status=payment,
         rating=rating,
         hires=hires,
-        blob=f"{job.title}\n{job.description}",
+        blob=f"{job.title}\n{job.description}\n{attachment}",
+        contractor_type=contractor_type,
     )
 
 
@@ -327,7 +345,7 @@ def _learned_term_nudge(db: Session, text: str) -> tuple[int, str]:
     neg_tokens: dict[str, int] = {}
     job_ids = {log.job_id for log in logs if log.job_id}
     jobs = {job.id: job for job in db.query(Job).filter(Job.id.in_(job_ids)).all()} if job_ids else {}
-    positive = {"hired", "shortlisted", "approved"}
+    positive = {"hired", "shortlisted", "messaged", "approved"}
     negative = {"rejected", "ignored"}
     for log in logs:
         job = jobs.get(log.job_id) if log.job_id else None
@@ -378,6 +396,7 @@ async def execute_scoring_matrix(
     interviewing: int | None = None,
     attachment_text: str = "",
     price_label: str = "",
+    contractor_type: str = "",
     db: Session | None = None,
     settings: Settings | None = None,
 ) -> ScoreResult:
@@ -397,6 +416,7 @@ async def execute_scoring_matrix(
         interviewing=interviewing,
         attachment_text=attachment_text,
         price_label=price_label,
+        contractor_type=contractor_type,
     )
     settings = settings or get_settings()
     session, own = _session(db)
@@ -424,6 +444,10 @@ async def execute_scoring_matrix(
             if word.lower() in blob:
                 blocked = True
                 breakdown.append(f"excluded keyword: {word}")
+
+        for reason in hard_block_reasons(blob, runtime, args.contractor_type):
+            blocked = True
+            breakdown.append(reason)
 
         hits = [skill for skill in profile.skills if skill.lower() in blob]
         if hits:

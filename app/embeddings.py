@@ -116,12 +116,15 @@ def cosine(a: list[float], b: list[float]) -> float:
 
 def portfolio_blob(item: PortfolioItem) -> str:
     origin = "Upwork history" if item.origin == "upwork" else "Agent notes"
-    kind = {
-        "job_history": "completed Upwork contract",
-        "employment": "profile employment history, not an Upwork contract",
-        "proposal": "submitted proposal, not completed work",
-        "project": "project",
-    }.get(item.kind or "", "project")
+    status = (item.outcomes_achieved or "").strip().lower()
+    if item.kind == "employment" or status == "employment":
+        kind = "profile employment history, not an Upwork contract"
+    elif item.kind == "job_history":
+        kind = "completed Upwork contract"
+    elif item.kind == "proposal":
+        kind = "submitted proposal, not completed work"
+    else:
+        kind = "project"
     return "\n".join(
         [
             f"[{origin} · {kind}] {item.project_title}",

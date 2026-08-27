@@ -8,10 +8,11 @@ from typing import Any
 
 from sqlalchemy.orm import Session, selectinload
 
-from app.db.models import ChatMessage, Job, MessageDraft, MessageRoom, utcnow
+from app.db.models import ChatMessage, MessageDraft, MessageRoom, utcnow
 from app.job_display import relative_ago
 from app.models import ChatAttachment, ChatMessageView, ChatReplyIntent, ChatThreadCard, ReplyIntent, display_intent_label
 from app.upwork.mcp_client import UpworkMcpClient, format_mcp_error, oauth_needs_login
+from app.upwork.outcomes import job_id_for_room
 
 logger = logging.getLogger(__name__)
 
@@ -367,10 +368,7 @@ async def sync_messages(mcp: UpworkMcpClient, db: Session, *, max_rooms: int = 2
 
 
 def related_job_id(db: Session, room: MessageRoom) -> int | None:
-    if not room.context_id:
-        return None
-    job = db.query(Job).filter(Job.upwork_id == room.context_id).one_or_none()
-    return job.id if job else None
+    return job_id_for_room(db, room)
 
 
 def message_attachments(row: ChatMessage) -> list[ChatAttachment]:

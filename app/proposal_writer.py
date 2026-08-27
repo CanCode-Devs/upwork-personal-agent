@@ -6,6 +6,7 @@ from typing import Any
 
 from app.db.models import Proposal
 from app.engagement import classify_engagement
+from app.models import ScreeningAnswer
 
 OPENING_HOOK = ""
 
@@ -17,7 +18,7 @@ Formula (use this order):
 1. Technical hook: 1-2 lines on what you would actually build for THIS job.
 2. Hardest part: the risk or engineering effort beyond the job-post happy path.
 3. Solution: 1-3 sentences on the approach.
-4. Relevant work: ONE project from the provided proof. Do not invent contracts, metrics, or clients.
+4. Relevant work: ONE project from the provided proof. Proof is completed work only (contract, portfolio project, or employment). Never treat another Upwork job posting, application, or proposal as work you did. Do not invent contracts, metrics, clients, or employers. If proof is empty, cite profile skills only and do not name a client.
 5. Posting apply items: if job.apply_questions is non-empty, add one labeled section per item AFTER relevant work and BEFORE the offer/CTA.
 6. Offer: a low-risk reason to start talking, only when the job is substantial.
 7. Direct CTA: tell them what to send or do next.

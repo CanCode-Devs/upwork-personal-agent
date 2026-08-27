@@ -164,6 +164,9 @@ td.title a { color: var(--paper); font-weight: 500; }
 .badge.submitted { border-color: var(--good); color: #9fd4b3; }
 .badge.rejected, .badge.expired { color: var(--muted); }
 .badge.submit_failed { border-color: var(--bad); color: #f0a598; }
+.badge.hired { border-color: var(--good); color: #9fd4b3; }
+.badge.shortlisted, .badge.messaged { border-color: var(--accent); color: var(--accent-2); }
+.badge.ignored, .badge.viewed { color: var(--muted); }
 
 .filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 0; }
 .filters a {

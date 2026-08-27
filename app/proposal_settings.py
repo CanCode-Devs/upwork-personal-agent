@@ -15,7 +15,7 @@ DEFAULT_LETTER_STRUCTURE = """Opening hook
 Technical hook: 1-2 lines on what you would actually build for THIS job
 Hardest part: the risk or engineering effort beyond the job-post happy path
 Solution: 1-3 sentences on the approach
-Relevant work: ONE project from the provided proof. Do not invent contracts, metrics, or clients
+Relevant work: ONE project from the provided proof. Proof is completed work only. Never cite a job you only applied to. Do not invent contracts, metrics, clients, or employers
 Posting apply items: if job.apply_questions is non-empty, add one labeled section per item AFTER relevant work and BEFORE the offer/CTA
 Offer: a low-risk reason to start talking, only when the job is substantial
 Direct CTA: tell them what to send or do next. If a client timezone and working hours are provided, make availability specific to those. Do not invent hours"""

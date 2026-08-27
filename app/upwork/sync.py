@@ -12,7 +12,8 @@ from app.embeddings import rebuild_portfolio_embeddings
 from app.events import add_event
 from app.models import JobStatus, WorkKind
 from app.tools.memory import prune_upwork_work, upsert_upwork_work
-from app.upwork.mcp_client import UpworkMcpClient, already_applied, job_ref_keys
+from app.upwork.mcp_client import POLL_PROPOSAL_STATUSES, UpworkMcpClient, job_ref_keys
+from app.upwork.outcomes import ApplicationRow, apply_upwork_outcomes
 
 _UNTRUSTED = re.compile(r"</?untrusted_participant_content>\s*", re.IGNORECASE)
 
@@ -226,8 +227,39 @@ def _from_proposals(payloads: list[Any]) -> list[dict[str, Any]]:
     return found
 
 
-def _from_applications(payloads: list[Any]) -> list[dict[str, str]]:
-    found: list[dict[str, str]] = []
+def _truthy_flag(value: Any) -> bool:
+    if value is True:
+        return True
+    if isinstance(value, (int, float)) and value == 1:
+        return True
+    if isinstance(value, str) and value.strip().lower() in {"true", "1", "yes", "viewed", "opened"}:
+        return True
+    return False
+
+
+def _proposal_viewed(node: dict[str, Any]) -> bool:
+    for key in (
+        "viewed",
+        "isViewed",
+        "viewedByClient",
+        "clientViewed",
+        "hasBeenViewed",
+        "opened",
+        "isOpened",
+        "clientOpened",
+    ):
+        if _truthy_flag(_pick(node, key)):
+            return True
+    status = node.get("status")
+    if isinstance(status, dict):
+        for key in ("viewed", "isViewed", "opened"):
+            if _truthy_flag(_pick(status, key)):
+                return True
+    return False
+
+
+def _from_applications(payloads: list[Any]) -> list[ApplicationRow]:
+    found: list[ApplicationRow] = []
     seen: set[str] = set()
     for payload in payloads:
         data = _as_data(payload)
@@ -255,9 +287,11 @@ def _from_applications(payloads: list[Any]) -> list[dict[str, str]]:
             found.append(
                 {
                     "posting_id": posting_id,
+                    "proposal_id": str(_pick(node, "id") or ""),
                     "title": _text(_pick(content, "title") or _pick(posting, "title") or _pick(node, "title")),
                     "status": status,
                     "rate": rate,
+                    "viewed": "1" if _proposal_viewed(node) else "",
                 }
             )
     return found
@@ -287,21 +321,47 @@ def mark_jobs_applied(db: Session, posting_ids: set[str], message: str) -> int:
     return changed
 
 
-def upsert_applications(db: Session, rows: list[dict[str, str]]) -> int:
+def _existing_application(db: Session, posting_id: str) -> UpworkApplication | None:
+    existing = db.query(UpworkApplication).filter(UpworkApplication.posting_id == posting_id).one_or_none()
+    if existing is not None:
+        return existing
+    keys = job_ref_keys(posting_id)
+    for row in db.query(UpworkApplication).all():
+        if job_ref_keys(row.posting_id) & keys:
+            return row
+    return None
+
+
+def upsert_applications(db: Session, rows: list[ApplicationRow]) -> int:
     keep: set[str] = set()
     for row in rows:
         posting_id = row["posting_id"]
         keep.update(job_ref_keys(posting_id))
-        existing = db.query(UpworkApplication).filter(UpworkApplication.posting_id == posting_id).one_or_none()
+        existing = _existing_application(db, posting_id)
         if existing is None:
             existing = UpworkApplication(posting_id=posting_id)
             db.add(existing)
         existing.title = row["title"]
         existing.status = row["status"]
         existing.rate = row["rate"]
+        if row.get("proposal_id"):
+            existing.proposal_id = row["proposal_id"]
         existing.synced_at = datetime.now(UTC)
     mark_jobs_applied(db, keep, "Matched an Upwork proposal")
     return len(keep)
+
+
+async def sync_proposal_outcomes(
+    mcp: UpworkMcpClient,
+    db: Session,
+    *,
+    max_pages: int = 3,
+) -> dict[str, int]:
+    pages = await mcp.fetch_proposal_pages(POLL_PROPOSAL_STATUSES, max_pages=max_pages)
+    rows = _from_applications(pages)
+    applied = upsert_applications(db, rows)
+    logged = await apply_upwork_outcomes(db, rows)
+    return {"applications": applied, "logged": logged}
 
 
 async def sync_upwork_memory(db: Session, client: UpworkMcpClient | None = None) -> dict[str, int]:
@@ -334,7 +394,9 @@ async def sync_upwork_memory(db: Session, client: UpworkMcpClient | None = None)
         imported += 1
     prune_upwork_work(seen, db)
     rebuild_portfolio_embeddings(db)
-    applied = upsert_applications(db, _from_applications(payloads.get("applications") or payloads.get("proposals") or []))
+    app_rows = _from_applications(payloads.get("applications") or payloads.get("proposals") or [])
+    applied = upsert_applications(db, app_rows)
+    logged = await apply_upwork_outcomes(db, app_rows)
 
     profile_blob = _profile_fields(payloads)
     if any(profile_blob.values()):
@@ -359,5 +421,9 @@ async def sync_upwork_memory(db: Session, client: UpworkMcpClient | None = None)
             default=str,
         )
         row.synced_at = datetime.now(UTC)
-    add_event(db, "upwork", f"Synced {imported} read-only Upwork records, {applied} applications")
-    return {"imported": imported, "applications": applied}
+    add_event(
+        db,
+        "upwork",
+        f"Synced {imported} read-only Upwork records, {applied} applications, {logged} outcomes",
+    )
+    return {"imported": imported, "applications": applied, "outcomes": logged}

@@ -51,6 +51,7 @@ class PreferenceCategory(StrEnum):
 class FeedbackOutcome(StrEnum):
     hired = "hired"
     shortlisted = "shortlisted"
+    messaged = "messaged"
     viewed = "viewed"
     ignored = "ignored"
     rejected = "rejected"
@@ -254,6 +255,33 @@ class SuggestReplyResult(BaseModel):
     text: str = ""
 
 
+class WorkHistorySnippet(TypedDict):
+    origin: str
+    kind: str
+    title: str
+    tech: list[str]
+    outcomes: str
+    keywords: list[str]
+    description: str
+
+
+class SearchQueryProfile(TypedDict):
+    name: str
+    title: str
+    skills: list[str]
+    hourly_rate: int | None
+    voice: str
+    exclude_keywords: list[str]
+    current_queries: list[str]
+    upwork_overview: str
+
+
+class SearchQueryContext(TypedDict):
+    profile: SearchQueryProfile
+    upwork_history: list[WorkHistorySnippet]
+    agent_history: list[WorkHistorySnippet]
+
+
 class LearnPreferenceArgs(BaseModel):
     category: PreferenceCategory
     rule: str
@@ -302,6 +330,7 @@ class ScoringMatrixArgs(BaseModel):
     interviewing: int | None = None
     attachment_text: str = ""
     price_label: str = ""
+    contractor_type: str = ""
 
 
 class GeneratePitchArgs(BaseModel):
@@ -386,6 +415,9 @@ class RuntimeSettings(BaseModel):
     min_client_hires: int | None = None
     max_proposal_count: int | None = None
     prefer_timezones: str = ""
+    skip_us_work_auth: bool = True
+    skip_w2_only: bool = True
+    skip_onsite: bool = True
 
 
 class JobPayload(TypedDict, total=False):

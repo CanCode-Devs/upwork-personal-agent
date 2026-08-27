@@ -15,19 +15,21 @@
   {% if card and card.posted_ago %}<div>{{ card.posted_kind }}: <strong>{{ card.posted_ago }}</strong>{% if card.posted_local %} · {{ card.posted_local }}{% endif %}</div>{% endif %}
   <div>Timezone: {{ card.timezone if card else "—" }}{% if card and card.location %} · {{ card.location }}{% endif %}</div>
   <div>Upwork id: {{ job.upwork_id }}</div>
-  {% if job.applied_on_upwork %}<div><span class="badge submitted">Already applied on Upwork</span></div>{% endif %}
+  {% if job.applied_on_upwork %}<div><span class="badge submitted">Already applied on Upwork</span>{% if application and application.status %} <span class="badge">{{ application.status }}</span>{% endif %}{% if latest_outcome %} <span class="badge {{ latest_outcome }}">{{ latest_outcome }}</span>{% endif %}</div>{% endif %}
   {% if job.url or job.upwork_id %}<div><a href="{{ (job.url or job.upwork_id)|upwork_job }}" target="_blank" rel="noreferrer">Open on Upwork</a></div>{% endif %}
   <div>Expires: {{ job.expires_at|dt }}</div>
 </div>
 
-{% if request.query_params.get('regenerated') %}
+{% if request.query_params.get('drafted') %}
+<div class="banner ok">Proposal drafted. Review the letter and milestones before submit.</div>
+{% elif request.query_params.get('regenerated') %}
 <div class="banner ok">Proposal regenerated. Review the letter and milestones before submit.</div>
 {% elif request.query_params.get('skipped') %}
 <div class="banner">This job no longer passes Settings, so it was skipped instead of drafting a letter.</div>
 {% elif request.query_params.get('error') == 'blocked' %}
-<div class="banner">This job cannot be regenerated (already applied or not in Pending).</div>
+<div class="banner">This job cannot be drafted (already applied or not in Pending).</div>
 {% elif request.query_params.get('error') %}
-<div class="banner">Could not regenerate the proposal. Check the log on this page.</div>
+<div class="banner">Could not write the proposal. Check the log on this page.</div>
 {% elif request.query_params.get('saved') %}
 <div class="banner ok">Edits saved.</div>
 {% elif job.status == 'submit_failed' %}
@@ -107,14 +109,24 @@
     <h2>Cover letter</h2>
     {% if can_act and not job.applied_on_upwork %}
     <form method="post" action="/jobs/{{ job.id }}/regenerate" style="margin-bottom:16px">
+      {% if has_draft %}
       <label for="regen_comments">Regenerate proposal</label>
       <textarea id="regen_comments" name="comments" class="short" placeholder="Optional comments, e.g. stress n8n, answer the 5 apply items, shorter CTA"></textarea>
-      <p class="muted">Rewrites the letter, milestones (if fixed-price), screening answers, and highlights. Does not submit.</p>
+      <p class="muted">Rewrites the letter, milestones (if fixed-price), screening answers, and highlights with the draft model. Does not submit.</p>
       <div class="actions" style="margin-top:8px">
         <button class="btn secondary" type="submit">Regenerate</button>
       </div>
+      {% else %}
+      <label for="regen_comments">Write proposal</label>
+      <textarea id="regen_comments" name="comments" class="short" placeholder="Optional focus, e.g. stress RAG evals, skip milestones you dislike"></textarea>
+      <p class="muted">Calls the larger draft model for a cover letter, screening answers, and milestones. Does not submit.</p>
+      <div class="actions" style="margin-top:8px">
+        <button class="btn" type="submit">Write proposal</button>
+      </div>
+      {% endif %}
     </form>
     {% endif %}
+    {% if has_draft %}
     <form id="proposal-form" method="post" action="/jobs/{{ job.id }}/edit" enctype="multipart/form-data">
       <textarea name="cover_letter" {% if not can_act %}readonly{% endif %}>{{ cover_letter }}</textarea>
       {% if can_act %}
@@ -235,6 +247,11 @@
       </div>
       {% endif %}
     </form>
+    {% elif can_act %}
+    <p class="muted">No letter yet. Write a proposal when this job is worth the Connects.</p>
+    {% else %}
+    <p class="empty">No cover letter for this job.</p>
+    {% endif %}
     {% if can_act %}
     <form method="post" action="/jobs/{{ job.id }}/reject" style="margin-top:16px">
       <label for="reason">Reject reason (helps the agent learn)</label>
@@ -245,30 +262,40 @@
     </form>
     {% endif %}
 
-    <form id="outcome-form" method="post" action="/jobs/{{ job.id }}/outcome" style="margin-top:24px">
+    {% if job.applied_on_upwork or application or outcomes %}
+    <div style="margin-top:24px">
       <h2>Outcome log</h2>
-      <label for="outcome">What happened after apply?</label>
-      <select id="outcome" name="outcome">
-        <option value="viewed">Viewed</option>
-        <option value="shortlisted">Shortlisted</option>
-        <option value="hired">Hired</option>
-        <option value="ignored">Ignored</option>
-        <option value="rejected">Rejected by client</option>
-      </select>
-      <label for="client_notes">Notes</label>
-      <input id="client_notes" name="client_notes" type="text" placeholder="Client said they wanted a video intro">
-      <div class="actions" style="margin-top:12px">
-        <button id="outcome-btn" class="btn secondary" type="submit">Save outcome</button>
+      <p class="muted">Filled from Upwork proposal status and messages on poll / Portfolio sync.</p>
+      {% if outcomes %}
+      <div class="card" style="margin-top:12px">
+        {% for row in outcomes %}
+        <div class="event">
+          <time>{{ row.created_at|dt }}</time>
+          {{ row.outcome }} — {{ row.client_notes }}
+        </div>
+        {% endfor %}
       </div>
-    </form>
-    {% if outcomes %}
-    <div class="card" style="margin-top:16px">
-      {% for row in outcomes %}
-      <div class="event">
-        <time>{{ row.created_at|dt }}</time>
-        {{ row.outcome }} — {{ row.client_notes }}
-      </div>
-      {% endfor %}
+      {% else %}
+      <p class="muted">Nothing recorded yet.</p>
+      {% endif %}
+      <form id="outcome-form" method="post" action="/jobs/{{ job.id }}/outcome" style="margin-top:16px">
+        <p class="muted">Optional. Use this only to correct a synced outcome or add a note.</p>
+        <label for="outcome">Correction</label>
+        <select id="outcome" name="outcome">
+          <option value="" {% if not latest_outcome %}selected{% endif %}>Leave as synced</option>
+          <option value="viewed" {% if latest_outcome == 'viewed' %}selected{% endif %}>Viewed</option>
+          <option value="messaged" {% if latest_outcome == 'messaged' %}selected{% endif %}>Messaged</option>
+          <option value="shortlisted" {% if latest_outcome == 'shortlisted' %}selected{% endif %}>Shortlisted / offer</option>
+          <option value="hired" {% if latest_outcome == 'hired' %}selected{% endif %}>Hired</option>
+          <option value="ignored" {% if latest_outcome == 'ignored' %}selected{% endif %}>Ignored</option>
+          <option value="rejected" {% if latest_outcome == 'rejected' %}selected{% endif %}>Rejected by client</option>
+        </select>
+        <label for="client_notes">Notes</label>
+        <input id="client_notes" name="client_notes" type="text" placeholder="Optional note">
+        <div class="actions" style="margin-top:12px">
+          <button id="outcome-btn" class="btn secondary" type="submit">Save note</button>
+        </div>
+      </form>
     </div>
     {% endif %}
 
@@ -283,7 +310,7 @@
     </div>
   </div>
 </div>
-{% if can_act %}
+{% if can_act and has_draft %}
 <script>
 (function () {
   const boxes = document.querySelectorAll("#highlights-panel input[type=checkbox]:not([disabled])");

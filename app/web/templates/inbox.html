@@ -4,7 +4,7 @@
 <div class="top">
   <div>
     <h1>Inbox</h1>
-    <div class="sub">Score, edit, then approve. Autonomy: <code>{{ runtime.autonomy_mode if runtime else "manual" }}</code></div>
+    <div class="sub">Score, then write a proposal when you want one. Autonomy: <code>{{ runtime.autonomy_mode if runtime else "manual" }}</code></div>
   </div>
 </div>
 
@@ -70,6 +70,9 @@
           </span>
           <span class="job-summary-meta">
             {% if job.applied %}<span class="badge submitted">Applied{% if job.applied_status %} · {{ job.applied_status }}{% endif %}</span>{% endif %}
+            {% if job.local and job.status == 'pending_review' and not job.applied %}
+            {% if job.has_draft %}<span class="badge submitted">Draft ready</span>{% else %}<span class="badge needs-draft">Needs draft</span>{% endif %}
+            {% endif %}
             <span class="badge {{ job.status }}">{{ job.status }}</span>
           </span>
         </summary>

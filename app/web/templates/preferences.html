@@ -31,6 +31,18 @@
         <input type="checkbox" name="require_verified_payment" value="1" {% if runtime.require_verified_payment %}checked{% endif %}>
         Only verified payment clients
       </label>
+      <label class="check">
+        <input type="checkbox" name="skip_us_work_auth" value="1" {% if runtime.skip_us_work_auth %}checked{% endif %}>
+        Skip US citizen / green card / no-sponsorship jobs
+      </label>
+      <label class="check">
+        <input type="checkbox" name="skip_w2_only" value="1" {% if runtime.skip_w2_only %}checked{% endif %}>
+        Skip W-2 only / no C2C jobs
+      </label>
+      <label class="check">
+        <input type="checkbox" name="skip_onsite" value="1" {% if runtime.skip_onsite %}checked{% endif %}>
+        Skip on-site / local-only jobs
+      </label>
       <label for="autonomy_mode">Autonomy</label>
       <select id="autonomy_mode" name="autonomy_mode">
         <option value="manual" {% if runtime.autonomy_mode == "manual" %}selected{% endif %}>Manual — approve every submit</option>
@@ -93,6 +105,42 @@
       <button class="btn" type="submit">Save agent profile</button>
     </div>
   </form>
+  <form method="post" action="/preferences/search-queries/suggest" style="margin-top:16px">
+    <p class="muted">Suggests 6–10 Upwork keyword queries from your profile, Upwork history, and Portfolio case studies. Polls keep using the list above until you Add a suggestion.</p>
+    {% if not has_work_history %}
+    <p class="muted">No work history imported yet. Sync from Upwork on the Portfolio page, or add case studies, then suggest again.</p>
+    {% endif %}
+    <div class="actions" style="margin-top:8px">
+      <button class="btn secondary" type="submit">Suggest search queries</button>
+    </div>
+  </form>
+  {% if request.query_params.get('suggested') %}
+  <div class="banner ok" style="margin-top:12px">Suggestions ready. Add the ones you want polls to use.</div>
+  {% elif request.query_params.get('empty') %}
+  <div class="banner" style="margin-top:12px">No new queries. They may already be in your list or dismissed.</div>
+  {% elif request.query_params.get('error') == 'suggest' %}
+  <div class="banner" style="margin-top:12px">Could not suggest queries. Check the OpenAI key and try again.</div>
+  {% elif request.query_params.get('added') %}
+  <div class="banner ok" style="margin-top:12px">Query added. The next poll will search it.</div>
+  {% elif request.query_params.get('dismissed') %}
+  <div class="banner" style="margin-top:12px">Suggestion dismissed.</div>
+  {% endif %}
+  {% if suggested_queries %}
+  <h3 style="margin-top:20px">Suggested queries</h3>
+  {% for item in suggested_queries %}
+  <div class="event" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+    <span>{{ item }}</span>
+    <form method="post" action="/preferences/search-queries/add" style="display:inline">
+      <input type="hidden" name="query" value="{{ item }}">
+      <button class="btn secondary" type="submit">Add</button>
+    </form>
+    <form method="post" action="/preferences/search-queries/dismiss" style="display:inline">
+      <input type="hidden" name="query" value="{{ item }}">
+      <button class="btn danger" type="submit">Dismiss</button>
+    </form>
+  </div>
+  {% endfor %}
+  {% endif %}
 </div>
 
 {% if upwork_profile %}

@@ -61,8 +61,18 @@ class JobCard(TypedDict):
     posted_ago: str
     posted_local: str
     posted_kind: str
+    posted_at: datetime | None
     proposal_count: int | None
     interviewing: int | None
+    has_draft: bool
+
+
+def _job_has_draft(job: Job) -> bool:
+    proposals = list(job.proposals or [])
+    if not proposals:
+        return False
+    latest = sorted(proposals, key=lambda item: item.id)[-1]
+    return bool((latest.edited_text or latest.draft_text or "").strip())
 
 
 def _as_dict(raw: str | None) -> dict[str, Any]:
@@ -360,8 +370,10 @@ def job_card(job: Job, applied_status: str = "") -> JobCard:
         "posted_ago": posted_ago,
         "posted_local": posted_local,
         "posted_kind": posted_kind,
+        "posted_at": posted or parse_upwork_datetime(job.created_at),
         "proposal_count": proposal_count,
         "interviewing": interviewing,
+        "has_draft": _job_has_draft(job),
     }
 
 
@@ -394,8 +406,10 @@ def application_card(row: UpworkApplication) -> JobCard:
         "posted_ago": "",
         "posted_local": "",
         "posted_kind": "",
+        "posted_at": parse_upwork_datetime(row.synced_at) if row.synced_at else None,
         "proposal_count": None,
         "interviewing": None,
+        "has_draft": True,
     }
 
 
@@ -409,7 +423,7 @@ def _aware(value: datetime | None) -> datetime:
 
 def sort_job_cards(cards: list[JobCard], sort: InboxSort) -> list[JobCard]:
     def when(card: JobCard) -> datetime:
-        return _aware(card.get("created_at"))
+        return _aware(card.get("posted_at") or card.get("created_at"))
 
     def score_val(card: JobCard) -> int:
         score = card.get("score")

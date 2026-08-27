@@ -10,9 +10,7 @@ from app.db.session import SessionLocal
 from app.events import add_event
 from app.models import JobPayload, JobStatus
 from app.profile import load_profile
-from app.runtime import load_runtime, should_auto_submit
 from app.tools.discovery import _parse_client, execute_scoring_matrix, fetch_live_jobs
-from app.tools.execution import PitchSkipped, generate_tailored_pitch, submit_proposal
 from app.upwork.mcp_client import (
     UpworkMcpClient,
     derive_client_stats,
@@ -26,6 +24,8 @@ from app.upwork.mcp_client import (
     job_ref_keys,
 )
 from app.upwork.messages import sync_messages
+from app.upwork.outcomes import application_for_posting
+from app.upwork.sync import sync_proposal_outcomes
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +178,8 @@ async def ingest_payload(payload: JobPayload, settings: Settings, mcp: UpworkMcp
         derive_client_stats(details)
         detailed["client_details"] = json.dumps(details, default=str)
         attachment_text = str(details.get("attachment_text") or "")
+        quals = details.get("preferred_qualifications") if isinstance(details.get("preferred_qualifications"), dict) else {}
+        contractor_type = str(quals.get("contractor_type") or "")
         hire_rate = details.get("hire_rate")
         invites_sent = details.get("invites_sent")
         interviewing = details.get("interviewing")
@@ -198,12 +200,12 @@ async def ingest_payload(payload: JobPayload, settings: Settings, mcp: UpworkMcp
             interviewing=int(interviewing) if isinstance(interviewing, (int, float)) else None,
             attachment_text=attachment_text,
             price_label=str(detailed.get("price_label") or detailed.get("budget") or ""),
+            contractor_type=contractor_type,
             db=db,
             settings=settings,
         )
-        runtime = load_runtime(db, settings)
         status = JobStatus.pending_review if scored.go else JobStatus.skipped
-        applied_row = db.query(UpworkApplication).filter(UpworkApplication.posting_id == job_id).one_or_none()
+        applied_row = application_for_posting(db, job_id)
         job = Job(
             upwork_id=job_id,
             title=detailed.get("title") or "Untitled job",
@@ -230,44 +232,12 @@ async def ingest_payload(payload: JobPayload, settings: Settings, mcp: UpworkMcp
         db.add(job)
         db.flush()
         add_event(db, "scored", f"{scored.score}: {scored.reason}", job.id)
-        job_pk = job.id
         db.commit()
         if not scored.go:
             return "skipped"
         if applied_row is not None:
             return "skipped"
-        try:
-            drafted = await generate_tailored_pitch(str(job_pk), settings=settings)
-        except PitchSkipped:
-            return "skipped"
-        except Exception:
-            logger.exception("draft failed for job %s", job_pk)
-            return "queued"
-        db2 = SessionLocal()
-        try:
-            stored = db2.query(Job).filter(Job.id == job_pk).one()
-            stored.matched_context = json.dumps(drafted.matched_context)
-            stored.description = detailed.get("description") or stored.description
-            add_event(db2, "funnel", "pitch_drafted", stored.id)
-            if should_auto_submit(scored.score, runtime):
-                await submit_proposal(
-                    str(stored.id),
-                    drafted.cover_letter,
-                    db=db2,
-                    screening_answers=drafted.screening_answers,
-                    portfolio_project_ids=drafted.portfolio_project_ids,
-                    certificate_ids=drafted.certificate_ids,
-                )
-                db2.commit()
-                return "submitted"
-            db2.commit()
-            return "queued"
-        except Exception:
-            db2.rollback()
-            logger.exception("failed to store draft for job %s", job_pk)
-            return "queued"
-        finally:
-            db2.close()
+        return "queued"
     except Exception:
         db.rollback()
         raise
@@ -348,19 +318,43 @@ async def run_agent_cycle(settings: Settings | None = None) -> dict[str, int]:
         logger.exception("backfill job details failed")
     try:
         db_msg = SessionLocal()
+        skip_outcomes = False
         try:
-            n = await sync_messages(mcp, db_msg)
-            add_event(db_msg, "messages", f"synced_rooms={n}")
-            db_msg.commit()
-        except Exception as exc:
-            db_msg.rollback()
-            detail = format_mcp_error(exc)
-            logger.exception("message sync failed")
-            add_event(db_msg, "poll_error", f"messages: {detail}")
-            db_msg.commit()
-            if oauth_needs_login(detail):
-                add_event(db_msg, "poll", "Upwork session expired. Connect Upwork from the inbox.")
+            try:
+                n = await sync_messages(mcp, db_msg)
+                add_event(db_msg, "messages", f"synced_rooms={n}")
                 db_msg.commit()
+            except Exception as exc:
+                db_msg.rollback()
+                detail = format_mcp_error(exc)
+                logger.exception("message sync failed")
+                add_event(db_msg, "poll_error", f"messages: {detail}")
+                db_msg.commit()
+                if oauth_needs_login(detail):
+                    add_event(db_msg, "poll", "Upwork session expired. Connect Upwork from the inbox.")
+                    db_msg.commit()
+                    skip_outcomes = True
+            if not skip_outcomes:
+                try:
+                    outcome_counts = await sync_proposal_outcomes(mcp, db_msg)
+                    add_event(
+                        db_msg,
+                        "outcomes",
+                        (
+                            f"applications={outcome_counts['applications']} "
+                            f"logged={outcome_counts['logged']}"
+                        ),
+                    )
+                    db_msg.commit()
+                except Exception as exc:
+                    db_msg.rollback()
+                    detail = format_mcp_error(exc)
+                    logger.exception("proposal outcome sync failed")
+                    add_event(db_msg, "poll_error", f"outcomes: {detail}")
+                    db_msg.commit()
+                    if oauth_needs_login(detail):
+                        add_event(db_msg, "poll", "Upwork session expired. Connect Upwork from the inbox.")
+                        db_msg.commit()
         finally:
             db_msg.close()
     except Exception:

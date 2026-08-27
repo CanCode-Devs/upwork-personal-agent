@@ -1,6 +1,6 @@
 # Upwork Personal Agent
 
-A **local** agent for **one** Upwork freelancer on **their own** account. It watches for jobs that match you, skips the ones that fail your rules, drafts a proposal from *your* portfolio and history, and waits for you before it spends Connects.
+A **local** agent for **one** Upwork freelancer on **their own** account. It watches for jobs that match you, skips the ones that fail your rules, and waits for you before it writes a letter or spends Connects.
 
 Upwork treats freelancer accounts as personal. You may not share a login, Connects, or proposals across a team. This app is built that way on purpose: one OAuth login, one dashboard, one person reviewing drafts. It is not a multi-seat agency inbox.
 
@@ -13,14 +13,17 @@ Built by [CanCode Devs](https://github.com/CanCode-Devs). [MIT License](LICENSE)
 **Discovery**
 - Poll Upwork through the official MCP (OAuth in the browser, once)
 - Search from your profile queries; **Poll now** when you do not want to wait
+- **Suggest search queries** on Settings: one cheap-model pass over your profile, Upwork history, and Portfolio case studies. Add a suggestion before polls use it
 - Sync portfolio, contracts, and certificates from Upwork for proof in drafts
 
 **Scoring**
 - Rank jobs against skills, client metrics, and Settings floors (budget, verified payment, min score)
-- Hard-skip jobs that hit exclude keywords or strict rules
-- Learn from outcomes you log (hired, ignored, shortlisted)
+- Hard-skip jobs that hit exclude keywords, strict rules, or eligibility gates (US work authorization, W-2/no C2C, on-site/local)
+- Learn from outcomes synced from Upwork (hired, declined, messaged) plus notes you add
+- Polls score only. They do not call the writer
 
 **Drafting**
+- Open a scored job and click **Write proposal** when you want a letter (larger model: `OPENAI_DRAFT_MODEL`)
 - Cover letter, Upwork screening answers, posting “please include” items, and escrow milestones for fixed-price jobs
 - Highlights capped at the closest real work (not invented case studies)
 - **Proposal** page: hook, structure, never-say list, milestone template, and your own job-post → letter examples
@@ -79,7 +82,7 @@ Copy `.env.example` to `.env` and set at least `OPENAI_API_KEY`, `DASHBOARD_PASS
 
 | Layer | Owns | When it applies |
 |-------|------|-----------------|
-| `.env` | OpenAI, poll interval, dashboard login, `PROFILE_PATH`, `APP_NAME` / `APP_TAGLINE`, `SEED_DEMO_PORTFOLIO`, `EMBEDDING_MODEL` | Always |
+| `.env` | OpenAI (`OPENAI_MODEL` for chat and query suggestions, `OPENAI_DRAFT_MODEL` for letters), poll interval, dashboard login, `PROFILE_PATH`, `APP_NAME` / `APP_TAGLINE`, `SEED_DEMO_PORTFOLIO`, `EMBEDDING_MODEL` | Always |
 | `.env` → SQLite (once) | Scoring floors, autonomy | Seeded on first boot; **Settings** owns them after that |
 | `profiles/default.yaml` | Name, title, rate, skills, search queries, exclude keywords, voice | Identity and search. Voice reaches the writer |
 | **Proposal page** | Hook, tone, structure, must/never lists, extra instructions, milestones, screening, few-shot examples | Every new draft or **Regenerate**. Stored in `./data/` |
@@ -98,7 +101,7 @@ HTML and CSS under `app/` are bind-mounted and update without a restart.
 
 ## Autonomy
 
-Set in `.env` (`AUTONOMY_MODE`) or on the Settings page:
+Polls never write or submit a letter. Use **Write proposal** then **Approve & submit** on the job page.
 
 - `manual` — inbox review; you approve before Connects are spent
 - `auto_above_threshold` — auto-submit when score >= `AUTO_SUBMIT_THRESHOLD` (default 85)
@@ -106,12 +109,12 @@ Set in `.env` (`AUTONOMY_MODE`) or on the Settings page:
 
 ## Daily use
 
-1. Inbox shows scored jobs plus a short reason
-2. Edit the letter, **Regenerate** if needed, then **Approve & submit**, or **Reject** with a reason
-3. Log hired / ignored / shortlisted after the fact so scoring learns
-4. Settings: autonomy, rate floors, strict/soft rules
+1. Inbox shows scored jobs plus a short reason. **Needs draft** until you write a letter
+2. Open a job, click **Write proposal** if you want to apply, edit, **Regenerate** if needed, then **Approve & submit**, or **Reject** with a reason
+3. Polls update the outcome log from proposal status and messages. Add a note if you want extra context so scoring learns
+4. Settings: autonomy, rate floors, eligibility skips (US work auth / W-2 / on-site), **Suggest search queries**
 5. Proposal: voice and examples for the next draft
-6. **Poll now** runs a discovery cycle immediately
+6. **Poll now** runs a discovery cycle immediately (score only; no letters)
 
 Keep the machine awake; Compose uses `restart: unless-stopped`.
 
@@ -140,7 +143,7 @@ Do not commit `.env`, `profiles/default.yaml`, `./data/` (includes Proposal exam
 
 ## Future plans
 
-These are not in the current release. Drafting today uses the OpenAI API (`OPENAI_MODEL` / optional `OPENAI_BASE_URL`); embeddings use a local Hugging Face MiniLM model.
+These are not in the current release. Chat replies and search-query suggestions use `OPENAI_MODEL` (default `gpt-4o-mini`). Cover letters use `OPENAI_DRAFT_MODEL` (default `gpt-4o`). Embeddings use a local Hugging Face MiniLM model.
 
 - **Multiple LLM providers**, including local runtimes such as [vLLM](https://docs.vllm.ai/) and [Ollama](https://ollama.com/), plus other hosted APIs — pick a provider per environment without rewriting the writer
 - **Multiple embedding backends**: Hugging Face models, OpenAI embeddings, and other APIs, so scoring and example matching are not tied to one MiniLM checkpoint

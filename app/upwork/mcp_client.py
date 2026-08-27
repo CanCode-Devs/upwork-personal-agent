@@ -835,6 +835,55 @@ def page_has_more(value: Any) -> bool:
     return False
 
 
+PROPOSAL_MEMORY_STATUSES: tuple[str, ...] = (
+    "Pending",
+    "Accepted",
+    "Submitted",
+    "Active",
+    "Offered",
+    "Hired",
+    "Activated",
+)
+PROPOSAL_CLOSED_STATUSES: tuple[str, ...] = ("Declined", "Withdrawn", "Archived")
+POLL_PROPOSAL_STATUSES: tuple[str, ...] = (
+    "Offered",
+    "Hired",
+    "Declined",
+    "Archived",
+    "Activated",
+    "Accepted",
+)
+
+
+async def paginate_freelancer_proposals(
+    named: Any,
+    statuses: tuple[str, ...],
+    *,
+    max_pages: int,
+) -> list[Any]:
+    pages: list[Any] = []
+    for status in statuses:
+        cursor = ""
+        for _ in range(max_pages):
+            params: dict[str, Any] = {
+                "limit": 10,
+                "status": status,
+                "sort_field": "CREATEDDATETIME",
+                "sort_order": "DESC",
+            }
+            if cursor:
+                params["cursor"] = cursor
+            page = await named("upwork__list_freelancer_proposals", "list", params)
+            pages.append(page)
+            if isinstance(page, dict) and page.get("error"):
+                break
+            nxt = next_cursor(page)
+            if not nxt or nxt == cursor:
+                break
+            cursor = nxt
+    return pages
+
+
 def next_cursor(value: Any) -> str:
     if isinstance(value, dict):
         for key, item in value.items():
@@ -1764,6 +1813,26 @@ class UpworkMcpClient:
             result = await call_session_tool(session, name, arguments or {})
             return _parse_jsonish(_tool_text(result))
 
+    async def fetch_proposal_pages(
+        self,
+        statuses: tuple[str, ...] | list[str],
+        *,
+        max_pages: int = 3,
+    ) -> list[Any]:
+        async with self._session(interactive=False) as session:
+            await list_session_tools(session)
+            org_uid = await self._resolve_org_uid(session)
+
+            async def named(tool: str, action: str, params: dict[str, Any] | None = None) -> Any:
+                args: dict[str, Any] = {"action": action, "org_uid": org_uid, "params": params or {}}
+                try:
+                    result = await call_session_tool(session, tool, args)
+                    return _parse_jsonish(_tool_text(result))
+                except Exception as exc:
+                    return {"error": str(exc), "tool": tool, "action": action}
+
+            return await paginate_freelancer_proposals(named, tuple(statuses), max_pages=max_pages)
+
     async def fetch_work_memory(self) -> dict[str, Any]:
         async with self._session(interactive=False) as session:
             await list_session_tools(session)
@@ -1799,46 +1868,13 @@ class UpworkMcpClient:
                 if page.get("error") or not page_has_more(page):
                     break
                 offset += 10
-            proposals: list[Any] = []
-            for status in ("Pending", "Accepted", "Submitted", "Active"):
-                cursor = ""
-                for _ in range(8):
-                    params: dict[str, Any] = {
-                        "limit": 10,
-                        "status": status,
-                        "sort_field": "CREATEDDATETIME",
-                        "sort_order": "DESC",
-                    }
-                    if cursor:
-                        params["cursor"] = cursor
-                    page = await named("upwork__list_freelancer_proposals", "list", params)
-                    proposals.append(page)
-                    if page.get("error"):
-                        break
-                    nxt = next_cursor(page)
-                    if not nxt or nxt == cursor:
-                        break
-                    cursor = nxt
-            applications: list[Any] = list(proposals)
-            for status in ("Declined", "Withdrawn"):
-                cursor = ""
-                for _ in range(8):
-                    params: dict[str, Any] = {
-                        "limit": 10,
-                        "status": status,
-                        "sort_field": "CREATEDDATETIME",
-                        "sort_order": "DESC",
-                    }
-                    if cursor:
-                        params["cursor"] = cursor
-                    page = await named("upwork__list_freelancer_proposals", "list", params)
-                    applications.append(page)
-                    if page.get("error"):
-                        break
-                    nxt = next_cursor(page)
-                    if not nxt or nxt == cursor:
-                        break
-                    cursor = nxt
+            proposals = await paginate_freelancer_proposals(
+                named, PROPOSAL_MEMORY_STATUSES, max_pages=8
+            )
+            applications = list(proposals)
+            applications.extend(
+                await paginate_freelancer_proposals(named, PROPOSAL_CLOSED_STATUSES, max_pages=8)
+            )
             return {
                 "org_uid": org_uid,
                 "accounts": accounts,

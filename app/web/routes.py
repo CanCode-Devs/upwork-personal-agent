@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.actions import approve_and_submit, cover_letter_for, latest_proposal, reject_job, save_edit
 from app.auth import COOKIE_NAME, create_session_value, current_user, verify_password
 from app.config import Settings, get_settings
-from app.models import ApplyHighlight, ConnectsPanel, FreelancerProfile, InboxCounts, InboxSort, JobStatus, MilestoneStageConfig, PitchTone, ScreeningAnswer, SessionUser, WorkKind, WorkOrigin, WriterConfig
+from app.models import ApplyHighlight, ConnectsPanel, FeedbackOutcome, FreelancerProfile, InboxCounts, InboxSort, JobStatus, MilestoneStageConfig, PitchTone, ScreeningAnswer, SessionUser, WorkKind, WorkOrigin, WriterConfig
 from app.db.models import ChatMessage, Event, FeedbackLog, Job, MessageRoom, PortfolioItem, PreferenceRule, ProposalExample, UpworkApplication, UpworkProfile, User
 from app.llm import llm_suggest_reply
 from app.db.session import SessionLocal, get_db
@@ -38,10 +38,18 @@ from app.proposal_settings import (
 )
 from app.proposal_writer import dump_apply, finalize_letter, load_apply, load_screening, parse_screening_form
 from app.runtime import get_or_create_runtime
+from app.search_queries import (
+    accept_search_query,
+    dismiss_search_query,
+    pending_queries,
+    remove_pending_query,
+    suggest_search_queries,
+    work_history_for_prompt,
+)
 from app.tools.discovery import apply_runtime_filters
 from app.tools.execution import HIGHLIGHT_PICK, PitchSkipped, bid_amount_for_job, generate_tailored_pitch, local_job_highlights, rank_highlights
 from app.tools.memory import learn_preference, log_interaction_feedback, save_agent_item, update_portfolio_matrix
-from app.upwork.mcp_client import UpworkMcpClient, already_applied, connects_shortage, format_mcp_error, oauth_needs_login, public_job_url
+from app.upwork.mcp_client import UpworkMcpClient, already_applied, connects_shortage, format_mcp_error, oauth_needs_login, public_job_url, job_ref_keys
 from app.upwork.oauth import (
     OAuthCallbackPayload,
     WebOAuthFlow,
@@ -62,6 +70,7 @@ from app.upwork.messages import (
     thread_card,
 )
 from app.upwork.sync import mark_jobs_applied, sync_upwork_memory
+from app.upwork.outcomes import application_for_job, index_applications, latest_client_outcome
 from app.worker import run_poll_cycle
 
 router = APIRouter()
@@ -221,11 +230,20 @@ async def inbox(
         query = query.filter(Job.status == selected)
     jobs: Sequence[Job] = query.limit(200).all()
     application_rows = db.query(UpworkApplication).order_by(UpworkApplication.synced_at.desc()).all()
-    applications = {row.posting_id: row.status for row in application_rows}
-    cards = [job_card(job, applied_status=applications.get(job.upwork_id, "")) for job in jobs]
+    app_index = index_applications(list(application_rows))
+    cards = []
+    for job in jobs:
+        app = application_for_job(job, app_index)
+        cards.append(job_card(job, applied_status=app.status if app else ""))
     if selected == "applied":
-        seen = {job.upwork_id for job in jobs}
-        cards.extend(application_card(row) for row in application_rows if row.posting_id not in seen)
+        seen_keys: set[str] = set()
+        for job in jobs:
+            seen_keys |= job_ref_keys(job.upwork_id)
+        cards.extend(
+            application_card(row)
+            for row in application_rows
+            if not (job_ref_keys(row.posting_id) & seen_keys)
+        )
     cards = sort_job_cards(cards, selected_sort)
     events = db.query(Event).order_by(Event.created_at.desc()).limit(12).all()
     mcp = UpworkMcpClient()
@@ -301,11 +319,12 @@ async def job_detail(request: Request, job_id: int, db: Session = Depends(get_db
         can_act = job.status in {JobStatus.pending_review.value, JobStatus.submit_failed.value} and not job.applied_on_upwork
     writer = load_proposal_settings(db)
     letter = cover_letter_for(job, db)
+    has_draft = bool(letter.strip())
     overlay = load_overlay(get_settings())
     bid = bid_amount_for_job(job, overlay.hourly_rate)
     panel = ConnectsPanel(charged_amount=bid)
     highlights: list[ApplyHighlight] = []
-    if can_act:
+    if can_act and has_draft:
         mcp = UpworkMcpClient()
         try:
             if job.applied_on_upwork:
@@ -412,6 +431,8 @@ async def job_detail(request: Request, job_id: int, db: Session = Depends(get_db
                 submit_error = event.message
                 break
     oauth_stale = oauth_needs_login(submit_error)
+    application = application_for_job(job, db=db)
+    latest_outcome = latest_client_outcome(db, job.id)
     return render(
         request,
         "job.html",
@@ -424,7 +445,10 @@ async def job_detail(request: Request, job_id: int, db: Session = Depends(get_db
             "matched_context": context,
             "outcomes": outcomes,
             "can_act": can_act,
-            "card": job_card(job),
+            "has_draft": has_draft,
+            "card": job_card(job, applied_status=application.status if application else ""),
+            "application": application,
+            "latest_outcome": latest_outcome.value if latest_outcome else "",
             "connects": panel,
             "milestones": milestones,
             "show_milestones": bool(milestones) or job_needs_milestones(job, bid, allowed),
@@ -508,6 +532,7 @@ async def regenerate_job(
         return RedirectResponse("/", status_code=303)
     if job.applied_on_upwork or job.status not in {JobStatus.pending_review.value, JobStatus.submit_failed.value}:
         return RedirectResponse(f"/jobs/{job.id}?error=blocked", status_code=303)
+    had_draft = bool(cover_letter_for(job, db).strip())
     points = [line.strip(" -•\t") for line in comments.splitlines() if line.strip()]
     try:
         await generate_tailored_pitch(str(job.id), focus_points=points, db=db, settings=settings)
@@ -516,11 +541,16 @@ async def regenerate_job(
     except Exception:
         logger.exception("regenerate failed for job %s", job.id)
         return RedirectResponse(f"/jobs/{job.id}?error=failed", status_code=303)
-    note = "Proposal regenerated"
+    if had_draft:
+        note = "Proposal regenerated"
+        flag = "regenerated"
+    else:
+        note = "Proposal drafted"
+        flag = "drafted"
     if comments.strip():
         note += f": {comments.strip()[:240]}"
-    add_event(db, "regenerated", note, job.id)
-    return RedirectResponse(f"/jobs/{job.id}?regenerated=1", status_code=303)
+    add_event(db, "regenerated" if had_draft else "drafted", note, job.id)
+    return RedirectResponse(f"/jobs/{job.id}?{flag}=1", status_code=303)
 
 
 @router.post("/jobs/{job_id}/approve")
@@ -732,14 +762,25 @@ def history(
 @router.post("/jobs/{job_id}/outcome")
 async def job_outcome(
     job_id: int,
-    outcome: str = Form(...),
+    outcome: str = Form(""),
     client_notes: str = Form(""),
     db: Session = Depends(get_db),
 ) -> Response:
     job = db.query(Job).filter(Job.id == job_id).one_or_none()
     if job is None:
         return RedirectResponse("/", status_code=303)
-    await log_interaction_feedback(str(job.id), outcome, client_notes, db=db)
+    applied = job.applied_on_upwork or application_for_job(job, db=db) is not None
+    if not applied:
+        return RedirectResponse(f"/jobs/{job.id}", status_code=303)
+    chosen = outcome.strip()
+    if not chosen:
+        latest = latest_client_outcome(db, job.id)
+        chosen = latest.value if latest else ""
+    try:
+        FeedbackOutcome(chosen)
+    except ValueError:
+        return RedirectResponse(f"/jobs/{job.id}", status_code=303)
+    await log_interaction_feedback(str(job.id), chosen, client_notes, db=db)
     return RedirectResponse(f"/jobs/{job.id}", status_code=303)
 
 
@@ -983,6 +1024,7 @@ def preferences_page(request: Request, db: Session = Depends(get_db)) -> Respons
                 upwork_skills = [str(item) for item in parsed_skills if str(item).strip()]
         except json.JSONDecodeError:
             upwork_skills = []
+    upwork_history, agent_history = work_history_for_prompt(db)
     return render(
         request,
         "preferences.html",
@@ -994,6 +1036,8 @@ def preferences_page(request: Request, db: Session = Depends(get_db)) -> Respons
             "overlay": overlay,
             "upwork_profile": snapshot,
             "upwork_skills": upwork_skills,
+            "suggested_queries": pending_queries(runtime),
+            "has_work_history": bool(upwork_history or agent_history),
         },
     )
 
@@ -1010,6 +1054,9 @@ def save_runtime(
     max_proposal_count: str = Form(""),
     prefer_timezones: str = Form(""),
     require_verified_payment: str | None = Form(default=None),
+    skip_us_work_auth: str | None = Form(default=None),
+    skip_w2_only: str | None = Form(default=None),
+    skip_onsite: str | None = Form(default=None),
     db: Session = Depends(get_db),
 ) -> Response:
     runtime = get_or_create_runtime(db)
@@ -1019,6 +1066,9 @@ def save_runtime(
     runtime.min_hourly = _opt_int(min_hourly)
     runtime.min_fixed = _opt_int(min_fixed)
     runtime.require_verified_payment = bool(require_verified_payment)
+    runtime.skip_us_work_auth = bool(skip_us_work_auth)
+    runtime.skip_w2_only = bool(skip_w2_only)
+    runtime.skip_onsite = bool(skip_onsite)
     try:
         runtime.min_client_rating = float(min_client_rating) if min_client_rating.strip() else None
     except ValueError:
@@ -1086,6 +1136,49 @@ def save_profile_overlay(
     save_overlay(overlay)
     apply_runtime_filters(db)
     return RedirectResponse("/preferences", status_code=303)
+
+
+@router.post("/preferences/search-queries/suggest")
+def suggest_profile_queries(
+    request: Request,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> Response:
+    _user(request)
+    try:
+        pending = suggest_search_queries(db, settings)
+    except Exception:
+        logger.exception("search query suggestion failed")
+        return RedirectResponse("/preferences?error=suggest", status_code=303)
+    flag = "suggested" if pending else "empty"
+    return RedirectResponse(f"/preferences?{flag}=1", status_code=303)
+
+
+@router.post("/preferences/search-queries/add")
+def add_suggested_query(
+    request: Request,
+    query: str = Form(""),
+    db: Session = Depends(get_db),
+) -> Response:
+    _user(request)
+    overlay = load_overlay(get_settings())
+    overlay = accept_search_query(overlay, query)
+    save_overlay(overlay)
+    runtime = get_or_create_runtime(db)
+    remove_pending_query(runtime, query)
+    return RedirectResponse("/preferences?added=1", status_code=303)
+
+
+@router.post("/preferences/search-queries/dismiss")
+def dismiss_suggested_query(
+    request: Request,
+    query: str = Form(""),
+    db: Session = Depends(get_db),
+) -> Response:
+    _user(request)
+    runtime = get_or_create_runtime(db)
+    dismiss_search_query(runtime, query)
+    return RedirectResponse("/preferences?dismissed=1", status_code=303)
 
 
 @router.get("/portfolio", response_class=HTMLResponse)

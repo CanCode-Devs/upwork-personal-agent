@@ -128,6 +128,7 @@ class UpworkApplication(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     posting_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    proposal_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(512), default="")
     status: Mapped[str] = mapped_column(String(64), default="")
     rate: Mapped[str] = mapped_column(String(64), default="")
@@ -169,6 +170,11 @@ class AppRuntimeSettings(Base):
     min_client_hires: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_proposal_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     prefer_timezones: Mapped[str] = mapped_column(Text, default="")
+    skip_us_work_auth: Mapped[bool] = mapped_column(Boolean, default=True)
+    skip_w2_only: Mapped[bool] = mapped_column(Boolean, default=True)
+    skip_onsite: Mapped[bool] = mapped_column(Boolean, default=True)
+    pending_search_queries: Mapped[str] = mapped_column(Text, default="[]")
+    dismissed_search_queries: Mapped[str] = mapped_column(Text, default="[]")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
