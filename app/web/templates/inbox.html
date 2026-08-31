@@ -14,13 +14,21 @@
 {% if mcp and mcp.stale %}
 <div class="banner">
   Upwork login expired, so polls cannot search. Sign in again on this machine.
+  {% if can.upwork_connect %}
   <a class="btn" href="/upwork/connect?force=1" target="_blank" rel="noopener noreferrer">Connect Upwork</a>
+  {% else %}
+  Ask an admin to connect Upwork.
+  {% endif %}
   {% if mcp.error %}<div class="sub">{{ mcp.error }}</div>{% endif %}
 </div>
 {% elif mcp and not mcp.connected %}
 <div class="banner">
   Upwork is not connected, so polls skip. Sign in with Upwork on this machine.
+  {% if can.upwork_connect %}
   <a class="btn" href="/upwork/connect" target="_blank" rel="noopener noreferrer">Connect Upwork</a>
+  {% else %}
+  Ask an admin to connect Upwork.
+  {% endif %}
   {% if oauth_detail %}<div class="sub">{{ oauth_detail }}</div>{% endif %}
 </div>
 {% elif mcp and mcp.connected and oauth != 'ok' %}
@@ -144,7 +152,7 @@
     {% for event in events %}
     <div class="event">
       <time>{{ event.created_at|dt }}</time>
-      {{ event.kind }} — {{ event.message }}
+        {{ event.kind }}{% if event.user %} · {{ event.user.username }}{% endif %} — {{ event.message }}
     </div>
     {% else %}
     <div class="event">No events yet.</div>

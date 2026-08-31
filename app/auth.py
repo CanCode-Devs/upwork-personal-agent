@@ -11,7 +11,8 @@ from starlette.types import ASGIApp
 
 from app.config import Settings
 from app.db.models import User
-from app.models import SessionUser
+from app.db.session import SessionLocal
+from app.models import SessionUser, UserRole
 
 COOKIE_NAME = "session"
 password_hash = PasswordHash.recommended()
@@ -29,6 +30,10 @@ def verify_password(plain: str, hashed: str) -> bool:
     return password_hash.verify(plain, hashed)
 
 
+def session_user_from_row(row: User) -> SessionUser:
+    return SessionUser(id=row.id, username=row.username, role=row.role)
+
+
 def bootstrap_user(db: Session, settings: Settings) -> None:
     existing = db.query(User).filter(User.username == settings.dashboard_username).one_or_none()
     if existing is None:
@@ -36,13 +41,17 @@ def bootstrap_user(db: Session, settings: Settings) -> None:
             User(
                 username=settings.dashboard_username,
                 password_hash=hash_password(settings.dashboard_password),
+                role=UserRole.admin.value,
+                is_active=True,
             )
         )
         db.commit()
         return
+    existing.role = UserRole.admin.value
+    existing.is_active = True
     if not verify_password(settings.dashboard_password, existing.password_hash):
         existing.password_hash = hash_password(settings.dashboard_password)
-        db.commit()
+    db.commit()
 
 
 def create_session_value(settings: Settings, username: str) -> str:
@@ -57,11 +66,20 @@ def read_session_value(settings: Settings, value: str) -> str | None:
     return raw.decode("utf-8")
 
 
-def current_user(request: Request) -> SessionUser | None:
-    username = getattr(request.state, "username", None)
+def load_session_user(db: Session, username: str | None) -> SessionUser | None:
     if not username:
         return None
-    return SessionUser(username=username)
+    row = db.query(User).filter(User.username == username).one_or_none()
+    if row is None or not row.is_active:
+        return None
+    return session_user_from_row(row)
+
+
+def current_user(request: Request) -> SessionUser | None:
+    user = getattr(request.state, "session_user", None)
+    if not user:
+        return None
+    return user
 
 
 class SessionMiddleware(BaseHTTPMiddleware):
@@ -71,7 +89,14 @@ class SessionMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         cookie = request.cookies.get(COOKIE_NAME)
-        request.state.username = read_session_value(self.settings, cookie) if cookie else None
+        username = read_session_value(self.settings, cookie) if cookie else None
+        db = SessionLocal()
+        try:
+            session_user = load_session_user(db, username)
+        finally:
+            db.close()
+        request.state.session_user = session_user
+        request.state.username = session_user["username"] if session_user else None
         return await call_next(request)
 
 

@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block title %}Users · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="top">
+  <div>
+    <h1>Users</h1>
+    <div class="sub">Dashboard seats on this machine. They share one Upwork OAuth token. The env bootstrap account stays admin.</div>
+  </div>
+</div>
+
+{% if error %}<div class="banner">{{ error }}</div>{% endif %}
+{% if created %}<div class="banner ok">Operator added. Give them the username and password.</div>{% endif %}
+
+<div class="card" style="margin-bottom:24px">
+  <h2>Add operator</h2>
+  <form method="post" action="/users">
+    <label for="username">Username</label>
+    <input id="username" name="username" type="text" autocomplete="off" required>
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="new-password" required>
+    <label for="role">Role</label>
+    <select id="role" name="role">
+      <option value="reviewer" selected>Reviewer — inbox, drafts, submit, messages</option>
+      <option value="admin">Admin — settings, users, Upwork connect</option>
+    </select>
+    <div class="actions" style="margin-top:16px">
+      <button class="btn" type="submit">Create user</button>
+    </div>
+  </form>
+</div>
+
+{% if people %}
+<table>
+  <thead>
+    <tr>
+      <th>User</th>
+      <th>Role</th>
+      <th>Status</th>
+      <th>Password</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for person in people %}
+    <tr>
+      <td>
+        {{ person.username }}
+        {% if person.is_owner %}<span class="badge">owner</span>{% endif %}
+      </td>
+      <td>
+        {% if person.is_owner %}
+        admin
+        {% else %}
+        <form class="inline-form" method="post" action="/users/{{ person.id }}/role">
+          <select name="role">
+            <option value="admin" {% if person.role == "admin" %}selected{% endif %}>admin</option>
+            <option value="reviewer" {% if person.role == "reviewer" %}selected{% endif %}>reviewer</option>
+          </select>
+          <button class="btn secondary" type="submit">Save</button>
+        </form>
+        {% endif %}
+      </td>
+      <td>{% if person.is_active %}active{% else %}inactive{% endif %}</td>
+      <td>
+        <form class="inline-form" method="post" action="/users/{{ person.id }}/password">
+          <input class="compact" name="password" type="password" autocomplete="new-password" placeholder="New password" required>
+          <button class="btn secondary" type="submit">Reset</button>
+        </form>
+      </td>
+      <td class="actions">
+        {% if person.is_owner %}
+        <span class="muted">Env account</span>
+        {% elif person.is_active %}
+        <form method="post" action="/users/{{ person.id }}/active">
+          <input type="hidden" name="active" value="0">
+          <button class="btn danger" type="submit">Deactivate</button>
+        </form>
+        {% else %}
+        <form method="post" action="/users/{{ person.id }}/active">
+          <input type="hidden" name="active" value="1">
+          <button class="btn secondary" type="submit">Reactivate</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No users yet.</p>
+{% endif %}
+{% endblock %}

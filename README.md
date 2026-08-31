@@ -2,7 +2,7 @@
 
 A **local** agent for **one** Upwork freelancer on **their own** account. It watches for jobs that match you, skips the ones that fail your rules, and waits for you before it writes a letter or spends Connects.
 
-Upwork treats freelancer accounts as personal. You may not share a login, Connects, or proposals across a team. This app is built that way on purpose: one OAuth login, one dashboard, one person reviewing drafts. It is not a multi-seat agency inbox.
+Upwork treats freelancer accounts as personal. This app uses **one OAuth login** and one Connects balance. You can add dashboard seats (Admin / Reviewer) so hired operators review and send from this UI. They never log into Upwork; they share the token on this machine. Keep the host private (localhost or a VPN).
 
 It is not a cloud SaaS and not an auto-apply bot unless you turn that on. You run it with Docker on your machine. Tokens, letters, and examples stay in `./data/` on disk.
 
@@ -118,13 +118,24 @@ Polls never write or submit a letter. Use **Write proposal** then **Approve & su
 
 Keep the machine awake; Compose uses `restart: unless-stopped`.
 
+## Dashboard seats
+
+`DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` bootstrap the **Admin** on every start. Extra operators live in SQLite, not `.env`. Open **Users** (admin only) to create a Reviewer, set a password, change role, or deactivate.
+
+| Role | Can |
+|------|-----|
+| **Admin** | Everything: settings, writer, portfolio, Upwork connect, users |
+| **Reviewer** | Inbox, History, Messages, write/edit drafts, **Approve & submit**, reject, Poll now |
+
+The job log records which dashboard user edited, approved, or sent. There is still one Upwork OAuth file (`./data/upwork_oauth.json`).
+
 ## Layout
 
 - `Dockerfile` / `docker-compose.yml` — app + embedding warmup
 - `app/agent.py` — poll orchestrator
 - `app/tools/` — memory, discovery, execution
 - `app/embeddings.py` — local vector store (sentence-transformers)
-- `app/web` — dashboard (Inbox, Portfolio, Proposal, Settings)
+- `app/web` — dashboard (Inbox, Messages, Portfolio, Proposal, Settings, Users)
 - `profiles/example.yaml` — generic starter profile (committed)
 - `profiles/default.yaml` — your profile (gitignored; copy from example)
 - `profiles/scoring.example.yaml` — scoring matrix template
@@ -139,7 +150,7 @@ The `warmup` service exits immediately if `.all-minilm-l6-v2.ready` exists in th
 
 ## Security
 
-Do not commit `.env`, `profiles/default.yaml`, `./data/` (includes Proposal examples and OAuth tokens). Approving a proposal spends Connects on **your** Upwork account. Do not share that login or this dashboard with others; Upwork accounts are personal. Prefer `manual` until you trust scoring and drafts. Leave `SEED_DEMO_PORTFOLIO=false` unless you want the bundled demo case studies.
+Do not commit `.env`, `profiles/default.yaml`, `./data/` (includes Proposal examples and OAuth tokens). Approving a proposal spends Connects on **your** Upwork account. Dashboard seats share that token; do not expose this UI on the public internet. Prefer `manual` until you trust scoring and drafts. Leave `SEED_DEMO_PORTFOLIO=false` unless you want the bundled demo case studies.
 
 ## Future plans
 

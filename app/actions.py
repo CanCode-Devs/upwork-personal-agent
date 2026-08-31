@@ -45,6 +45,7 @@ async def approve_and_submit(
     job_history_ids: list[str] | None = None,
     profile_history_ids: list[str] | None = None,
     attachment_uids: list[str] | None = None,
+    user_id: int | None = None,
 ) -> Job:
     if job.applied_on_upwork:
         raise ValueError("Already applied on Upwork")
@@ -68,6 +69,7 @@ async def approve_and_submit(
             certificate_ids=certificate_ids,
             job_history_ids=job_history_ids,
             profile_history_ids=profile_history_ids,
+            user_id=user_id,
         )
     overlay = load_overlay(get_settings())
     bid = bid_amount_for_job(job, overlay.hourly_rate)
@@ -77,6 +79,7 @@ async def approve_and_submit(
         "approved",
         f"Approved from dashboard boost={max(0, boost_connects)} milestones={len(milestones or [])}",
         job.id,
+        user_id=user_id,
     )
     await log_interaction_feedback(str(job.id), FeedbackOutcome.approved.value, "Approved from dashboard", db=db)
     result = await submit_proposal(
@@ -97,12 +100,12 @@ async def approve_and_submit(
     return job
 
 
-async def reject_job(db: Session, job: Job, reason: str = "") -> Job:
+async def reject_job(db: Session, job: Job, reason: str = "", user_id: int | None = None) -> Job:
     if job.status not in {JobStatus.pending_review.value, JobStatus.submit_failed.value}:
         raise ValueError(f"Job cannot be rejected from status {job.status}")
     job.status = JobStatus.rejected.value
     note = reason.strip() or "Rejected from dashboard"
-    add_event(db, "rejected", note, job.id)
+    add_event(db, "rejected", note, job.id, user_id=user_id)
     await log_interaction_feedback(str(job.id), FeedbackOutcome.rejected.value, note, db=db)
     return job
 
@@ -117,6 +120,7 @@ def save_edit(
     certificate_ids: list[str] | None = None,
     job_history_ids: list[str] | None = None,
     profile_history_ids: list[str] | None = None,
+    user_id: int | None = None,
 ) -> Proposal:
     writer = load_proposal_settings(db)
     letter = finalize_letter(cover_letter, hook=writer.opening_hook, enforce=writer.enforce_opening_hook)
@@ -151,5 +155,5 @@ def save_edit(
         proposal.apply_json = dump_apply(raw)
     db.flush()
     add_embedding(db, EmbeddingSource.proposal, proposal.id, cover_letter)
-    add_event(db, "edited", "Cover letter updated", job.id)
+    add_event(db, "edited", "Cover letter updated", job.id, user_id=user_id)
     return proposal

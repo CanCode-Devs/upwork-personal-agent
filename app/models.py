@@ -461,8 +461,53 @@ class ToolCallArgs(TypedDict, total=False):
     coverLetter: str
 
 
+class UserRole(StrEnum):
+    admin = "admin"
+    reviewer = "reviewer"
+
+
+class Permission(StrEnum):
+    review = "review"
+    submit = "submit"
+    messages = "messages"
+    poll = "poll"
+    settings = "settings"
+    writer = "writer"
+    portfolio = "portfolio"
+    upwork_connect = "upwork_connect"
+    users = "users"
+
+
 class SessionUser(TypedDict):
+    id: int
     username: str
+    role: str
+
+
+class PermissionFlags(TypedDict):
+    review: bool
+    submit: bool
+    messages: bool
+    poll: bool
+    settings: bool
+    writer: bool
+    portfolio: bool
+    upwork_connect: bool
+    users: bool
+
+
+class DashboardUserCreate(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=256)
+    role: UserRole
+
+    @field_validator("username", "password")
+    @classmethod
+    def strip_required(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("required")
+        return text
 
 
 class InboxCounts(TypedDict):

@@ -18,6 +18,8 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     username: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(256))
+    role: Mapped[str] = mapped_column(String(32), default="admin")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -77,11 +79,13 @@ class Event(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id"), nullable=True, index=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
     kind: Mapped[str] = mapped_column(String(64), index=True)
     message: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     job: Mapped[Job | None] = relationship(back_populates="events")
+    user: Mapped["User | None"] = relationship()
 
 
 class PreferenceRule(Base):

@@ -11,14 +11,43 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
+from pydantic import ValidationError
 from sqlalchemy import func
 from sqlalchemy.orm import Session, selectinload
 
 from app.actions import approve_and_submit, cover_letter_for, latest_proposal, reject_job, save_edit
-from app.auth import COOKIE_NAME, create_session_value, current_user, verify_password
+from app.auth import COOKIE_NAME, create_session_value, current_user, hash_password, verify_password
 from app.config import Settings, get_settings
-from app.models import ApplyHighlight, ConnectsPanel, FeedbackOutcome, FreelancerProfile, InboxCounts, InboxSort, JobStatus, MilestoneStageConfig, PitchTone, ScreeningAnswer, SessionUser, WorkKind, WorkOrigin, WriterConfig
+from app.models import (
+    ApplyHighlight,
+    ConnectsPanel,
+    DashboardUserCreate,
+    FeedbackOutcome,
+    FreelancerProfile,
+    InboxCounts,
+    InboxSort,
+    JobStatus,
+    MilestoneStageConfig,
+    Permission,
+    PitchTone,
+    ScreeningAnswer,
+    SessionUser,
+    UserRole,
+    WorkKind,
+    WorkOrigin,
+    WriterConfig,
+)
 from app.db.models import ChatMessage, Event, FeedbackLog, Job, MessageRoom, PortfolioItem, PreferenceRule, ProposalExample, UpworkApplication, UpworkProfile, User
+from app.rbac import (
+    UserMutationError,
+    create_dashboard_user,
+    flags_for,
+    is_bootstrap_username,
+    require_permission,
+    reset_user_password,
+    set_user_active,
+    set_user_role,
+)
 from app.llm import llm_suggest_reply
 from app.db.session import SessionLocal, get_db
 from app.engagement import classify_engagement
@@ -100,9 +129,12 @@ def render(request: Request, name: str, context: dict | None = None, status_code
     settings = get_settings()
     payload = dict(context or {})
     payload.pop("request", None)
+    user = payload.get("user") or current_user(request)
     payload.setdefault("app_name", settings.app_name)
     payload.setdefault("app_tagline", settings.app_tagline)
     payload.setdefault("asset_v", _ASSET_V)
+    payload.setdefault("user", user)
+    payload.setdefault("can", flags_for(user))
     return templates.TemplateResponse(request, name, payload, status_code=status_code)
 
 
@@ -180,7 +212,7 @@ def login_submit(
     settings: Settings = Depends(get_settings),
 ) -> Response:
     user = db.query(User).filter(User.username == username).one_or_none()
-    if user is None or not verify_password(password, user.password_hash):
+    if user is None or not user.is_active or not verify_password(password, user.password_hash):
         return render(
             request,
             "login.html",
@@ -212,8 +244,8 @@ async def inbox(
     sort: str = Query(default=InboxSort.recent.value),
     oauth: str | None = Query(default=None),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.review)),
 ) -> Response:
-    user = _user(request)
     allowed = {item.value for item in JobStatus} | {"all", "applied"}
     selected = status if status in allowed else JobStatus.pending_review.value
     selected_sort = InboxSort.recent
@@ -245,7 +277,7 @@ async def inbox(
             if not (job_ref_keys(row.posting_id) & seen_keys)
         )
     cards = sort_job_cards(cards, selected_sort)
-    events = db.query(Event).order_by(Event.created_at.desc()).limit(12).all()
+    events = db.query(Event).options(selectinload(Event.user)).order_by(Event.created_at.desc()).limit(12).all()
     mcp = UpworkMcpClient()
     connected = await mcp.is_authenticated()
     stale_auth = _inbox_auth_stale(events, oauth)
@@ -284,9 +316,16 @@ async def inbox(
 
 
 @router.get("/jobs/{job_id}", response_class=HTMLResponse)
-async def job_detail(request: Request, job_id: int, db: Session = Depends(get_db)) -> Response:
-    user = _user(request)
-    job = db.query(Job).options(selectinload(Job.proposals), selectinload(Job.events)).filter(Job.id == job_id).one_or_none()
+async def job_detail(
+    request: Request,
+    job_id: int,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.review)),
+) -> Response:
+    job = db.query(Job).options(
+        selectinload(Job.proposals),
+        selectinload(Job.events).selectinload(Event.user),
+    ).filter(Job.id == job_id).one_or_none()
     if job is None:
         return RedirectResponse("/", status_code=303)
     events = sorted(job.events, key=lambda item: item.created_at, reverse=True)
@@ -468,8 +507,9 @@ def job_attachment_file(
     filename: str,
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
+    user: SessionUser = Depends(require_permission(Permission.review)),
 ) -> Response:
-    _user(request)
+    _ = user
     job = db.query(Job).filter(Job.id == job_id).one_or_none()
     if job is None:
         raise HTTPException(status_code=404)
@@ -487,6 +527,7 @@ def job_attachment_file(
 def edit_job(
     job_id: int,
     cover_letter: str = Form(...),
+    user: SessionUser = Depends(require_permission(Permission.review)),
     milestones_present: str = Form(""),
     ms_title: list[str] = Form(default=[]),
     ms_description: list[str] = Form(default=[]),
@@ -514,6 +555,7 @@ def edit_job(
         certificate_ids=certificate_ids,
         job_history_ids=job_history_ids,
         profile_history_ids=profile_history_ids,
+        user_id=user["id"],
     )
     return RedirectResponse(f"/jobs/{job.id}?saved=1", status_code=303)
 
@@ -525,8 +567,8 @@ async def regenerate_job(
     comments: str = Form(""),
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
+    user: SessionUser = Depends(require_permission(Permission.review)),
 ) -> Response:
-    _user(request)
     job = db.query(Job).options(selectinload(Job.proposals)).filter(Job.id == job_id).one_or_none()
     if job is None:
         return RedirectResponse("/", status_code=303)
@@ -549,7 +591,7 @@ async def regenerate_job(
         flag = "drafted"
     if comments.strip():
         note += f": {comments.strip()[:240]}"
-    add_event(db, "regenerated" if had_draft else "drafted", note, job.id)
+    add_event(db, "regenerated" if had_draft else "drafted", note, job.id, user_id=user["id"])
     return RedirectResponse(f"/jobs/{job.id}?{flag}=1", status_code=303)
 
 
@@ -571,6 +613,7 @@ async def approve_job(
     attach_choice: str = Form("skip"),
     proposal_files: list[UploadFile] | None = File(default=None),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.submit)),
 ) -> Response:
     job = db.query(Job).options(selectinload(Job.proposals)).filter(Job.id == job_id).one_or_none()
     if job is None:
@@ -611,9 +654,10 @@ async def approve_job(
             job_history_ids=job_history_ids,
             profile_history_ids=profile_history_ids,
             attachment_uids=attachment_uids,
+            user_id=user["id"],
         )
     except (ValueError, RuntimeError, Exception) as exc:
-        add_event(db, "submit_failed", format_mcp_error(exc), job.id)
+        add_event(db, "submit_failed", format_mcp_error(exc), job.id, user_id=user["id"])
         logger.exception("approve/submit failed for job %s", job.id)
     return RedirectResponse(f"/jobs/{job.id}", status_code=303)
 
@@ -623,16 +667,18 @@ async def reject(
     job_id: int,
     reason: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.review)),
 ) -> Response:
     job = db.query(Job).options(selectinload(Job.proposals)).filter(Job.id == job_id).one_or_none()
     if job is None:
         return RedirectResponse("/", status_code=303)
-    await reject_job(db, job, reason)
+    await reject_job(db, job, reason, user_id=user["id"])
     return RedirectResponse(f"/jobs/{job.id}", status_code=303)
 
 
 @router.post("/poll")
-async def poll_now() -> Response:
+async def poll_now(user: SessionUser = Depends(require_permission(Permission.poll))) -> Response:
+    _ = user
     await run_poll_cycle()
     return RedirectResponse("/", status_code=303)
 
@@ -672,8 +718,11 @@ def _abandon_web_login(flow: WebOAuthFlow, message: str) -> None:
 
 
 @router.get("/upwork/connect")
-async def upwork_connect(request: Request, db: Session = Depends(get_db)) -> Response:
-    user = _user(request)
+async def upwork_connect(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.upwork_connect)),
+) -> Response:
     force = request.query_params.get("force") == "1"
     client = UpworkMcpClient()
     if await client.is_authenticated() and not force:
@@ -738,8 +787,8 @@ async def upwork_callback(
 def history(
     request: Request,
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.review)),
 ) -> Response:
-    user = _user(request)
     jobs = (
         db.query(Job)
         .filter(Job.status.in_([
@@ -765,7 +814,9 @@ async def job_outcome(
     outcome: str = Form(""),
     client_notes: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.review)),
 ) -> Response:
+    _ = user
     job = db.query(Job).filter(Job.id == job_id).one_or_none()
     if job is None:
         return RedirectResponse("/", status_code=303)
@@ -785,7 +836,8 @@ async def job_outcome(
 
 
 @router.get("/settings")
-def settings_alias() -> Response:
+def settings_alias(user: SessionUser = Depends(require_permission(Permission.settings))) -> Response:
+    _ = user
     return RedirectResponse("/preferences", status_code=303)
 
 
@@ -860,8 +912,11 @@ def _writer_from_form(
 
 
 @router.get("/proposal", response_class=HTMLResponse)
-def proposal_page(request: Request, db: Session = Depends(get_db)) -> Response:
-    user = _user(request)
+def proposal_page(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.writer)),
+) -> Response:
     writer = load_proposal_settings(db)
     overlay = load_overlay(get_settings())
     examples = db.query(ProposalExample).order_by(ProposalExample.created_at.desc()).all()
@@ -903,8 +958,9 @@ def save_proposal_settings(
     apply_questions_instructions: str = Form(""),
     example_count: str = Form("2"),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.writer)),
 ) -> Response:
-    _user(request)
+    _ = user
     row = get_or_create_proposal_settings(db)
     apply_config_to_row(
         row,
@@ -933,15 +989,21 @@ def save_proposal_settings(
 
 
 @router.post("/proposal/reset")
-def reset_proposal(request: Request, db: Session = Depends(get_db)) -> Response:
-    _user(request)
+def reset_proposal(
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.writer)),
+) -> Response:
+    _ = user
     reset_proposal_settings(db)
     return RedirectResponse("/proposal?reset=1", status_code=303)
 
 
 @router.post("/proposal/reset-role")
-def reset_role_structure(request: Request, db: Session = Depends(get_db)) -> Response:
-    _user(request)
+def reset_role_structure(
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.writer)),
+) -> Response:
+    _ = user
     reset_role_letter_structure(db)
     return RedirectResponse("/proposal?reset=role", status_code=303)
 
@@ -954,8 +1016,9 @@ def add_proposal_example(
     cover_letter: str = Form(""),
     notes: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.writer)),
 ) -> Response:
-    _user(request)
+    _ = user
     if not job_post.strip() or not cover_letter.strip():
         return RedirectResponse("/proposal?error=example", status_code=303)
     db.add(
@@ -979,8 +1042,9 @@ def update_proposal_example(
     cover_letter: str = Form(""),
     notes: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.writer)),
 ) -> Response:
-    _user(request)
+    _ = user
     row = db.query(ProposalExample).filter(ProposalExample.id == example_id).one_or_none()
     if row is None:
         return RedirectResponse("/proposal", status_code=303)
@@ -992,8 +1056,12 @@ def update_proposal_example(
 
 
 @router.post("/proposal/examples/{example_id}/delete")
-def delete_proposal_example(request: Request, example_id: int, db: Session = Depends(get_db)) -> Response:
-    _user(request)
+def delete_proposal_example(
+    example_id: int,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.writer)),
+) -> Response:
+    _ = user
     row = db.query(ProposalExample).filter(ProposalExample.id == example_id).one_or_none()
     if row is not None:
         db.delete(row)
@@ -1001,8 +1069,12 @@ def delete_proposal_example(request: Request, example_id: int, db: Session = Dep
 
 
 @router.post("/proposal/examples/{example_id}/toggle")
-def toggle_proposal_example(request: Request, example_id: int, db: Session = Depends(get_db)) -> Response:
-    _user(request)
+def toggle_proposal_example(
+    example_id: int,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.writer)),
+) -> Response:
+    _ = user
     row = db.query(ProposalExample).filter(ProposalExample.id == example_id).one_or_none()
     if row is not None:
         row.active = not row.active
@@ -1010,8 +1082,11 @@ def toggle_proposal_example(request: Request, example_id: int, db: Session = Dep
 
 
 @router.get("/preferences", response_class=HTMLResponse)
-def preferences_page(request: Request, db: Session = Depends(get_db)) -> Response:
-    user = _user(request)
+def preferences_page(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
+) -> Response:
     runtime = get_or_create_runtime(db)
     rules = db.query(PreferenceRule).order_by(PreferenceRule.created_at.desc()).all()
     overlay = load_overlay(get_settings())
@@ -1058,7 +1133,9 @@ def save_runtime(
     skip_w2_only: str | None = Form(default=None),
     skip_onsite: str | None = Form(default=None),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
 ) -> Response:
+    _ = user
     runtime = get_or_create_runtime(db)
     runtime.autonomy_mode = autonomy_mode
     runtime.auto_submit_threshold = auto_submit_threshold
@@ -1086,14 +1163,21 @@ async def add_rule(
     rule: str = Form(...),
     enforcement_level: str = Form("soft_penalty"),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
 ) -> Response:
+    _ = user
     await learn_preference(category, rule, enforcement_level, db=db)
     apply_runtime_filters(db)
     return RedirectResponse("/preferences", status_code=303)
 
 
 @router.post("/preferences/rules/{rule_id}/toggle")
-def toggle_rule(rule_id: int, db: Session = Depends(get_db)) -> Response:
+def toggle_rule(
+    rule_id: int,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
+) -> Response:
+    _ = user
     row = db.query(PreferenceRule).filter(PreferenceRule.id == rule_id).one_or_none()
     if row is not None:
         row.active = not row.active
@@ -1102,7 +1186,12 @@ def toggle_rule(rule_id: int, db: Session = Depends(get_db)) -> Response:
 
 
 @router.post("/preferences/rules/{rule_id}/delete")
-def delete_rule(rule_id: int, db: Session = Depends(get_db)) -> Response:
+def delete_rule(
+    rule_id: int,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
+) -> Response:
+    _ = user
     row = db.query(PreferenceRule).filter(PreferenceRule.id == rule_id).one_or_none()
     if row is not None:
         db.delete(row)
@@ -1121,7 +1210,9 @@ def save_profile_overlay(
     exclude_keywords: str = Form(""),
     search_queries: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
 ) -> Response:
+    _ = user
     rate = int(hourly_rate) if hourly_rate.strip().isdigit() else None
     overlay = FreelancerProfile(
         name=name.strip(),
@@ -1143,8 +1234,8 @@ def suggest_profile_queries(
     request: Request,
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
 ) -> Response:
-    _user(request)
     try:
         pending = suggest_search_queries(db, settings)
     except Exception:
@@ -1156,11 +1247,11 @@ def suggest_profile_queries(
 
 @router.post("/preferences/search-queries/add")
 def add_suggested_query(
-    request: Request,
     query: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
 ) -> Response:
-    _user(request)
+    _ = user
     overlay = load_overlay(get_settings())
     overlay = accept_search_query(overlay, query)
     save_overlay(overlay)
@@ -1171,19 +1262,22 @@ def add_suggested_query(
 
 @router.post("/preferences/search-queries/dismiss")
 def dismiss_suggested_query(
-    request: Request,
     query: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
 ) -> Response:
-    _user(request)
+    _ = user
     runtime = get_or_create_runtime(db)
     dismiss_search_query(runtime, query)
     return RedirectResponse("/preferences?dismissed=1", status_code=303)
 
 
 @router.get("/portfolio", response_class=HTMLResponse)
-def portfolio_page(request: Request, db: Session = Depends(get_db)) -> Response:
-    user = _user(request)
+def portfolio_page(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.portfolio)),
+) -> Response:
     items = db.query(PortfolioItem).order_by(PortfolioItem.created_at.desc()).all()
     parsed = []
     for item in items:
@@ -1233,7 +1327,9 @@ async def add_portfolio(
     associated_keywords: str = Form(""),
     description: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.portfolio)),
 ) -> Response:
+    _ = user
     stack = [part.strip() for part in tech_stack.split(",") if part.strip()]
     keys = [part.strip() for part in associated_keywords.split(",") if part.strip()]
     await update_portfolio_matrix(
@@ -1248,11 +1344,14 @@ async def add_portfolio(
 
 
 @router.post("/portfolio/sync-upwork")
-async def sync_upwork_portfolio(db: Session = Depends(get_db)) -> Response:
+async def sync_upwork_portfolio(
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.portfolio)),
+) -> Response:
     try:
         await sync_upwork_memory(db)
     except Exception as exc:
-        add_event(db, "upwork", f"Sync failed: {exc}")
+        add_event(db, "upwork", f"Sync failed: {exc}", user_id=user["id"])
     return RedirectResponse("/portfolio", status_code=303)
 
 
@@ -1265,7 +1364,9 @@ async def edit_portfolio(
     associated_keywords: str = Form(""),
     description: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.portfolio)),
 ) -> Response:
+    _ = user
     stack = [part.strip() for part in tech_stack.split(",") if part.strip()]
     keys = [part.strip() for part in associated_keywords.split(",") if part.strip()]
     await save_agent_item(
@@ -1281,7 +1382,12 @@ async def edit_portfolio(
 
 
 @router.post("/portfolio/{item_id}/delete")
-def delete_portfolio(item_id: int, db: Session = Depends(get_db)) -> Response:
+def delete_portfolio(
+    item_id: int,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.portfolio)),
+) -> Response:
+    _ = user
     row = db.query(PortfolioItem).filter(PortfolioItem.id == item_id).one_or_none()
     if row is not None and row.origin == WorkOrigin.agent.value:
         db.delete(row)
@@ -1348,12 +1454,22 @@ async def _messages_context(
 
 
 @router.get("/messages", response_class=HTMLResponse)
-async def messages_page(request: Request, db: Session = Depends(get_db)) -> Response:
+async def messages_page(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.messages)),
+) -> Response:
+    _ = user
     return render(request, "messages.html", await _messages_context(request, db))
 
 
 @router.post("/messages/sync")
-async def messages_sync(next: str = Form(""), db: Session = Depends(get_db)) -> Response:
+async def messages_sync(
+    next: str = Form(""),
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.messages)),
+) -> Response:
+    _ = user
     dest = _safe_room_next(next)
     mcp = UpworkMcpClient()
     if not await mcp.is_authenticated():
@@ -1370,7 +1486,13 @@ async def messages_sync(next: str = Form(""), db: Session = Depends(get_db)) -> 
 
 
 @router.get("/messages/{room_id}", response_class=HTMLResponse)
-async def message_thread(request: Request, room_id: str, db: Session = Depends(get_db)) -> Response:
+async def message_thread(
+    request: Request,
+    room_id: str,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.messages)),
+) -> Response:
+    _ = user
     exists = db.query(MessageRoom).filter(MessageRoom.room_id == room_id).one_or_none()
     if exists is None:
         return RedirectResponse("/messages", status_code=303)
@@ -1378,7 +1500,12 @@ async def message_thread(request: Request, room_id: str, db: Session = Depends(g
 
 
 @router.post("/messages/{room_id}/suggest")
-async def suggest_reply(room_id: str, db: Session = Depends(get_db)) -> Response:
+async def suggest_reply(
+    room_id: str,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.messages)),
+) -> Response:
+    _ = user
     room = db.query(MessageRoom).filter(MessageRoom.room_id == room_id).one_or_none()
     if room is None:
         return RedirectResponse("/messages", status_code=303)
@@ -1408,6 +1535,7 @@ async def send_reply(
     body: str = Form(""),
     chat_files: list[UploadFile] | None = File(default=None),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.messages)),
 ) -> Response:
     room = db.query(MessageRoom).filter(MessageRoom.room_id == room_id).one_or_none()
     if room is None:
@@ -1440,7 +1568,7 @@ async def send_reply(
             await refresh_room(mcp, db, room)
         except Exception:
             logger.exception("refresh after send failed")
-        add_event(db, "messages", f"sent room={room.room_id} {result[:180]}")
+        add_event(db, "messages", f"sent room={room.room_id} {result[:180]}", user_id=user["id"])
         return RedirectResponse(f"/messages/{room.room_id}?sent=1", status_code=303)
     except Exception as exc:
         detail = format_mcp_error(exc)
@@ -1454,4 +1582,120 @@ async def send_reply(
             return RedirectResponse(f"/messages/{room.room_id}?error=connect", status_code=303)
         logger.exception("send message failed")
         return RedirectResponse(f"/messages/{room.room_id}?error=send", status_code=303)
+
+
+_USER_ERRORS = {
+    "duplicate": "That username is already taken.",
+    "empty": "Username and password are required.",
+    "invalid_role": "Choose Admin or Reviewer.",
+    "last_admin": "Keep at least one active admin.",
+    "owner": "The env bootstrap account stays admin and active.",
+    "missing": "That user is gone.",
+}
+
+
+@router.get("/users", response_class=HTMLResponse)
+def users_page(
+    request: Request,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+    user: SessionUser = Depends(require_permission(Permission.users)),
+) -> Response:
+    rows = db.query(User).order_by(User.created_at.asc()).all()
+    error = request.query_params.get("error") or ""
+    return render(
+        request,
+        "users.html",
+        {
+            "user": user,
+            "counts": _counts(db),
+            "people": [
+                {
+                    "id": row.id,
+                    "username": row.username,
+                    "role": row.role,
+                    "is_active": row.is_active,
+                    "created_at": row.created_at,
+                    "is_owner": is_bootstrap_username(row.username, settings),
+                }
+                for row in rows
+            ],
+            "roles": list(UserRole),
+            "error": _USER_ERRORS.get(error, ""),
+            "created": request.query_params.get("created") or "",
+        },
+    )
+
+
+@router.post("/users")
+def create_user(
+    username: str = Form(""),
+    password: str = Form(""),
+    role: str = Form(UserRole.reviewer.value),
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.users)),
+) -> Response:
+    _ = user
+    try:
+        chosen = UserRole(role)
+    except ValueError:
+        return RedirectResponse("/users?error=invalid_role", status_code=303)
+    try:
+        payload = DashboardUserCreate(username=username, password=password, role=chosen)
+    except ValidationError:
+        return RedirectResponse("/users?error=empty", status_code=303)
+    try:
+        create_dashboard_user(db, payload.username, hash_password(payload.password), payload.role.value)
+    except UserMutationError as exc:
+        return RedirectResponse(f"/users?error={exc.code}", status_code=303)
+    return RedirectResponse("/users?created=1", status_code=303)
+
+
+@router.post("/users/{user_id}/role")
+def change_user_role(
+    user_id: int,
+    role: str = Form(""),
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+    user: SessionUser = Depends(require_permission(Permission.users)),
+) -> Response:
+    _ = user
+    try:
+        set_user_role(db, user_id, role, settings)
+    except UserMutationError as exc:
+        return RedirectResponse(f"/users?error={exc.code}", status_code=303)
+    return RedirectResponse("/users", status_code=303)
+
+
+@router.post("/users/{user_id}/password")
+def change_user_password(
+    user_id: int,
+    password: str = Form(""),
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.users)),
+) -> Response:
+    _ = user
+    if not password.strip():
+        return RedirectResponse("/users?error=empty", status_code=303)
+    try:
+        reset_user_password(db, user_id, hash_password(password.strip()))
+    except UserMutationError as exc:
+        return RedirectResponse(f"/users?error={exc.code}", status_code=303)
+    return RedirectResponse("/users", status_code=303)
+
+
+@router.post("/users/{user_id}/active")
+def change_user_active(
+    user_id: int,
+    active: str = Form(""),
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+    user: SessionUser = Depends(require_permission(Permission.users)),
+) -> Response:
+    _ = user
+    try:
+        set_user_active(db, user_id, active.strip() == "1", settings)
+    except UserMutationError as exc:
+        return RedirectResponse(f"/users?error={exc.code}", status_code=303)
+    return RedirectResponse("/users", status_code=303)
 

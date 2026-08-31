@@ -304,7 +304,7 @@
       {% for event in events %}
       <div class="event">
         <time>{{ event.created_at|dt }}</time>
-        {{ event.kind }} — {{ event.message }}
+        {{ event.kind }}{% if event.user %} · {{ event.user.username }}{% endif %} — {{ event.message }}
       </div>
       {% endfor %}
     </div>

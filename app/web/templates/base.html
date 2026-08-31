@@ -23,11 +23,22 @@
       </div>
       <nav>
         <a href="/?status=pending_review" class="{% if request.url.path == '/' %}active{% endif %}">Inbox</a>
+        {% if can is defined and can.messages %}
         <a href="/messages" class="{% if request.url.path.startswith('/messages') %}active{% endif %}">Messages</a>
+        {% endif %}
+        {% if can is defined and can.portfolio %}
         <a href="/portfolio" class="{% if request.url.path.startswith('/portfolio') %}active{% endif %}">Portfolio</a>
+        {% endif %}
+        {% if can is defined and can.writer %}
         <a href="/proposal" class="{% if request.url.path.startswith('/proposal') %}active{% endif %}">Proposal</a>
+        {% endif %}
+        {% if can is defined and can.settings %}
         <a href="/preferences" class="{% if request.url.path.startswith('/preferences') or request.url.path.startswith('/settings') %}active{% endif %}">Settings</a>
+        {% endif %}
         <a href="/history" class="{% if request.url.path == '/history' %}active{% endif %}">History</a>
+        {% if can is defined and can.users %}
+        <a href="/users" class="{% if request.url.path.startswith('/users') %}active{% endif %}">Users</a>
+        {% endif %}
         <form action="/logout" method="post">
           <button class="btn ghost" type="submit">Log out</button>
         </form>
@@ -41,8 +52,8 @@
         <div>Rejected <b>{{ counts.rejected }}</b></div>
       </div>
       {% endif %}
-      {% if user is defined %}
-      <div class="user">{{ user.username }}</div>
+      {% if user is defined and user %}
+      <div class="user">{{ user.username }}<span class="role">{{ user.role }}</span></div>
       {% endif %}
     </aside>
     <section class="main">
