@@ -29,21 +29,21 @@ class PollScheduler:
         self._interval = 15 * 60
 
     def configure(self, interval_seconds: int) -> None:
-        new_interval = max(60, interval_seconds)
-        changed = new_interval != self._interval
-        self._interval = new_interval
+        self._interval = max(60, interval_seconds)
         if self._polling or self._pending_source:
             return
-        if self._next_poll_at is None:
-            self._next_poll_at = _utc_now()
-            return
-        if not changed or self._last_finished_at is None:
-            return
         now = _utc_now()
-        scheduled = self._last_finished_at + timedelta(seconds=self._interval)
-        self._next_poll_at = now if scheduled <= now else scheduled
-        if self._loop_running:
-            self._wake.set()
+        if self._last_finished_at is not None:
+            scheduled = self._last_finished_at + timedelta(seconds=self._interval)
+            new_next = now if scheduled <= now else scheduled
+            if self._next_poll_at != new_next:
+                earlier = self._next_poll_at is None or new_next < self._next_poll_at
+                self._next_poll_at = new_next
+                if earlier and self._loop_running:
+                    self._wake.set()
+            return
+        if self._next_poll_at is None:
+            self._next_poll_at = now
 
     def snapshot(self) -> PollStatusView:
         pending = bool(self._pending_source)
