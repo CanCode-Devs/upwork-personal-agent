@@ -29,9 +29,21 @@ class PollScheduler:
         self._interval = 15 * 60
 
     def configure(self, interval_seconds: int) -> None:
-        self._interval = max(60, interval_seconds)
-        if self._next_poll_at is None and not self._polling and not self._pending_source:
+        new_interval = max(60, interval_seconds)
+        changed = new_interval != self._interval
+        self._interval = new_interval
+        if self._polling or self._pending_source:
+            return
+        if self._next_poll_at is None:
             self._next_poll_at = _utc_now()
+            return
+        if not changed or self._last_finished_at is None:
+            return
+        now = _utc_now()
+        scheduled = self._last_finished_at + timedelta(seconds=self._interval)
+        self._next_poll_at = now if scheduled <= now else scheduled
+        if self._loop_running:
+            self._wake.set()
 
     def snapshot(self) -> PollStatusView:
         pending = bool(self._pending_source)
@@ -60,16 +72,19 @@ class PollScheduler:
         self._pending_source = "auto"
         try:
             while True:
-                source = self._pending_source or "auto"
-                await self._run_once(settings, source)
-                self._wake.clear()
+                current = get_settings()
+                self.configure(current.poll_interval_minutes * 60)
                 remaining = self._seconds_until_next()
-                if remaining <= 0:
+                if remaining > 0:
+                    try:
+                        await asyncio.wait_for(self._wake.wait(), timeout=remaining)
+                    except TimeoutError:
+                        pass
+                    self._wake.clear()
                     continue
-                try:
-                    await asyncio.wait_for(self._wake.wait(), timeout=remaining)
-                except TimeoutError:
-                    pass
+                source = self._pending_source or "auto"
+                await self._run_once(current, source)
+                self._wake.clear()
         finally:
             self._loop_running = False
 

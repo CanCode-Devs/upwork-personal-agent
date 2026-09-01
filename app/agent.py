@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime, timedelta
+from typing import Literal, TypedDict
 
 from app.config import Settings, get_settings
 from app.db.models import FeedbackLog, Job, UpworkApplication
@@ -71,6 +72,104 @@ def _job_url(payload: JobPayload) -> str | None:
     if not job_id:
         return None
     return public_job_url(job_id)
+
+
+class JobActivityPatch(TypedDict, total=False):
+    proposal_count: int | float
+    interviewing: int | float
+    invites_sent: int | float
+    avg_bid: int | float | str
+    hired_on_job: int | float
+    unanswered_invites: int | float
+
+
+_ACTIVITY_KEYS: tuple[Literal[
+    "proposal_count",
+    "interviewing",
+    "invites_sent",
+    "avg_bid",
+    "hired_on_job",
+    "unanswered_invites",
+], ...] = (
+    "proposal_count",
+    "interviewing",
+    "invites_sent",
+    "avg_bid",
+    "hired_on_job",
+    "unanswered_invites",
+)
+
+
+def _activity_from_payload(payload: JobPayload) -> JobActivityPatch:
+    details = _details_dict(payload.get("client_details"))
+    top: JobActivityPatch = {}
+    if payload.get("proposal_count") is not None:
+        top["proposal_count"] = payload["proposal_count"]
+    if payload.get("interviewing") is not None:
+        top["interviewing"] = payload["interviewing"]
+    if payload.get("invites_sent") is not None:
+        top["invites_sent"] = payload["invites_sent"]
+    values: JobActivityPatch = {}
+    for key in _ACTIVITY_KEYS:
+        value = top.get(key)
+        if value is None:
+            value = details.get(key)
+        if value is not None:
+            values[key] = value
+    return values
+
+
+async def refresh_known_job_activity(
+    search_results: list[JobPayload],
+    settings: Settings | None = None,
+) -> int:
+    payload_by_id: dict[str, JobPayload] = {}
+    for item in search_results:
+        job_id = item.get("id")
+        if job_id:
+            payload_by_id[job_id] = item
+    if not payload_by_id:
+        return 0
+    settings = settings or get_settings()
+    db = SessionLocal()
+    try:
+        runtime = load_runtime(db, settings)
+        rows = (
+            db.query(Job)
+            .filter(
+                Job.upwork_id.in_(payload_by_id.keys()),
+                Job.score >= runtime.auto_submit_threshold,
+                Job.status.in_(
+                    [JobStatus.pending_review.value, JobStatus.submit_failed.value]
+                ),
+                Job.applied_on_upwork.is_(False),
+            )
+            .all()
+        )
+        updated = 0
+        for row in rows:
+            payload = payload_by_id.get(row.upwork_id)
+            if payload is None:
+                continue
+            incoming = _activity_from_payload(payload)
+            if not incoming:
+                continue
+            details = _details_dict(row.client_json)
+            changed = False
+            for key, value in incoming.items():
+                if details.get(key) != value:
+                    details[key] = value
+                    changed = True
+            if changed:
+                row.client_json = json.dumps(details, default=str)
+                updated += 1
+        db.commit()
+        return updated
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 def expire_stale_jobs() -> int:
@@ -293,7 +392,16 @@ async def ingest_payload(payload: JobPayload, settings: Settings, mcp: UpworkMcp
 
 async def run_agent_cycle(settings: Settings | None = None) -> dict[str, int]:
     settings = settings or get_settings()
-    counts = {"searched": 0, "new": 0, "queued": 0, "skipped": 0, "submitted": 0, "expired": 0, "errors": 0}
+    counts = {
+        "searched": 0,
+        "new": 0,
+        "queued": 0,
+        "skipped": 0,
+        "submitted": 0,
+        "expired": 0,
+        "errors": 0,
+        "activity_refreshed": 0,
+    }
     counts["expired"] = expire_stale_jobs()
     mcp = UpworkMcpClient(settings)
     if not await mcp.is_authenticated():
@@ -331,6 +439,10 @@ async def run_agent_cycle(settings: Settings | None = None) -> dict[str, int]:
                 break
             continue
         counts["searched"] += len(jobs)
+        try:
+            counts["activity_refreshed"] += await refresh_known_job_activity(jobs, settings)
+        except Exception:
+            logger.exception("activity refresh failed")
         db = SessionLocal()
         try:
             known = {row[0] for row in db.query(Job.upwork_id).all()}
@@ -413,7 +525,9 @@ async def run_agent_cycle(settings: Settings | None = None) -> dict[str, int]:
             (
                 f"searched={counts['searched']} new={counts['new']} "
                 f"queued={counts['queued']} skipped={counts['skipped']} "
-                f"submitted={counts['submitted']} errors={counts['errors']}"
+                f"submitted={counts['submitted']} "
+                f"activity_refreshed={counts['activity_refreshed']} "
+                f"errors={counts['errors']}"
             ),
         )
         db.commit()
