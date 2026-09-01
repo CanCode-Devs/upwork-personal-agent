@@ -136,6 +136,24 @@ def portfolio_blob(item: PortfolioItem) -> str:
     )
 
 
+_CATALOG_HEADER = (
+    "COMPLETED WORK CATALOG\n"
+    "These are the freelancer's real completed projects, Upwork contracts, and employment.\n"
+    "Cite only items listed here. Each block starts with id=. "
+    "Never invent work. Never cite a submitted proposal or a job posting.\n"
+)
+
+
+def catalog_prefix(items: list[PortfolioItem]) -> str:
+    if not items:
+        return ""
+    blocks: list[str] = []
+    for item in items:
+        blob = portfolio_blob(item)[:800]
+        blocks.append(f"id={item.id}\n{blob}")
+    return _CATALOG_HEADER + "\n---\n".join(blocks)
+
+
 def remove_embedding(
     db: Session,
     source_type: EmbeddingSource | str,

@@ -13,8 +13,10 @@
     <h2>Scoring</h2>
     <p class="muted">Floors and minimums skip jobs. Soft items only change the score. Saving re-filters Pending.</p>
     <form method="post" action="/preferences/runtime">
-      <label for="min_score">Minimum score to show in Pending (skip below)</label>
+      <label for="min_score">Minimum relevance score to show in Pending (skip below)</label>
       <input id="min_score" name="min_score" type="text" value="{{ runtime.min_score }}">
+      <label for="min_client_score">Minimum client score to show in Pending (skip below)</label>
+      <input id="min_client_score" name="min_client_score" type="text" value="{{ runtime.min_client_score }}">
       <label for="min_hourly">Min hourly rate (skip hourly jobs below; ignore if no rate listed)</label>
       <input id="min_hourly" name="min_hourly" type="text" value="{{ runtime.min_hourly or overlay.hourly_rate or '' }}">
       <label for="min_fixed">Min fixed budget (skip fixed jobs below; ignore if no budget listed)</label>

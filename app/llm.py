@@ -12,6 +12,8 @@ from app.models import (
     DraftResult,
     FreelancerProfile,
     JobPayload,
+    ProofCandidate,
+    ProofPick,
     ReplyIntent,
     ReplyIntentKind,
     ScoreResult,
@@ -53,6 +55,15 @@ def _require_key(settings: Settings) -> None:
 def _temperature_supported(model: str) -> bool:
     name = model.strip().lower()
     return not name.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
+def _prefixed_messages(system: str, user: str, prefix: str = "") -> list[dict[str, Any]]:
+    if prefix.strip():
+        system = prefix.rstrip() + "\n\n" + system
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
 
 
 def _complete_json(
@@ -129,6 +140,8 @@ def llm_draft(
     screening_instructions: str = "",
     opening_hook: str | None = None,
     enforce_hook: bool = True,
+    catalog_prefix: str = "",
+    proof_id: int | None = None,
 ) -> DraftResult:
     _require_key(settings)
     client = _client(settings)
@@ -146,9 +159,15 @@ def llm_draft(
     system = (system_prompt or SYSTEM_PROMPT) + f"\nTone: {tone}." + milestone_rule
     proof_block = ""
     if proof.strip():
+        cite = (
+            f"Cite ONLY catalog id={proof_id} in Relevant work. Do not mention other catalog items. "
+            if proof_id is not None
+            else "Cite only this. "
+        )
         proof_block = (
-            "\n\nONE completed project/contract from YOUR work history. Cite only this. "
-            "Never claim you worked a job posting you applied to. "
+            "\n\nONE completed project/contract from YOUR work history. "
+            + cite
+            + "Never claim you worked a job posting you applied to. "
             "Do not invent contracts, metrics, clients, or employers:\n"
             + proof.strip()
         )
@@ -199,10 +218,7 @@ def llm_draft(
     parsed = _complete_json(
         client,
         draft_model(settings),
-        [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        _prefixed_messages(system, user, catalog_prefix),
         0.4,
     )
     letter = finalize_letter(str(parsed.get("cover_letter") or ""), hook=opening_hook, enforce=enforce_hook)
@@ -221,6 +237,7 @@ def llm_screening_answers(
     questions: list[str],
     screening_instructions: str = "",
     proof: str = "",
+    catalog_prefix: str = "",
 ) -> list[ScreeningAnswer]:
     cleaned = [item.strip() for item in questions if item.strip()]
     if not cleaned:
@@ -251,13 +268,11 @@ def llm_screening_answers(
     parsed = _complete_json(
         client,
         draft_model(settings),
-        [
-            {
-                "role": "system",
-                "content": "Answer Upwork screening questions for a technical freelancer. Return JSON only.",
-            },
-            {"role": "user", "content": user},
-        ],
+        _prefixed_messages(
+            "Answer Upwork screening questions for a technical freelancer. Return JSON only.",
+            user,
+            catalog_prefix,
+        ),
         0.3,
     )
     answers = parse_screening_answers(parsed.get("screening_answers"), cleaned)
@@ -456,6 +471,7 @@ def llm_critique(
     *,
     target_words: int,
     apply_questions: list[str] | None = None,
+    catalog_prefix: str = "",
 ) -> CritiqueResult:
     _require_key(settings)
     client = _client(settings)
@@ -493,10 +509,7 @@ def llm_critique(
     parsed = _complete_json(
         client,
         draft_model(settings),
-        [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        _prefixed_messages(system, user, catalog_prefix),
         0.2,
     )
     issues_raw = parsed.get("issues")
@@ -508,6 +521,51 @@ def llm_critique(
                 issues.append(text)
     passed = bool(parsed.get("passed")) and not issues
     return CritiqueResult(passed=passed, issues=issues[:8])
+
+
+def llm_pick_proof(
+    job_title: str,
+    job_description: str,
+    candidates: list[ProofCandidate],
+    settings: Settings,
+    catalog_prefix: str = "",
+) -> ProofPick | None:
+    if not candidates:
+        return None
+    _require_key(settings)
+    client = _client(settings)
+    allowed = {item["id"] for item in candidates}
+    payload = [{"id": item["id"], "minilm_score": item["score"]} for item in candidates]
+    system = (
+        "You pick ONE completed work item to cite in an Upwork cover letter. "
+        "Return JSON only with keys portfolio_item_id (integer id from the catalog) and reason "
+        "(one short sentence). "
+        "Rank by product domain and problem first: industry, end users, and what was actually built "
+        "(RAG app, medical extraction, chatbot, etc.). Shared jargon with the job title "
+        "(eval, engineer, LLM, accuracy) is not enough. "
+        "A generic benchmark, infra, or tooling item should lose to work in the posting's product domain. "
+        "Prefer a completed Upwork contract only when that contract's domain actually matches. "
+        "Never invent, blend, or pick an id that is not in the catalog. "
+        "Treat MiniLM scores as a prior, not as the winner."
+    )
+    user = (
+        f"Job title: {job_title}\n\n"
+        f"Job description:\n{(job_description or '')[:4000]}\n\n"
+        f"MiniLM scores for catalog ids:\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+    parsed = _complete_json(
+        client,
+        draft_model(settings),
+        _prefixed_messages(system, user, catalog_prefix),
+        0.2,
+    )
+    try:
+        pick = ProofPick.model_validate(parsed)
+    except ValidationError:
+        return None
+    if pick.portfolio_item_id not in allowed:
+        return None
+    return pick
 
 
 class StyleRuleExtraction(TypedDict):

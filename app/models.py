@@ -114,22 +114,54 @@ class MilestoneStageConfig(BaseModel):
     description: str = ""
 
 
+class ClientScoringConfig(BaseModel):
+    base_score: int = 50
+    payment_verified: int = 6
+    payment_unverified: int = -12
+    strong_rating_at: float = 4.8
+    strong_rating_reviews: int = 10
+    strong_rating: int = 12
+    strong_rating_few: int = 6
+    rating_min_reviews: int = 3
+    low_rating_below: float = 4.5
+    low_rating: int = -8
+    very_low_rating_below: float = 4.0
+    very_low_rating: int = -18
+    hire_rate_high_at: float = 70
+    hire_rate_high: int = 10
+    hire_rate_mid_at: float = 50
+    hire_rate_mid: int = 5
+    hire_rate_low_below: float = 30
+    hire_rate_low_min_posted: int = 5
+    hire_rate_low: int = -12
+    spend_high_at: float = 50000
+    spend_high: int = 14
+    spend_mid_at: float = 10000
+    spend_mid: int = 10
+    spend_ok_at: float = 1000
+    spend_ok: int = 4
+    spend_low: int = -6
+    hourly_min_hours: float = 20
+    hourly_high_at: float = 40
+    hourly_high: int = 12
+    hourly_mid_at: float = 25
+    hourly_mid: int = 4
+    hourly_low_below: float = 20
+    hourly_low: int = -16
+    avg_spend_high_at: float = 1000
+    avg_spend_high: int = 8
+    avg_spend_low_below: float = 200
+    avg_spend_low: int = -8
+    tenure_years: float = 2
+    tenure: int = 4
+    active_contracts: int = 3
+
+
 class ScoringConfig(BaseModel):
     base_score: int = 55
     skill_bonus_per_hit: int = 8
     skill_bonus_cap: int = 30
     soft_penalty: int = 12
-    payment_unverified: int = -10
-    payment_verified: int = 6
-    low_rating_below: float = 4.0
-    low_rating: int = -10
-    strong_rating_at: float = 4.8
-    strong_rating: int = 4
-    hire_rate_high_at: float = 50
-    hire_rate_high: int = 4
-    hire_rate_low_below: float = 20
-    hire_rate_low_min_hires: int = 5
-    hire_rate_low: int = -8
     interviewing_at: int = 5
     interviewing: int = -6
     invites_at: int = 10
@@ -141,6 +173,7 @@ class ScoringConfig(BaseModel):
     unlike_wins_below: float = 0.25
     unlike_wins: int = -4
     over_proposal_cap: int = -8
+    client: ClientScoringConfig = Field(default_factory=ClientScoringConfig)
 
 
 class WriterConfig(BaseModel):
@@ -163,6 +196,12 @@ class WriterConfig(BaseModel):
     critique_rounds: int = 1
 
 
+class UnprovenGap(TypedDict):
+    source: str
+    heading: str
+    snippet: str
+
+
 class StyleExample(TypedDict):
     title: str
     job_post: str
@@ -175,6 +214,12 @@ class ScoreResult(BaseModel):
     reason: str
     should_apply: bool
     go: bool = True
+    breakdown: list[str] = Field(default_factory=list)
+
+
+class ClientScoreResult(BaseModel):
+    score: int = Field(ge=0, le=100)
+    reason: str
     breakdown: list[str] = Field(default_factory=list)
 
 
@@ -201,6 +246,21 @@ class CritiqueResult(BaseModel):
     passed: bool = True
     issues: list[str] = Field(default_factory=list)
     rounds: int = 0
+
+
+class ProofCandidate(TypedDict):
+    id: int
+    score: float
+    kind: str
+    origin: str
+    title: str
+    keywords: str
+    blob: str
+
+
+class ProofPick(BaseModel):
+    portfolio_item_id: int
+    reason: str = ""
 
 
 class DraftResult(BaseModel):
@@ -432,6 +492,7 @@ class RuntimeSettings(BaseModel):
     autonomy_mode: AutonomyMode = AutonomyMode.manual
     auto_submit_threshold: int = 85
     min_score: int = 70
+    min_client_score: int = 50
     min_hourly: int | None = None
     min_fixed: int | None = None
     require_verified_payment: bool = False

@@ -9,8 +9,13 @@
   <a href="/">Back to inbox</a>
 </div>
 
+<div class="meta scores">
+  <div class="score-chip"><span>Relevance</span><strong>{{ job.score if job.score is not none else "—" }}</strong></div>
+  <div class="score-chip"><span>Client</span><strong>{{ job.client_score if job.client_score is not none else "—" }}</strong></div>
+</div>
 <div class="meta">
-  <div>Score: <strong>{{ job.score if job.score is not none else "—" }}</strong> — {{ job.score_reason or "" }}</div>
+  {% if job.score_reason %}<div>Relevance: {{ job.score_reason }}</div>{% endif %}
+  {% if job.client_score_reason %}<div>Client: {{ job.client_score_reason }}</div>{% endif %}
   <div>Price: {{ card.price_label if card else job.budget or "—" }}</div>
   {% if card and card.posted_ago %}<div>{{ card.posted_kind }}: <strong>{{ card.posted_ago }}</strong>{% if card.posted_local %} · {{ card.posted_local }}{% endif %}</div>{% endif %}
   <div>Timezone: {{ card.timezone if card else "—" }}{% if card and card.location %} · {{ card.location }}{% endif %}</div>
@@ -28,6 +33,10 @@
 <div class="banner">This job no longer passes Settings, so it was skipped instead of drafting a letter.</div>
 {% elif request.query_params.get('error') == 'blocked' %}
 <div class="banner">This job cannot be drafted (already applied or not in Pending).</div>
+{% elif request.query_params.get('error') == 'unproven' %}
+<div class="banner">Fix the unproven answers below before submit.</div>
+{% elif request.query_params.get('error') == 'quote' %}
+<div class="banner">Enter an hourly quote greater than 0.</div>
 {% elif request.query_params.get('error') %}
 <div class="banner">Could not write the proposal. Check the log on this page.</div>
 {% elif request.query_params.get('attachments') %}
@@ -105,8 +114,17 @@
 
 {% if breakdown %}
 <div class="card" style="margin-bottom:20px">
-  <h2>Score breakdown</h2>
+  <h2>Relevance score breakdown</h2>
   {% for item in breakdown %}
+  <div class="event">{{ item }}</div>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if client_breakdown %}
+<div class="card" style="margin-bottom:20px">
+  <h2>Client score breakdown</h2>
+  {% for item in client_breakdown %}
   <div class="event">{{ item }}</div>
   {% endfor %}
 </div>
@@ -147,6 +165,16 @@
       {% endif %}
     </form>
     {% endif %}
+    {% if has_draft and can_act %}
+    <div id="unproven-banner" class="banner" {% if not unproven_gaps %}hidden{% endif %}>
+      <strong>Fix these before submit.</strong> The draft could not prove them from your profile. Replace the placeholder answers, then submit.
+      <ul class="critique-list" id="unproven-list">
+        {% for item in unproven_gaps %}
+        <li>{{ item.heading }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
     {% if has_draft %}
     {% if critique and critique.issues %}
     <div class="card compact" style="margin-bottom:12px">
@@ -162,7 +190,15 @@
     <p class="muted" style="margin-bottom:12px">Auto-review passed{% if critique.rounds %} after {{ critique.rounds }} round{{ 's' if critique.rounds != 1 else '' }}{% endif %}.</p>
     {% endif %}
     <form id="proposal-form" method="post" action="/jobs/{{ job.id }}/edit" enctype="multipart/form-data">
-      <textarea name="cover_letter" {% if not can_act %}readonly{% endif %}>{{ cover_letter }}</textarea>
+      <textarea id="cover-letter" name="cover_letter" {% if not can_act %}readonly{% endif %}>{{ cover_letter }}</textarea>
+      {% if quote_is_fixed %}
+      <p class="sub" style="margin:12px 0 16px">Your quote: <strong>${{ quote_bid }}</strong></p>
+      {% elif can_act %}
+      <label for="hourly_quote" style="margin-top:12px">Your quote ($/hr)</label>
+      <input id="hourly_quote" name="hourly_quote" type="number" min="1" step="1" value="{{ quote_bid }}" required>
+      {% else %}
+      <p class="sub" style="margin:12px 0 16px">Your quote: <strong>${{ quote_bid }}/hr</strong></p>
+      {% endif %}
       {% if can_act %}
       <div
         id="connects-panel"
@@ -210,7 +246,7 @@
         <div class="screening-row">
           <label>{{ item.question }}</label>
           <input type="hidden" name="sq_question" value="{{ item.question }}">
-          <textarea name="sq_answer" class="short" data-screening-required>{{ item.answer }}</textarea>
+          <textarea name="sq_answer" class="short" data-screening-required data-screening-question="{{ item.question }}">{{ item.answer }}</textarea>
         </div>
         {% endfor %}
       </div>
@@ -277,14 +313,26 @@
       {% endif %}
       <div class="actions" style="margin-top:12px">
         <button class="btn secondary" type="submit">Save edit</button>
-        <button id="approve-btn" class="btn" type="submit" formaction="/jobs/{{ job.id }}/approve">Approve &amp; submit</button>
+        <button id="approve-btn" class="btn" type="submit" formaction="/jobs/{{ job.id }}/approve" {% if unproven_gaps %}disabled{% endif %}>Approve &amp; submit</button>
       </div>
       {% endif %}
     </form>
     {% elif can_act %}
     <p class="muted">No letter yet. Write a proposal when this job is worth the Connects.</p>
+    {% if quote_is_fixed %}
+    <p class="sub" style="margin:12px 0 16px">Your quote: <strong>${{ quote_bid }}</strong></p>
+    {% else %}
+    <form method="post" action="/jobs/{{ job.id }}/quote" style="margin:12px 0 16px">
+      <label for="hourly_quote">Your quote ($/hr)</label>
+      <input id="hourly_quote" name="hourly_quote" type="number" min="1" step="1" value="{{ quote_bid }}" required>
+      <div class="actions" style="margin-top:8px">
+        <button class="btn secondary" type="submit">Save quote</button>
+      </div>
+    </form>
+    {% endif %}
     {% else %}
     <p class="empty">No cover letter for this job.</p>
+    <p class="sub" style="margin:12px 0 16px">Your quote: <strong>{% if quote_is_fixed %}${{ quote_bid }}{% else %}${{ quote_bid }}/hr{% endif %}</strong></p>
     {% endif %}
     {% if can_act %}
     <form method="post" action="/jobs/{{ job.id }}/reject" style="margin-top:16px">
@@ -345,6 +393,7 @@
   </div>
 </div>
 {% if can_act and has_draft %}
+<script type="application/json" id="unproven-config">{{ {"source": unproven_source, "apply_questions": apply_questions}|tojson }}</script>
 <script>
 (function () {
   const boxes = document.querySelectorAll("#highlights-panel input[type=checkbox]:not([disabled])");
@@ -366,8 +415,90 @@
   const remainingLabel = document.getElementById("connects-remaining-label");
   const shortEl = document.getElementById("connects-short");
   const approveBtn = document.getElementById("approve-btn");
+  const letterEl = document.getElementById("cover-letter");
+  const banner = document.getElementById("unproven-banner");
+  const listEl = document.getElementById("unproven-list");
   if (!panel || !form || !approveBtn) return;
   let submitting = false;
+  let unprovenRe = null;
+  let applyQuestions = [];
+  const cfgEl = document.getElementById("unproven-config");
+  if (cfgEl) {
+    try {
+      const cfg = JSON.parse(cfgEl.textContent || "{}");
+      if (cfg.source) unprovenRe = new RegExp(cfg.source, "i");
+      if (Array.isArray(cfg.apply_questions)) applyQuestions = cfg.apply_questions;
+    } catch (err) {
+      unprovenRe = null;
+    }
+  }
+
+  function foldQuotes(text) {
+    return String(text || "").replace(/\u2019/g, "'").replace(/\u2018/g, "'");
+  }
+
+  function isUnproven(text) {
+    return Boolean(unprovenRe && unprovenRe.test(foldQuotes(text)));
+  }
+
+  function letterSections(letter) {
+    const text = String(letter || "").replace(/\r\n/g, "\n").trim();
+    if (!text) return [];
+    const chunks = [];
+    text.split(/\n{2,}/).forEach((part) => {
+      String(part).split(/(?=\n?\s*\d+[.)]\s+)/).forEach((bit) => {
+        const cleaned = bit.trim();
+        if (cleaned) chunks.push(cleaned);
+      });
+    });
+    return chunks;
+  }
+
+  function headingFrom(section) {
+    const first = section.trim().split("\n", 2)[0].trim().replace(/^\d+[.)]\s*/, "");
+    return first.slice(0, 120) || "Unproven answer";
+  }
+
+  function questionInLetter(letter, question) {
+    const blob = String(letter || "").replace(/\s+/g, " ").toLowerCase();
+    let key = String(question || "").replace(/\s+/g, " ").trim().toLowerCase();
+    if (key.length > 60) key = key.slice(0, 60);
+    return Boolean(key) && blob.includes(key);
+  }
+
+  function scanUnproven() {
+    const headings = [];
+    const seen = new Set();
+    function add(heading) {
+      const title = String(heading || "Unproven answer").trim() || "Unproven answer";
+      const key = title.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      headings.push(title);
+    }
+    const letter = letterEl ? letterEl.value : "";
+    form.querySelectorAll("[data-screening-required]").forEach((field) => {
+      const question = field.getAttribute("data-screening-question") || "Screening question";
+      const answer = String(field.value || "");
+      if (!answer.trim() || isUnproven(answer)) add(question);
+    });
+    letterSections(letter).forEach((section) => {
+      if (isUnproven(section)) add(headingFrom(section));
+    });
+    applyQuestions.forEach((question) => {
+      if (question && !questionInLetter(letter, question)) add(question);
+    });
+    if (listEl) {
+      listEl.innerHTML = "";
+      headings.forEach((heading) => {
+        const item = document.createElement("li");
+        item.textContent = heading;
+        listEl.appendChild(item);
+      });
+    }
+    if (banner) banner.hidden = headings.length === 0;
+    return headings;
+  }
 
   function num(value) {
     if (value === "" || value == null) return null;
@@ -395,7 +526,8 @@
       remainingEl.textContent = String(available - apply - boost);
     }
     const short = available != null && apply != null && available < apply + boost;
-    const blocked = short || canApply === "0";
+    const unproven = scanUnproven().length > 0;
+    const blocked = short || canApply === "0" || unproven;
     if (shortEl) shortEl.hidden = !short;
     if (!submitting) approveBtn.disabled = blocked;
   }
@@ -403,20 +535,18 @@
   if (boostInput && boostInput.type !== "hidden") {
     boostInput.addEventListener("input", sync);
   }
+  if (letterEl) letterEl.addEventListener("input", sync);
+  form.querySelectorAll("[data-screening-required]").forEach((field) => {
+    field.addEventListener("input", sync);
+  });
   form.addEventListener("submit", function (event) {
     const submitter = event.submitter;
     if (!submitter || submitter.id !== "approve-btn") return;
+    sync();
     if (approveBtn.disabled) {
       event.preventDefault();
+      if (banner) banner.hidden = false;
       return;
-    }
-    const screening = form.querySelectorAll("[data-screening-required]");
-    for (const field of screening) {
-      if (!String(field.value || "").trim()) {
-        event.preventDefault();
-        window.alert("Answer every screening question before submit.");
-        return;
-      }
     }
     const attachChoice = form.querySelector('input[name="attach_choice"]:checked');
     const fileInput = document.getElementById("proposal-files");

@@ -27,6 +27,7 @@ class Settings(BaseSettings):
 
     search_queries: str = "python fastapi"
     min_score: int = 70
+    min_client_score: int = 50
     poll_interval_minutes: int = 15
     approval_ttl_hours: int = 24
     autonomy_mode: str = "manual"

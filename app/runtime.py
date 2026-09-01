@@ -21,6 +21,7 @@ def get_or_create_runtime(db: Session, settings: Settings | None = None) -> AppR
             autonomy_mode=settings.autonomy_mode,
             auto_submit_threshold=settings.auto_submit_threshold,
             min_score=settings.min_score,
+            min_client_score=settings.min_client_score,
             min_hourly=settings.min_hourly,
             min_fixed=settings.min_fixed,
         )
@@ -41,6 +42,7 @@ def load_runtime(db: Session | None = None, settings: Settings | None = None) ->
             autonomy_mode=_enum_value(AutonomyMode, row.autonomy_mode, AutonomyMode.manual),
             auto_submit_threshold=row.auto_submit_threshold,
             min_score=row.min_score,
+            min_client_score=getattr(row, "min_client_score", 50),
             min_hourly=row.min_hourly,
             min_fixed=row.min_fixed,
             require_verified_payment=bool(getattr(row, "require_verified_payment", False)),

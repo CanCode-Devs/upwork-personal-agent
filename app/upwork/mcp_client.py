@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -20,6 +21,8 @@ from app.models import ApplyHighlight, ConnectsPanel, JobPayload, McpStatus, Pro
 from app.proposal_writer import clean_screening_question
 from app.upwork.oauth import build_oauth_provider
 from app.upwork.token_store import token_storage
+
+logger = logging.getLogger(__name__)
 
 
 def format_mcp_error(exc: BaseException) -> str:
@@ -151,6 +154,16 @@ def already_applied(message: str) -> bool:
         or "existing proposal" in lower
         or "prior proposal" in lower
         or "invitation exists" in lower
+    )
+
+
+def _skip_attachment_confirm(message: str) -> bool:
+    lower = (message or "").lower()
+    return (
+        "task_id is required" in lower
+        or "do not need confirming" in lower
+        or "already stored" in lower
+        or "inline component" in lower
     )
 
 
@@ -1541,14 +1554,24 @@ class UpworkMcpClient:
                 uids = _file_uids(_parse_jsonish(_tool_text(status)))
             if not uids:
                 raise RuntimeError(_tool_text(stored) or "Upwork did not return file ids for the upload")
-            confirm_params: dict[str, Any] = {"context": context, "file_ids": uids}
+            confirm_params: dict[str, Any] = {"context": context, "file_ids": uids, "task_id": task_id}
             if context == "messages":
                 confirm_params["room_id"] = room_id
-            await call_session_tool(
-                session,
-                "upwork__confirm_attachment_upload",
-                {"action": "confirm", "org_uid": org_uid, "params": confirm_params},
-            )
+            try:
+                confirmed = await call_session_tool(
+                    session,
+                    "upwork__confirm_attachment_upload",
+                    {"action": "confirm", "org_uid": org_uid, "params": confirm_params},
+                )
+                confirm_text = _tool_text(confirmed)
+                if confirm_text and _skip_attachment_confirm(confirm_text) and uids:
+                    logger.warning("confirm_attachment_upload skipped: %s", confirm_text[:400])
+            except Exception as exc:
+                detail = format_mcp_error(exc)
+                if uids and _skip_attachment_confirm(detail):
+                    logger.warning("confirm_attachment_upload skipped: %s", detail[:400])
+                else:
+                    raise
             refs: list[dict[str, str]] = []
             for index, uid in enumerate(uids):
                 name = files[index][0] if index < len(files) else uid

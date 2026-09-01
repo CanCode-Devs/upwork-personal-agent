@@ -67,7 +67,16 @@
       {% for job in jobs %}
       <details class="job-card">
         <summary>
-          <span class="score">{{ job.score if job.score is not none else "—" }}</span>
+          <span class="score-stack">
+            <span class="score-pair">
+              <span class="score-label">Rel</span>
+              <span class="score">{{ job.score if job.score is not none else "—" }}</span>
+            </span>
+            <span class="score-pair">
+              <span class="score-label">Client</span>
+              <span class="score score-client">{{ job.client_score if job.client_score is not none else "—" }}</span>
+            </span>
+          </span>
           <span class="job-summary-main">
             {% if job.local %}
             <a href="/jobs/{{ job.id }}" onclick="event.stopPropagation()">{{ job.title }}</a>
@@ -86,7 +95,10 @@
         </summary>
         <div class="job-expand">
           {% if job.score_reason %}
-          <p class="job-reason">{{ job.score_reason }}</p>
+          <p class="job-reason">Relevance: {{ job.score_reason }}</p>
+          {% endif %}
+          {% if job.client_score_reason %}
+          <p class="job-reason">Client: {{ job.client_score_reason }}</p>
           {% endif %}
           <div class="facts">
             {% for fact in job.facts %}

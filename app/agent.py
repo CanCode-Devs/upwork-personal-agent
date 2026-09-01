@@ -10,7 +10,17 @@ from app.db.session import SessionLocal
 from app.events import add_event
 from app.models import JobPayload, JobStatus
 from app.profile import load_profile
-from app.tools.discovery import _parse_client, execute_scoring_matrix, fetch_live_jobs, job_filter_fields
+from app.runtime import load_runtime
+from app.tools.discovery import (
+    _parse_client,
+    client_hard_gate_reasons,
+    execute_client_score,
+    execute_scoring_matrix,
+    fetch_live_jobs,
+    job_filter_fields,
+    persist_client_score,
+    settings_block_reasons_for_job,
+)
 from app.upwork.mcp_client import (
     UpworkMcpClient,
     derive_client_stats,
@@ -114,6 +124,7 @@ async def backfill_job_details(mcp: UpworkMcpClient) -> None:
         for item in db.query(UpworkApplication).all():
             applied |= job_ref_keys(item.posting_id)
         pending = db.query(Job).filter(Job.status == JobStatus.pending_review.value).all()
+        runtime = load_runtime(db, mcp.settings)
         for row in pending:
             extra = by_id.get(row.upwork_id, {})
             try:
@@ -144,6 +155,17 @@ async def backfill_job_details(mcp: UpworkMcpClient) -> None:
                     row.client_json = json.dumps(merged, default=str)
             except json.JSONDecodeError:
                 row.client_json = extra.get("client_details") or row.client_json
+            persist_client_score(
+                row,
+                execute_client_score(_details_dict(row.client_json), runtime, settings=mcp.settings),
+            )
+            reasons = settings_block_reasons_for_job(row, db, mcp.settings)
+            if reasons:
+                row.status = JobStatus.skipped.value
+                row.expires_at = None
+                note = "skipped by settings: " + "; ".join(reasons)
+                row.score_reason = note + (f"; {row.score_reason}" if row.score_reason else "")
+                add_event(db, "skipped", note, row.id)
             if any(job_ref_keys(row.upwork_id) & applied) or row.status == JobStatus.submitted.value:
                 row.applied_on_upwork = True
             extra_desc = extra.get("description") or ""
@@ -209,7 +231,23 @@ async def ingest_payload(payload: JobPayload, settings: Settings, mcp: UpworkMcp
             db=db,
             settings=settings,
         )
-        status = JobStatus.pending_review if scored.go else JobStatus.skipped
+        runtime = load_runtime(db, settings)
+        client_scored = execute_client_score(details, runtime, settings=settings)
+        hires = detailed.get("client_hires")
+        if not isinstance(hires, (int, float)):
+            hires = details.get("hires") if isinstance(details.get("hires"), (int, float)) else None
+        else:
+            hires = int(hires)
+        client_gates = client_hard_gate_reasons(
+            runtime,
+            payment_status=payment,
+            rating=rating,
+            hires=int(hires) if isinstance(hires, (int, float)) else None,
+            client_country=fields["client_country"],
+            client_spend=fields["client_spend"],
+        )
+        go = scored.go and client_scored.score >= runtime.min_client_score and not client_gates
+        status = JobStatus.pending_review if go else JobStatus.skipped
         applied_row = application_for_posting(db, job_id)
         job = Job(
             upwork_id=job_id,
@@ -222,6 +260,9 @@ async def ingest_payload(payload: JobPayload, settings: Settings, mcp: UpworkMcp
             score=scored.score,
             score_reason=scored.reason,
             score_breakdown=json.dumps(scored.breakdown),
+            client_score=client_scored.score,
+            client_score_reason=client_scored.reason,
+            client_score_breakdown=json.dumps(client_scored.breakdown),
             status=status.value,
             price_label=detailed.get("price_label") or detailed.get("budget"),
             timezone=detailed.get("timezone") or "",
@@ -236,9 +277,9 @@ async def ingest_payload(payload: JobPayload, settings: Settings, mcp: UpworkMcp
         )
         db.add(job)
         db.flush()
-        add_event(db, "scored", f"{scored.score}: {scored.reason}", job.id)
+        add_event(db, "scored", f"{scored.score}/{client_scored.score}: {scored.reason}", job.id)
         db.commit()
-        if not scored.go:
+        if not go:
             return "skipped"
         if applied_row is not None:
             return "skipped"

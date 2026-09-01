@@ -17,7 +17,7 @@ from pydantic import ValidationError
 from sqlalchemy import func
 from sqlalchemy.orm import Session, selectinload
 
-from app.actions import approve_and_submit, cover_letter_for, latest_proposal, reject_job, save_edit
+from app.actions import approve_and_submit, cover_letter_for, latest_proposal, reject_job, save_edit, save_hourly_quote
 from app.auth import COOKIE_NAME, create_session_value, current_user, hash_password, verify_password
 from app.config import Settings, get_settings
 from app.models import (
@@ -70,13 +70,17 @@ from app.proposal_settings import (
     style_rules_for_prompt,
 )
 from app.proposal_writer import (
+    UNPROVEN_SOURCE,
+    UnprovenAnswersError,
     attachments_unreadable,
     dump_apply,
+    extract_apply_questions,
     finalize_letter,
     load_apply,
     load_critique,
     load_screening,
     parse_screening_form,
+    unproven_answer_gaps,
 )
 from app.runtime import get_or_create_runtime
 from app.search_queries import (
@@ -87,8 +91,8 @@ from app.search_queries import (
     suggest_search_queries,
     work_history_for_prompt,
 )
-from app.tools.discovery import apply_runtime_filters
-from app.tools.execution import HIGHLIGHT_PICK, PitchSkipped, bid_amount_for_job, generate_tailored_pitch, local_job_highlights, rank_highlights
+from app.tools.discovery import apply_runtime_filters, ensure_client_scores
+from app.tools.execution import HIGHLIGHT_PICK, PitchSkipped, generate_tailored_pitch, heal_applied_status, job_is_fixed, local_job_highlights, quote_amount_for_job, rank_highlights
 from app.tools.memory import learn_preference, log_interaction_feedback, save_agent_item, update_portfolio_matrix
 from app.upwork.mcp_client import UpworkMcpClient, already_applied, connects_shortage, format_mcp_error, oauth_needs_login, public_job_url, job_ref_keys
 from app.upwork.oauth import (
@@ -144,7 +148,7 @@ def render(request: Request, name: str, context: dict | None = None, status_code
     user = payload.get("user") or current_user(request)
     payload.setdefault("app_name", settings.app_name)
     payload.setdefault("app_tagline", settings.app_tagline)
-    payload.setdefault("asset_v", _ASSET_V)
+    payload.setdefault("asset_v", str(int(_STYLE_PATH.stat().st_mtime)) if _STYLE_PATH.exists() else "1")
     payload.setdefault("user", user)
     payload.setdefault("can", flags_for(user))
     payload.setdefault("poll", poll_status_payload())
@@ -283,6 +287,8 @@ async def inbox(
     elif selected != "all":
         query = query.filter(Job.status == selected)
     jobs: Sequence[Job] = query.limit(200).all()
+    if ensure_client_scores(db, list(jobs)):
+        db.commit()
     application_rows = db.query(UpworkApplication).order_by(UpworkApplication.synced_at.desc()).all()
     app_index = index_applications(list(application_rows))
     cards = []
@@ -350,6 +356,13 @@ async def job_detail(
     ).filter(Job.id == job_id).one_or_none()
     if job is None:
         return RedirectResponse("/", status_code=303)
+    if ensure_client_scores(db, [job]):
+        db.commit()
+        db.refresh(job)
+    if heal_applied_status(job):
+        add_event(db, "submitted", "Upwork already accepted this apply", job.id, user_id=user["id"])
+        db.commit()
+        db.refresh(job)
     events = sorted(job.events, key=lambda item: item.created_at, reverse=True)
     breakdown: list[str] = []
     if job.score_breakdown:
@@ -359,6 +372,14 @@ async def job_detail(
                 breakdown = [str(item) for item in parsed]
         except json.JSONDecodeError:
             breakdown = [job.score_breakdown]
+    client_breakdown: list[str] = []
+    if job.client_score_breakdown:
+        try:
+            parsed_client = json.loads(job.client_score_breakdown)
+            if isinstance(parsed_client, list):
+                client_breakdown = [str(item) for item in parsed_client]
+        except json.JSONDecodeError:
+            client_breakdown = [job.client_score_breakdown]
     context: list[str] = []
     if job.matched_context:
         try:
@@ -382,7 +403,13 @@ async def job_detail(
     letter = cover_letter_for(job, db)
     has_draft = bool(letter.strip())
     overlay = load_overlay(get_settings())
-    bid = bid_amount_for_job(job, overlay.hourly_rate)
+    stored_quote = None
+    raw_quote = load_apply(latest_proposal(job)).get("charged_amount")
+    if isinstance(raw_quote, (int, float)) and float(raw_quote) > 0:
+        stored_quote = float(raw_quote)
+    bid = quote_amount_for_job(job, overlay.hourly_rate, stored_quote)
+    quote_bid = int(bid) if float(bid).is_integer() else bid
+    quote_is_fixed = job_is_fixed(job)
     panel = ConnectsPanel(charged_amount=bid)
     highlights: list[ApplyHighlight] = []
     if can_act and has_draft:
@@ -502,6 +529,12 @@ async def job_detail(
         details = {}
     missing_attachments = attachments_unreadable(job.description or "", details)
     critique = load_critique(proposal)
+    apply_questions = extract_apply_questions(job.description or "")
+    if str(details.get("attachment_text") or "").strip():
+        for item in extract_apply_questions(str(details.get("attachment_text") or "")):
+            if item not in apply_questions:
+                apply_questions.append(item)
+    unproven_gaps = unproven_answer_gaps(letter, screening, apply_questions) if has_draft else []
     return render(
         request,
         "job.html",
@@ -511,6 +544,7 @@ async def job_detail(
             "cover_letter": letter,
             "events": events,
             "breakdown": breakdown,
+            "client_breakdown": client_breakdown,
             "matched_context": context,
             "outcomes": outcomes,
             "can_act": can_act,
@@ -528,6 +562,11 @@ async def job_detail(
             "oauth_stale": oauth_stale,
             "attachments_missing": missing_attachments,
             "critique": critique,
+            "unproven_gaps": unproven_gaps,
+            "apply_questions": apply_questions,
+            "unproven_source": UNPROVEN_SOURCE,
+            "quote_bid": quote_bid,
+            "quote_is_fixed": quote_is_fixed,
         },
     )
 
@@ -603,6 +642,19 @@ async def add_job_attachments(
     return RedirectResponse(f"/jobs/{job.id}?attachments=1", status_code=303)
 
 
+def _parse_hourly_quote(raw: str) -> float | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return int(value) if value == int(value) else value
+
+
 @router.post("/jobs/{job_id}/edit")
 def edit_job(
     job_id: int,
@@ -618,6 +670,7 @@ def edit_job(
     certificate_ids: list[str] = Form(default=[]),
     job_history_ids: list[str] = Form(default=[]),
     profile_history_ids: list[str] = Form(default=[]),
+    hourly_quote: str = Form(""),
     db: Session = Depends(get_db),
 ) -> Response:
     job = db.query(Job).options(selectinload(Job.proposals)).filter(Job.id == job_id).one_or_none()
@@ -625,6 +678,7 @@ def edit_job(
         return RedirectResponse("/", status_code=303)
     planned = parse_milestone_form(ms_description, ms_amount, ms_title) if milestones_present.strip() else None
     screening = parse_screening_form(sq_question, sq_answer)
+    rate = None if job_is_fixed(job) else _parse_hourly_quote(hourly_quote)
     save_edit(
         db,
         job,
@@ -636,7 +690,29 @@ def edit_job(
         job_history_ids=job_history_ids,
         profile_history_ids=profile_history_ids,
         user_id=user["id"],
+        charged_amount=rate,
     )
+    return RedirectResponse(f"/jobs/{job.id}?saved=1", status_code=303)
+
+
+@router.post("/jobs/{job_id}/quote")
+def save_job_quote(
+    job_id: int,
+    hourly_quote: str = Form(""),
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.review)),
+) -> Response:
+    job = db.query(Job).options(selectinload(Job.proposals)).filter(Job.id == job_id).one_or_none()
+    if job is None:
+        return RedirectResponse("/", status_code=303)
+    if job.applied_on_upwork or job.status not in {JobStatus.pending_review.value, JobStatus.submit_failed.value}:
+        return RedirectResponse(f"/jobs/{job.id}?error=blocked", status_code=303)
+    if job_is_fixed(job):
+        return RedirectResponse(f"/jobs/{job.id}", status_code=303)
+    rate = _parse_hourly_quote(hourly_quote)
+    if rate is None:
+        return RedirectResponse(f"/jobs/{job.id}?error=quote", status_code=303)
+    save_hourly_quote(db, job, rate, user_id=user["id"])
     return RedirectResponse(f"/jobs/{job.id}?saved=1", status_code=303)
 
 
@@ -692,6 +768,7 @@ async def approve_job(
     profile_history_ids: list[str] = Form(default=[]),
     attach_choice: str = Form("skip"),
     proposal_files: list[UploadFile] | None = File(default=None),
+    hourly_quote: str = Form(""),
     db: Session = Depends(get_db),
     user: SessionUser = Depends(require_permission(Permission.submit)),
 ) -> Response:
@@ -706,6 +783,7 @@ async def approve_job(
             boost = 0
     planned = parse_milestone_form(ms_description, ms_amount, ms_title) if milestones_present.strip() else None
     screening = parse_screening_form(sq_question, sq_answer)
+    rate = None if job_is_fixed(job) else _parse_hourly_quote(hourly_quote)
     attachment_uids: list[str] = []
     try:
         if attach_choice.strip() == "files":
@@ -735,7 +813,10 @@ async def approve_job(
             profile_history_ids=profile_history_ids,
             attachment_uids=attachment_uids,
             user_id=user["id"],
+            charged_amount=rate,
         )
+    except UnprovenAnswersError:
+        return RedirectResponse(f"/jobs/{job.id}?error=unproven", status_code=303)
     except (ValueError, RuntimeError, Exception) as exc:
         add_event(db, "submit_failed", format_mcp_error(exc), job.id, user_id=user["id"])
         logger.exception("approve/submit failed for job %s", job.id)
@@ -893,6 +974,8 @@ def history(
         .limit(200)
         .all()
     )
+    if ensure_client_scores(db, jobs):
+        db.commit()
     return render(
         request,
         "history.html",
@@ -1218,6 +1301,7 @@ def save_runtime(
     autonomy_mode: str = Form(...),
     auto_submit_threshold: int = Form(85),
     min_score: int = Form(70),
+    min_client_score: int = Form(50),
     min_hourly: str = Form(""),
     min_fixed: str = Form(""),
     min_client_rating: str = Form(""),
@@ -1242,6 +1326,7 @@ def save_runtime(
     runtime.autonomy_mode = autonomy_mode
     runtime.auto_submit_threshold = auto_submit_threshold
     runtime.min_score = min_score
+    runtime.min_client_score = min_client_score
     runtime.min_hourly = _opt_int(min_hourly)
     runtime.min_fixed = _opt_int(min_fixed)
     runtime.require_verified_payment = bool(require_verified_payment)

@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, Sequence
 
 from app.db.models import Proposal
 from app.engagement import classify_engagement
-from app.models import CritiqueResult, ScreeningAnswer
+from app.models import CritiqueResult, ScreeningAnswer, UnprovenGap
 
 OPENING_HOOK = ""
 
@@ -170,6 +170,96 @@ def extract_apply_questions(description: str) -> list[str]:
         seen.add(key)
         items.append(item)
     return items[:12]
+
+
+UNPROVEN_SOURCE = (
+    r"can(?:not|'t)\s+(?:truthfully\s+)?(?:claim|verify|prove)"
+    r"|won'?t\s+invent"
+    r"|will not invent"
+    r"|from the provided (?:proof|profile)"
+    r"|closest real work"
+    r"|i don'?t have a specific"
+    r"|i do not have a specific"
+)
+UNPROVEN_PATTERN = re.compile(UNPROVEN_SOURCE, re.IGNORECASE)
+
+
+class UnprovenAnswersError(ValueError):
+    def __init__(self, gaps: list[UnprovenGap]) -> None:
+        self.gaps = gaps
+        super().__init__("Fix unproven answers before submit")
+
+
+def _fold_quotes(text: str) -> str:
+    return (text or "").replace("\u2019", "'").replace("\u2018", "'")
+
+
+def is_unproven_text(text: str) -> bool:
+    return bool(UNPROVEN_PATTERN.search(_fold_quotes(text)))
+
+
+def _letter_sections(letter: str) -> list[str]:
+    text = (letter or "").replace("\r\n", "\n").strip()
+    if not text:
+        return []
+    chunks: list[str] = []
+    for part in re.split(r"\n{2,}", text):
+        bits = re.split(r"(?=\n?\s*\d+[.)]\s+)", part)
+        for bit in bits:
+            cleaned = bit.strip()
+            if cleaned:
+                chunks.append(cleaned)
+    return chunks
+
+
+def _heading_from_section(section: str) -> str:
+    first = section.strip().split("\n", 1)[0].strip()
+    first = re.sub(r"^\d+[.)]\s*", "", first)
+    return first[:120] or "Unproven answer"
+
+
+def _question_in_letter(letter: str, question: str) -> bool:
+    blob = re.sub(r"\s+", " ", letter or "").lower()
+    key = re.sub(r"\s+", " ", question or "").strip().lower()
+    if len(key) > 60:
+        key = key[:60]
+    return bool(key) and key in blob
+
+
+def unproven_answer_gaps(
+    letter: str,
+    screening: Sequence[ScreeningAnswer] | None = None,
+    apply_questions: Sequence[str] | None = None,
+) -> list[UnprovenGap]:
+    gaps: list[UnprovenGap] = []
+    seen: set[str] = set()
+
+    def add(source: str, heading: str, snippet: str) -> None:
+        title = (heading or "Unproven answer").strip() or "Unproven answer"
+        key = f"{source}:{title.lower()}"
+        if key in seen:
+            return
+        seen.add(key)
+        gaps.append({"source": source, "heading": title[:160], "snippet": (snippet or "").strip()[:180]})
+
+    for item in screening or []:
+        question = item.question.strip() or "Screening question"
+        answer = item.answer or ""
+        if not answer.strip():
+            add("screening", question, "Empty answer")
+        elif is_unproven_text(answer):
+            add("screening", question, answer.strip())
+
+    for section in _letter_sections(letter):
+        if is_unproven_text(section):
+            add("letter", _heading_from_section(section), section)
+
+    folded = letter or ""
+    for question in apply_questions or []:
+        text = (question or "").strip()
+        if text and not _question_in_letter(folded, text):
+            add("apply", text, "Not answered in the letter")
+    return gaps
 
 
 def sanitize_proposal(text: str) -> str:
