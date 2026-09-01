@@ -43,6 +43,28 @@
         <input type="checkbox" name="skip_onsite" value="1" {% if runtime.skip_onsite %}checked{% endif %}>
         Skip on-site / local-only jobs
       </label>
+      <label class="check">
+        <input type="checkbox" name="skip_entry_level" value="1" {% if runtime.skip_entry_level %}checked{% endif %}>
+        Skip entry-level jobs
+      </label>
+      <label for="job_type_filter">Job type</label>
+      <select id="job_type_filter" name="job_type_filter">
+        <option value="any" {% if runtime.job_type_filter == "any" %}selected{% endif %}>Any</option>
+        <option value="hourly" {% if runtime.job_type_filter == "hourly" %}selected{% endif %}>Hourly only</option>
+        <option value="fixed" {% if runtime.job_type_filter == "fixed" %}selected{% endif %}>Fixed only</option>
+      </select>
+      <label for="engagement_filter">Engagement</label>
+      <select id="engagement_filter" name="engagement_filter">
+        <option value="any" {% if runtime.engagement_filter == "any" %}selected{% endif %}>Any</option>
+        <option value="project" {% if runtime.engagement_filter == "project" %}selected{% endif %}>Projects only</option>
+        <option value="role" {% if runtime.engagement_filter == "role" %}selected{% endif %}>Role hires only</option>
+      </select>
+      <label for="blocked_client_countries">Blocked client countries (comma-separated; blank = off)</label>
+      <input id="blocked_client_countries" name="blocked_client_countries" type="text" value="{{ runtime.blocked_client_countries or '' }}" placeholder="India, Pakistan">
+      <label for="min_client_spend">Min client total spend (skip below; blank = off)</label>
+      <input id="min_client_spend" name="min_client_spend" type="text" value="{{ runtime.min_client_spend or '' }}">
+      <label for="max_connects_cost">Max Connects to apply (skip above; blank = off)</label>
+      <input id="max_connects_cost" name="max_connects_cost" type="text" value="{{ runtime.max_connects_cost or '' }}">
       <label for="autonomy_mode">Autonomy</label>
       <select id="autonomy_mode" name="autonomy_mode">
         <option value="manual" {% if runtime.autonomy_mode == "manual" %}selected{% endif %}>Manual — approve every submit</option>
@@ -180,7 +202,7 @@
     <tr>
       <td>{{ row.category }}</td>
       <td>{{ row.rule }}</td>
-      <td>{{ row.enforcement_level }}</td>
+      <td>{{ row.enforcement_level }}{% if row.enforcement_level == 'learned' %} <span class="badge">from edits</span>{% endif %}</td>
       <td>{% if row.active %}on{% else %}off{% endif %}</td>
       <td class="actions">
         <form method="post" action="/preferences/rules/{{ row.id }}/toggle">

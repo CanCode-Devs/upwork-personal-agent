@@ -10,7 +10,7 @@ from app.db.session import SessionLocal
 from app.events import add_event
 from app.models import JobPayload, JobStatus
 from app.profile import load_profile
-from app.tools.discovery import _parse_client, execute_scoring_matrix, fetch_live_jobs
+from app.tools.discovery import _parse_client, execute_scoring_matrix, fetch_live_jobs, job_filter_fields
 from app.upwork.mcp_client import (
     UpworkMcpClient,
     derive_client_stats,
@@ -184,6 +184,7 @@ async def ingest_payload(payload: JobPayload, settings: Settings, mcp: UpworkMcp
         invites_sent = details.get("invites_sent")
         interviewing = details.get("interviewing")
         job_text = "\n".join(part for part in (detailed.get("description") or "", attachment_text) if part)
+        fields = job_filter_fields(details)
         scored = await execute_scoring_matrix(
             client_rating=rating,
             client_payment_status=payment,
@@ -201,6 +202,10 @@ async def ingest_payload(payload: JobPayload, settings: Settings, mcp: UpworkMcp
             attachment_text=attachment_text,
             price_label=str(detailed.get("price_label") or detailed.get("budget") or ""),
             contractor_type=contractor_type,
+            experience_level=fields["experience_level"],
+            client_country=fields["client_country"],
+            client_spend=fields["client_spend"],
+            connects_cost=fields["connects_cost"],
             db=db,
             settings=settings,
         )

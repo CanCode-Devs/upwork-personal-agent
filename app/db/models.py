@@ -66,6 +66,7 @@ class Proposal(Base):
     milestones_json: Mapped[str] = mapped_column(Text, default="[]")
     screening_json: Mapped[str] = mapped_column(Text, default="[]")
     apply_json: Mapped[str] = mapped_column(Text, default="{}")
+    critique_json: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
@@ -177,6 +178,12 @@ class AppRuntimeSettings(Base):
     skip_us_work_auth: Mapped[bool] = mapped_column(Boolean, default=True)
     skip_w2_only: Mapped[bool] = mapped_column(Boolean, default=True)
     skip_onsite: Mapped[bool] = mapped_column(Boolean, default=True)
+    skip_entry_level: Mapped[bool] = mapped_column(Boolean, default=True)
+    job_type_filter: Mapped[str] = mapped_column(String(16), default="any")
+    engagement_filter: Mapped[str] = mapped_column(String(16), default="any")
+    blocked_client_countries: Mapped[str] = mapped_column(Text, default="")
+    min_client_spend: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_connects_cost: Mapped[int | None] = mapped_column(Integer, nullable=True)
     pending_search_queries: Mapped[str] = mapped_column(Text, default="[]")
     dismissed_search_queries: Mapped[str] = mapped_column(Text, default="[]")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
@@ -202,6 +209,7 @@ class ProposalSettings(Base):
     screening_instructions: Mapped[str] = mapped_column(Text, default="")
     apply_questions_instructions: Mapped[str] = mapped_column(Text, default="")
     example_count: Mapped[int] = mapped_column(Integer, default=2)
+    critique_rounds: Mapped[int] = mapped_column(Integer, default=1)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 

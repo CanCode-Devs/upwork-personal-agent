@@ -13,7 +13,7 @@ from app.db.session import SessionLocal
 from app.embeddings import cosine, embed_texts, query_similar
 from app.engagement import classify_engagement
 from app.events import add_event
-from app.llm import llm_draft, llm_screening_answers
+from app.llm import llm_critique, llm_draft, llm_screening_answers
 from app.milestones import (
     align_milestone_total,
     coerce_milestones,
@@ -25,6 +25,7 @@ from app.milestones import (
 from app.models import (
     ApplyHighlight,
     ContextMatch,
+    CritiqueResult,
     DraftResult,
     EmbeddingSource,
     FunnelStatus,
@@ -40,8 +41,22 @@ from app.models import (
     WorkKind,
 )
 from app.profile import load_overlay, load_profile
-from app.proposal_settings import build_system_prompt, load_proposal_settings, select_examples, style_rules_for_prompt
-from app.proposal_writer import dump_apply, dump_screening, finalize_letter, load_apply, load_screening
+from app.proposal_settings import (
+    DEFAULT_TARGET_WORDS,
+    build_system_prompt,
+    load_proposal_settings,
+    select_examples,
+    style_rules_for_prompt,
+)
+from app.proposal_writer import (
+    dump_apply,
+    dump_critique,
+    dump_screening,
+    extract_apply_questions,
+    finalize_letter,
+    load_apply,
+    load_screening,
+)
 from app.tools import register_tool
 from app.tools.discovery import settings_block_reasons_for_job
 from app.upwork.mcp_client import UpworkMcpClient, already_applied, format_mcp_error
@@ -399,33 +414,62 @@ async def generate_tailored_pitch(
         engagement = classify_engagement(job.title or "", job.description or "", job.job_type or "")
         system_prompt = build_system_prompt(writer, profile, style_rules_for_prompt(session), engagement=engagement)
         stage_payload = [item.model_dump() for item in writer.milestone_stages]
-        drafted = llm_draft(
-            payload,
-            profile,
-            settings,
-            proof=proof_text,
-            tone=args.tone.value,
-            focus_points=args.focus_points,
-            milestones_budget=bid if need_plan else None,
-            system_prompt=system_prompt,
-            style_examples=style_examples,
-            milestone_min=writer.milestone_min,
-            milestone_max=writer.milestone_max,
-            apply_questions_instructions=writer.apply_questions_instructions,
-            screening_instructions=writer.screening_instructions,
-            opening_hook=writer.opening_hook,
-            enforce_hook=writer.enforce_opening_hook,
-        )
-        if need_plan:
-            planned = coerce_milestones([item.model_dump() for item in drafted.milestones], bid) or heuristic_milestones(
-                job, bid, stage_payload
+
+        def run_draft(focus: list[str]) -> DraftResult:
+            result = llm_draft(
+                payload,
+                profile,
+                settings,
+                proof=proof_text,
+                tone=args.tone.value,
+                focus_points=focus,
+                milestones_budget=bid if need_plan else None,
+                system_prompt=system_prompt,
+                style_examples=style_examples,
+                milestone_min=writer.milestone_min,
+                milestone_max=writer.milestone_max,
+                apply_questions_instructions=writer.apply_questions_instructions,
+                screening_instructions=writer.screening_instructions,
+                opening_hook=writer.opening_hook,
+                enforce_hook=writer.enforce_opening_hook,
             )
-            drafted.milestones = planned
-        drafted.cover_letter = finalize_letter(
-            drafted.cover_letter,
-            hook=writer.opening_hook,
-            enforce=writer.enforce_opening_hook,
-        )
+            if need_plan:
+                planned = coerce_milestones([item.model_dump() for item in result.milestones], bid) or heuristic_milestones(
+                    job, bid, stage_payload
+                )
+                result.milestones = planned
+            result.cover_letter = finalize_letter(
+                result.cover_letter,
+                hook=writer.opening_hook,
+                enforce=writer.enforce_opening_hook,
+            )
+            return result
+
+        drafted = run_draft(list(args.focus_points))
+        critique = CritiqueResult(passed=True, issues=[], rounds=0)
+        rounds = max(0, writer.critique_rounds)
+        target_words = writer.target_words or DEFAULT_TARGET_WORDS
+        apply_items = extract_apply_questions(job.description or "")
+        for round_index in range(rounds):
+            try:
+                critique = llm_critique(
+                    drafted.cover_letter,
+                    payload,
+                    profile,
+                    settings,
+                    target_words=target_words,
+                    apply_questions=apply_items,
+                )
+            except Exception:
+                logger.exception("critique failed for job %s", job.id)
+                critique = CritiqueResult(passed=True, issues=[], rounds=round_index + 1)
+                break
+            critique.rounds = round_index + 1
+            if critique.passed:
+                break
+            focus = list(args.focus_points) + critique.issues
+            drafted = run_draft(focus)
+        drafted.critique = critique
         drafted.matched_context = [proof_text] if proof_text else []
         portfolio_ids: list[str] = []
         certificate_ids: list[str] = []
@@ -489,6 +533,7 @@ async def generate_tailored_pitch(
                 "proof": proof_text[:300],
             }
         )
+        proposal.critique_json = dump_critique(critique)
         job.matched_context = json.dumps(drafted.matched_context)
         session.flush()
         add_event(

@@ -38,7 +38,10 @@
         {% endfor %}
       </select>
       <label for="target_words">Target length (words, optional)</label>
-      <input id="target_words" name="target_words" type="text" value="{{ writer.target_words or '' }}" placeholder="e.g. 220">
+      <input id="target_words" name="target_words" type="text" value="{{ writer.target_words or '' }}" placeholder="e.g. 150">
+      <label for="critique_rounds">Self-critique rounds</label>
+      <input id="critique_rounds" name="critique_rounds" type="text" value="{{ writer.critique_rounds }}" placeholder="1">
+      <p class="muted">0 skips the auto-review pass. 1 drafts, grades, and rewrites once if it fails.</p>
     </div>
     <div class="card">
       <h2>Letter structure</h2>

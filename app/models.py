@@ -36,6 +36,18 @@ class AutonomyMode(StrEnum):
     fully_auto = "fully_auto"
 
 
+class JobTypeFilter(StrEnum):
+    any = "any"
+    hourly = "hourly"
+    fixed = "fixed"
+
+
+class EngagementFilter(StrEnum):
+    any = "any"
+    project = "project"
+    role = "role"
+
+
 class EnforcementLevel(StrEnum):
     strict_block = "strict_block"
     soft_penalty = "soft_penalty"
@@ -148,6 +160,7 @@ class WriterConfig(BaseModel):
     screening_instructions: str = ""
     apply_questions_instructions: str = ""
     example_count: int = 2
+    critique_rounds: int = 1
 
 
 class StyleExample(TypedDict):
@@ -184,6 +197,12 @@ class ApplyHighlight(BaseModel):
     detail: str = ""
 
 
+class CritiqueResult(BaseModel):
+    passed: bool = True
+    issues: list[str] = Field(default_factory=list)
+    rounds: int = 0
+
+
 class DraftResult(BaseModel):
     cover_letter: str
     matched_context: list[str] = Field(default_factory=list)
@@ -193,6 +212,7 @@ class DraftResult(BaseModel):
     certificate_ids: list[str] = Field(default_factory=list)
     job_history_ids: list[str] = Field(default_factory=list)
     profile_history_ids: list[str] = Field(default_factory=list)
+    critique: CritiqueResult | None = None
 
 
 class ReplyIntentKind(StrEnum):
@@ -331,6 +351,10 @@ class ScoringMatrixArgs(BaseModel):
     attachment_text: str = ""
     price_label: str = ""
     contractor_type: str = ""
+    experience_level: str = ""
+    client_country: str = ""
+    client_spend: float | None = None
+    connects_cost: int | None = None
 
 
 class GeneratePitchArgs(BaseModel):
@@ -418,6 +442,19 @@ class RuntimeSettings(BaseModel):
     skip_us_work_auth: bool = True
     skip_w2_only: bool = True
     skip_onsite: bool = True
+    skip_entry_level: bool = True
+    job_type_filter: JobTypeFilter = JobTypeFilter.any
+    engagement_filter: EngagementFilter = EngagementFilter.any
+    blocked_client_countries: str = ""
+    min_client_spend: int | None = None
+    max_connects_cost: int | None = None
+
+
+class JobFilterFields(TypedDict):
+    experience_level: str
+    client_country: str
+    client_spend: float | None
+    connects_cost: int | None
 
 
 class JobPayload(TypedDict, total=False):
@@ -517,6 +554,24 @@ class InboxCounts(TypedDict):
     submit_failed: int
     expired: int
     applied: int
+
+
+class PollStatus(TypedDict):
+    polling: bool
+    source: str
+    next_poll_at: str | None
+    last_finished_at: str | None
+    started_at: str | None
+    interval_seconds: int
+
+
+class PollStatusView(BaseModel):
+    polling: bool
+    source: str = ""
+    next_poll_at: datetime | None = None
+    last_finished_at: datetime | None = None
+    started_at: datetime | None = None
+    interval_seconds: int
 
 
 class McpStatus(TypedDict):

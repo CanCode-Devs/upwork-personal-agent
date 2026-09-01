@@ -11,13 +11,17 @@ from app.db.models import FeedbackLog, Job, PreferenceRule
 from app.db.session import SessionLocal
 from app.embeddings import query_similar
 from app.eligibility import hard_block_reasons
+from app.engagement import classify_engagement
 from app.events import add_event
 from app.models import (
     ContextMatch,
+    EngagementFilter,
     FetchLiveJobsArgs,
     FreelancerProfile,
+    JobFilterFields,
     JobPayload,
     JobStatus,
+    JobTypeFilter,
     RetrieveContextArgs,
     RuntimeSettings,
     ScoreResult,
@@ -124,6 +128,94 @@ def parse_price_amount(job_type: str, price_label: str, budget: float | None) ->
     return kind, None
 
 
+_ENTRY_KEYS = {"entry", "entry_level", "entrylevel", "beginner", "intern", "internship"}
+
+
+def _client_dict(raw: str | None) -> dict[str, Any]:
+    try:
+        data = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _money_amount(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, dict):
+        return _money_amount(value.get("rawValue") or value.get("amount") or value.get("displayValue"))
+    try:
+        return float(str(value).replace("$", "").replace(",", "").split()[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_int(value: object) -> int | None:
+    amount = _money_amount(value)
+    if amount is None:
+        return None
+    return int(amount)
+
+
+def _is_entry_level(experience_level: str) -> bool:
+    key = re.sub(r"[^a-z0-9]+", "_", (experience_level or "").lower()).strip("_")
+    if not key:
+        return False
+    return key in _ENTRY_KEYS or key.startswith("entry")
+
+
+def _country_blocked(country: str, blocked: str) -> bool:
+    hay = (country or "").lower().strip()
+    if not hay:
+        return False
+    for token in blocked.split(","):
+        needle = token.strip().lower()
+        if needle and needle in hay:
+            return True
+    return False
+
+
+def job_filter_fields(data: dict[str, Any]) -> JobFilterFields:
+    return {
+        "experience_level": str(data.get("experience_level") or ""),
+        "client_country": str(data.get("country") or ""),
+        "client_spend": _money_amount(data.get("spend_total")),
+        "connects_cost": _as_int(data.get("connects_cost")),
+    }
+
+
+def structured_skip_reasons(
+    runtime: RuntimeSettings,
+    *,
+    kind: str,
+    experience_level: str = "",
+    client_country: str = "",
+    client_spend: float | None = None,
+    connects_cost: int | None = None,
+    title: str = "",
+    description: str = "",
+    job_type: str = "",
+) -> list[str]:
+    reasons: list[str] = []
+    if runtime.skip_entry_level and _is_entry_level(experience_level):
+        reasons.append("entry-level job")
+    wanted_type = runtime.job_type_filter
+    if wanted_type != JobTypeFilter.any and kind in {"hourly", "fixed"} and kind != wanted_type.value:
+        reasons.append(f"job type {kind} not {wanted_type.value}")
+    wanted_eng = runtime.engagement_filter
+    if wanted_eng != EngagementFilter.any:
+        engagement = classify_engagement(title, description, job_type or kind)
+        if engagement != wanted_eng.value:
+            reasons.append(f"engagement {engagement} not {wanted_eng.value}")
+    if _country_blocked(client_country, runtime.blocked_client_countries):
+        reasons.append(f"blocked country {client_country}")
+    if runtime.min_client_spend is not None and client_spend is not None and client_spend < runtime.min_client_spend:
+        reasons.append(f"client spend {client_spend:g} below {runtime.min_client_spend}")
+    if runtime.max_connects_cost is not None and connects_cost is not None and connects_cost > runtime.max_connects_cost:
+        reasons.append(f"connects {connects_cost} above {runtime.max_connects_cost}")
+    return reasons
+
+
 def _job_client_fields(job: Job) -> tuple[str, float | None, int | None]:
     raw = job.client_json or job.client_info or ""
     try:
@@ -180,6 +272,13 @@ def hard_gate_reasons(
     hires: int | None,
     blob: str,
     contractor_type: str = "",
+    experience_level: str = "",
+    client_country: str = "",
+    client_spend: float | None = None,
+    connects_cost: int | None = None,
+    title: str = "",
+    description: str = "",
+    job_type: str = "",
 ) -> list[str]:
     reasons: list[str] = []
     if score is not None and score < runtime.min_score:
@@ -204,6 +303,19 @@ def hard_gate_reasons(
         if rule.enforcement_level == "strict_block" and _rule_matches(rule.rule, lowered):
             reasons.append(f"strict_block: {rule.rule}")
     reasons.extend(hard_block_reasons(blob, runtime, contractor_type))
+    reasons.extend(
+        structured_skip_reasons(
+            runtime,
+            kind=kind,
+            experience_level=experience_level,
+            client_country=client_country,
+            client_spend=client_spend,
+            connects_cost=connects_cost,
+            title=title,
+            description=description,
+            job_type=job_type or kind,
+        )
+    )
     return reasons
 
 
@@ -215,6 +327,7 @@ def settings_block_reasons_for_job(job: Job, session: Session, settings: Setting
     kind, amount = parse_price_amount(job.job_type or "", job.price_label or job.budget or "", None)
     payment, rating, hires = _job_client_fields(job)
     attachment, contractor_type = _eligibility_fields(job)
+    fields = job_filter_fields(_client_dict(job.client_json or job.client_info))
     return hard_gate_reasons(
         runtime,
         profile,
@@ -227,6 +340,13 @@ def settings_block_reasons_for_job(job: Job, session: Session, settings: Setting
         hires=hires,
         blob=f"{job.title}\n{job.description}\n{attachment}",
         contractor_type=contractor_type,
+        experience_level=fields["experience_level"],
+        client_country=fields["client_country"],
+        client_spend=fields["client_spend"],
+        connects_cost=fields["connects_cost"],
+        title=job.title or "",
+        description=job.description or "",
+        job_type=job.job_type or "",
     )
 
 
@@ -397,6 +517,10 @@ async def execute_scoring_matrix(
     attachment_text: str = "",
     price_label: str = "",
     contractor_type: str = "",
+    experience_level: str = "",
+    client_country: str = "",
+    client_spend: float | None = None,
+    connects_cost: int | None = None,
     db: Session | None = None,
     settings: Settings | None = None,
 ) -> ScoreResult:
@@ -417,6 +541,10 @@ async def execute_scoring_matrix(
         attachment_text=attachment_text,
         price_label=price_label,
         contractor_type=contractor_type,
+        experience_level=experience_level,
+        client_country=client_country,
+        client_spend=client_spend,
+        connects_cost=connects_cost,
     )
     settings = settings or get_settings()
     session, own = _session(db)
@@ -462,6 +590,20 @@ async def execute_scoring_matrix(
         elif kind == "hourly" and min_hourly and amount is not None and amount < min_hourly:
             blocked = True
             breakdown.append(f"below rate floor {min_hourly}")
+
+        for reason in structured_skip_reasons(
+            runtime,
+            kind=kind,
+            experience_level=args.experience_level,
+            client_country=args.client_country,
+            client_spend=args.client_spend,
+            connects_cost=args.connects_cost,
+            title=args.title,
+            description=args.job_text,
+            job_type=args.job_type,
+        ):
+            blocked = True
+            breakdown.append(reason)
 
         if runtime.require_verified_payment and args.client_payment_status.lower() not in {"verified", "true"}:
             blocked = True

@@ -1,3 +1,4 @@
+import base64
 import json
 from typing import Any, TypedDict
 
@@ -7,6 +8,7 @@ from pydantic import ValidationError
 from app.config import Settings
 from app.milestones import coerce_milestones
 from app.models import (
+    CritiqueResult,
     DraftResult,
     FreelancerProfile,
     JobPayload,
@@ -25,6 +27,7 @@ from app.proposal_writer import (
     finalize_letter,
     job_context,
     parse_screening_answers,
+    posting_mentions_attachments,
     profile_for_prompt,
     sanitize_proposal,
 )
@@ -55,7 +58,7 @@ def _temperature_supported(model: str) -> bool:
 def _complete_json(
     client: OpenAI,
     model: str,
-    messages: list[ChatMessage],
+    messages: list[dict[str, Any]],
     temperature: float,
 ) -> dict[str, Any]:
     kwargs: dict[str, object] = {
@@ -392,3 +395,170 @@ def llm_suggest_reply(
     if not result.intents:
         raise RuntimeError("LLM returned no reply intents")
     return result
+
+
+_IMAGE_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+def _image_mime(filename: str) -> str:
+    lower = filename.lower()
+    for ext, mime in _IMAGE_MIME.items():
+        if lower.endswith(ext):
+            return mime
+    return "application/octet-stream"
+
+
+def llm_extract_image_text(data: bytes, filename: str, settings: Settings) -> str:
+    _require_key(settings)
+    if not data:
+        return ""
+    if len(data) > 8 * 1024 * 1024:
+        raise RuntimeError("Image is larger than 8MB")
+    client = _client(settings)
+    encoded = base64.b64encode(data).decode("ascii")
+    mime = _image_mime(filename)
+    parsed = _complete_json(
+        client,
+        draft_model(settings),
+        [
+            {
+                "role": "system",
+                "content": (
+                    "Extract all readable text from this job-post screenshot or document image. "
+                    'Return JSON only with key text. Preserve questions, numbered items, labels, and headings. '
+                    "Do not summarize. If there is no text, return {\"text\": \"\"}."
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"Extract the text from {filename}."},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
+                ],
+            },
+        ],
+        0.0,
+    )
+    return str(parsed.get("text") or "").strip()
+
+
+def llm_critique(
+    letter: str,
+    job: JobPayload,
+    profile: FreelancerProfile,
+    settings: Settings,
+    *,
+    target_words: int,
+    apply_questions: list[str] | None = None,
+) -> CritiqueResult:
+    _require_key(settings)
+    client = _client(settings)
+    context = job_context(job)
+    questions = [item for item in (apply_questions or context.get("apply_questions") or []) if item]
+    mentions = bool(context.get("posting_mentions_attachments")) or posting_mentions_attachments(
+        str(job.get("description") or "")
+    )
+    has_attachment_text = bool(str(context.get("attachment_text") or "").strip())
+    system = (
+        "You grade an Upwork cover letter. Return JSON only with keys passed (boolean) and issues (array of strings). "
+        "passed is true only if every rubric item is fine. Each issue is one concrete rewrite instruction. "
+        "Do not rewrite the letter."
+    )
+    user = (
+        f"Target words (letter body, excluding labeled apply-item answers): {target_words}\n"
+        f"Profile skills: {json.dumps(profile.skills, ensure_ascii=False)}\n"
+        f"Profile title: {profile.title}\n"
+        f"Apply questions that must be answered in the letter: {json.dumps(questions, ensure_ascii=False)}\n"
+        f"Posting mentions attachments: {mentions}\n"
+        f"Attachment text present: {has_attachment_text}\n"
+        f"Closed contracts: {json.dumps(context.get('closed_contracts') or [], ensure_ascii=False)}\n\n"
+        f"Letter:\n{letter[:6000]}\n\n"
+        "Rubric:\n"
+        "1. AI tells: parallel triads, 'not X, it is Y', no contractions, claiming the letter is written manually, "
+        "or mentioning AI-generated proposals.\n"
+        "2. Length: body roughly at the target, not 2x longer.\n"
+        "3. Skill honesty: do not claim stacks or native expertise absent from the profile.\n"
+        "4. Apply questions: every listed item is answered if the list is non-empty.\n"
+        "5. Attachments: if the posting mentions attachments and attachment text is missing, the letter must not "
+        "ask the client to send those files.\n"
+        "6. Specificity: at least one concrete detail about THIS job or this client, not generic mobile-AI theory.\n"
+        "If the letter is fine, return {\"passed\": true, \"issues\": []}."
+    )
+    parsed = _complete_json(
+        client,
+        draft_model(settings),
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        0.2,
+    )
+    issues_raw = parsed.get("issues")
+    issues: list[str] = []
+    if isinstance(issues_raw, list):
+        for item in issues_raw:
+            text = str(item or "").strip()
+            if text:
+                issues.append(text)
+    passed = bool(parsed.get("passed")) and not issues
+    return CritiqueResult(passed=passed, issues=issues[:8])
+
+
+class StyleRuleExtraction(TypedDict):
+    rules: list[str]
+
+
+def llm_extract_style_rules(
+    settings: Settings,
+    *,
+    draft_text: str = "",
+    edited_text: str = "",
+    reject_notes: str = "",
+) -> list[str]:
+    _require_key(settings)
+    client = _client(settings)
+    system = (
+        "You extract reusable Upwork cover-letter STYLE rules from a freelancer's edits or reject notes. "
+        "Return JSON only with key rules: an array of 0 to 3 short imperative sentences. "
+        "Rules must apply to future jobs, not this job's stack or client. "
+        "Examples: 'Use contractions.', 'Keep availability to one short line.', "
+        "'Do not open by mentioning AI-generated proposals.' "
+        "If the change is only job-specific wording, or notes are about budget/fit rather than writing, return []."
+    )
+    payload = {
+        "draft_text": (draft_text or "")[:4000],
+        "edited_text": (edited_text or "")[:4000],
+        "reject_notes": (reject_notes or "")[:1000],
+    }
+    parsed = _complete_json(
+        client,
+        settings.openai_model,
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
+        ],
+        0.2,
+    )
+    raw = parsed.get("rules")
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        text = " ".join(str(item or "").split())
+        if not text or len(text) < 8:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text[:240])
+        if len(out) >= 3:
+            break
+    return out

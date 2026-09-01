@@ -4,12 +4,14 @@ import asyncio
 import json
 import logging
 import time
-from pathlib import Path
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 from sqlalchemy import func
@@ -22,11 +24,13 @@ from app.models import (
     ApplyHighlight,
     ConnectsPanel,
     DashboardUserCreate,
+    EngagementFilter,
     FeedbackOutcome,
     FreelancerProfile,
     InboxCounts,
     InboxSort,
     JobStatus,
+    JobTypeFilter,
     MilestoneStageConfig,
     Permission,
     PitchTone,
@@ -52,7 +56,7 @@ from app.llm import llm_suggest_reply
 from app.db.session import SessionLocal, get_db
 from app.engagement import classify_engagement
 from app.events import add_event
-from app.job_attachments import safe_filename
+from app.job_attachments import add_manual_attachment, safe_filename
 from app.job_display import application_card, job_card, sort_job_cards
 from app.milestones import heuristic_milestones, job_needs_milestones, load_milestones, parse_milestone_form
 from app.profile import load_overlay, load_profile, save_overlay
@@ -65,7 +69,15 @@ from app.proposal_settings import (
     reset_role_letter_structure,
     style_rules_for_prompt,
 )
-from app.proposal_writer import dump_apply, finalize_letter, load_apply, load_screening, parse_screening_form
+from app.proposal_writer import (
+    attachments_unreadable,
+    dump_apply,
+    finalize_letter,
+    load_apply,
+    load_critique,
+    load_screening,
+    parse_screening_form,
+)
 from app.runtime import get_or_create_runtime
 from app.search_queries import (
     accept_search_query,
@@ -100,7 +112,7 @@ from app.upwork.messages import (
 )
 from app.upwork.sync import mark_jobs_applied, sync_upwork_memory
 from app.upwork.outcomes import application_for_job, index_applications, latest_client_outcome
-from app.worker import run_poll_cycle
+from app.worker import poll_status_payload, trigger_poll_now
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/web/templates")
@@ -135,7 +147,17 @@ def render(request: Request, name: str, context: dict | None = None, status_code
     payload.setdefault("asset_v", _ASSET_V)
     payload.setdefault("user", user)
     payload.setdefault("can", flags_for(user))
+    payload.setdefault("poll", poll_status_payload())
     return templates.TemplateResponse(request, name, payload, status_code=status_code)
+
+
+def _return_path(request: Request) -> str:
+    referer = request.headers.get("referer") or ""
+    parsed = urlparse(referer)
+    path = parsed.path or "/"
+    if not path.startswith("/") or path.startswith("//"):
+        return "/"
+    return f"{path}?{parsed.query}" if parsed.query else path
 
 
 def _inbox_auth_stale(events: Sequence[Event], oauth: str | None) -> bool:
@@ -472,6 +494,14 @@ async def job_detail(
     oauth_stale = oauth_needs_login(submit_error)
     application = application_for_job(job, db=db)
     latest_outcome = latest_client_outcome(db, job.id)
+    try:
+        details = json.loads(job.client_json or "{}")
+    except json.JSONDecodeError:
+        details = {}
+    if not isinstance(details, dict):
+        details = {}
+    missing_attachments = attachments_unreadable(job.description or "", details)
+    critique = load_critique(proposal)
     return render(
         request,
         "job.html",
@@ -496,6 +526,8 @@ async def job_detail(
             "engagement": classify_engagement(job.title or "", job.description or "", job.job_type or ""),
             "submit_error": submit_error,
             "oauth_stale": oauth_stale,
+            "attachments_missing": missing_attachments,
+            "critique": critique,
         },
     )
 
@@ -521,6 +553,54 @@ def job_attachment_file(
     if not str(path).startswith(str(root)) or not path.is_file():
         raise HTTPException(status_code=404)
     return FileResponse(path, filename=safe)
+
+
+@router.post("/jobs/{job_id}/attachments")
+async def add_job_attachments(
+    job_id: int,
+    attachment_text: str = Form(""),
+    files: list[UploadFile] | None = File(default=None),
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+    user: SessionUser = Depends(require_permission(Permission.review)),
+) -> Response:
+    _ = user
+    job = db.query(Job).filter(Job.id == job_id).one_or_none()
+    if job is None:
+        return RedirectResponse("/", status_code=303)
+    try:
+        details = json.loads(job.client_json or "{}")
+    except json.JSONDecodeError:
+        details = {}
+    if not isinstance(details, dict):
+        details = {}
+    pasted = attachment_text.strip()
+    uploads = _read_uploads(files)
+    if not pasted and not uploads:
+        return RedirectResponse(f"/jobs/{job.id}?error=attachments", status_code=303)
+    try:
+        if pasted:
+            details = add_manual_attachment(
+                details,
+                job_id=job.upwork_id,
+                filename="pasted.txt",
+                pasted_text=pasted,
+                settings=settings,
+            )
+        for name, data, _content_type in uploads:
+            details = add_manual_attachment(
+                details,
+                job_id=job.upwork_id,
+                filename=name,
+                data=data,
+                settings=settings,
+            )
+    except Exception:
+        logger.exception("manual attachment failed for job %s", job.id)
+        return RedirectResponse(f"/jobs/{job.id}?error=attachments", status_code=303)
+    job.client_json = json.dumps(details, ensure_ascii=False)
+    add_event(db, "attachments", "Added posting attachment text", job.id, user_id=user["id"])
+    return RedirectResponse(f"/jobs/{job.id}?attachments=1", status_code=303)
 
 
 @router.post("/jobs/{job_id}/edit")
@@ -676,11 +756,23 @@ async def reject(
     return RedirectResponse(f"/jobs/{job.id}", status_code=303)
 
 
-@router.post("/poll")
-async def poll_now(user: SessionUser = Depends(require_permission(Permission.poll))) -> Response:
+@router.get("/poll/status")
+async def poll_status(user: SessionUser = Depends(require_permission(Permission.review))) -> JSONResponse:
     _ = user
-    await run_poll_cycle()
-    return RedirectResponse("/", status_code=303)
+    return JSONResponse(poll_status_payload())
+
+
+@router.post("/poll")
+async def poll_now(
+    request: Request,
+    user: SessionUser = Depends(require_permission(Permission.poll)),
+) -> Response:
+    _ = user
+    await trigger_poll_now()
+    snapshot = poll_status_payload()
+    if "application/json" in request.headers.get("accept", ""):
+        return JSONResponse(snapshot)
+    return RedirectResponse(_return_path(request), status_code=303)
 
 
 async def _complete_web_login(flow: WebOAuthFlow) -> None:
@@ -870,6 +962,7 @@ def _writer_from_form(
     screening_instructions: str,
     apply_questions_instructions: str,
     example_count: str,
+    critique_rounds: str,
 ) -> WriterConfig:
     stages: list[MilestoneStageConfig] = []
     count = max(len(ms_title), len(ms_weight), len(ms_description))
@@ -908,6 +1001,7 @@ def _writer_from_form(
         screening_instructions=screening_instructions.strip(),
         apply_questions_instructions=apply_questions_instructions.strip(),
         example_count=max(0, _opt_int(example_count) or 0),
+        critique_rounds=max(0, _opt_int(critique_rounds) if _opt_int(critique_rounds) is not None else 1),
     )
 
 
@@ -957,6 +1051,7 @@ def save_proposal_settings(
     screening_instructions: str = Form(""),
     apply_questions_instructions: str = Form(""),
     example_count: str = Form("2"),
+    critique_rounds: str = Form("1"),
     db: Session = Depends(get_db),
     user: SessionUser = Depends(require_permission(Permission.writer)),
 ) -> Response:
@@ -983,6 +1078,7 @@ def save_proposal_settings(
             screening_instructions,
             apply_questions_instructions,
             example_count,
+            critique_rounds,
         ),
     )
     return RedirectResponse("/proposal?saved=1", status_code=303)
@@ -1132,6 +1228,12 @@ def save_runtime(
     skip_us_work_auth: str | None = Form(default=None),
     skip_w2_only: str | None = Form(default=None),
     skip_onsite: str | None = Form(default=None),
+    skip_entry_level: str | None = Form(default=None),
+    job_type_filter: str = Form("any"),
+    engagement_filter: str = Form("any"),
+    blocked_client_countries: str = Form(""),
+    min_client_spend: str = Form(""),
+    max_connects_cost: str = Form(""),
     db: Session = Depends(get_db),
     user: SessionUser = Depends(require_permission(Permission.settings)),
 ) -> Response:
@@ -1146,6 +1248,18 @@ def save_runtime(
     runtime.skip_us_work_auth = bool(skip_us_work_auth)
     runtime.skip_w2_only = bool(skip_w2_only)
     runtime.skip_onsite = bool(skip_onsite)
+    runtime.skip_entry_level = bool(skip_entry_level)
+    try:
+        runtime.job_type_filter = JobTypeFilter(job_type_filter).value
+    except ValueError:
+        runtime.job_type_filter = JobTypeFilter.any.value
+    try:
+        runtime.engagement_filter = EngagementFilter(engagement_filter).value
+    except ValueError:
+        runtime.engagement_filter = EngagementFilter.any.value
+    runtime.blocked_client_countries = blocked_client_countries.strip()
+    runtime.min_client_spend = _opt_int(min_client_spend)
+    runtime.max_connects_cost = _opt_int(max_connects_cost)
     try:
         runtime.min_client_rating = float(min_client_rating) if min_client_rating.strip() else None
     except ValueError:

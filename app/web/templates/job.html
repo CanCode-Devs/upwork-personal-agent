@@ -30,10 +30,18 @@
 <div class="banner">This job cannot be drafted (already applied or not in Pending).</div>
 {% elif request.query_params.get('error') %}
 <div class="banner">Could not write the proposal. Check the log on this page.</div>
+{% elif request.query_params.get('attachments') %}
+<div class="banner ok">Attachment text saved. Regenerate the proposal so the letter can use it.</div>
 {% elif request.query_params.get('saved') %}
 <div class="banner ok">Edits saved.</div>
+{% elif request.query_params.get('error') == 'attachments' %}
+<div class="banner">Could not read that attachment. Paste the text or try another file.</div>
 {% elif job.status == 'submit_failed' %}
 <div class="banner">Submit to Upwork failed. {{ submit_error or "Check the log on this page." }}{% if oauth_stale %} Open Connect Upwork in a new tab, then retry.{% endif %}</div>
+{% endif %}
+
+{% if attachments_missing %}
+<div class="banner">This post references attachments the tool cannot read from Upwork. Paste the text or upload the screenshots below so the next draft can answer them.</div>
 {% endif %}
 
 {% if card and card.facts %}
@@ -67,8 +75,12 @@
   </div>
   {% endfor %}
   {% endif %}
-  {% if card.attachments %}
-  <h2 style="margin-top:16px">Posting attachments</h2>
+</div>
+{% endif %}
+
+<div class="card" style="margin-bottom:20px">
+  <h2>Posting attachments</h2>
+  {% if card and card.attachments %}
   {% for item in card.attachments %}
   <div class="event">
     {% if item.local_url %}<a href="{{ item.local_url }}">{{ item.filename }}</a>
@@ -79,8 +91,17 @@
   </div>
   {% endfor %}
   {% endif %}
+  <form method="post" action="/jobs/{{ job.id }}/attachments" enctype="multipart/form-data" style="margin-top:12px">
+    <p class="muted">Upwork does not send posting files to this app. Paste the screenshots or questions, or upload a PNG/PDF, then regenerate.</p>
+    <label for="attachment_text">Paste text</label>
+    <textarea id="attachment_text" name="attachment_text" class="short" placeholder="Questions, requirements, screenshot text"></textarea>
+    <label for="attachment_files">Upload screenshot or PDF</label>
+    <input id="attachment_files" name="files" type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.webp,.gif,.txt,.md,.docx">
+    <div class="actions" style="margin-top:8px">
+      <button class="btn secondary" type="submit">Save attachments</button>
+    </div>
+  </form>
 </div>
-{% endif %}
 
 {% if breakdown %}
 <div class="card" style="margin-bottom:20px">
@@ -127,6 +148,19 @@
     </form>
     {% endif %}
     {% if has_draft %}
+    {% if critique and critique.issues %}
+    <div class="card compact" style="margin-bottom:12px">
+      <h3>Auto-review</h3>
+      <p class="muted">{% if critique.passed %}Passed after {{ critique.rounds }} round{{ 's' if critique.rounds != 1 else '' }}.{% else %}Revised {{ critique.rounds }} time{{ 's' if critique.rounds != 1 else '' }}.{% endif %}</p>
+      <ul class="critique-list">
+        {% for item in critique.issues %}
+        <li>{{ item }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% elif critique and critique.rounds %}
+    <p class="muted" style="margin-bottom:12px">Auto-review passed{% if critique.rounds %} after {{ critique.rounds }} round{{ 's' if critique.rounds != 1 else '' }}{% endif %}.</p>
+    {% endif %}
     <form id="proposal-form" method="post" action="/jobs/{{ job.id }}/edit" enctype="multipart/form-data">
       <textarea name="cover_letter" {% if not can_act %}readonly{% endif %}>{{ cover_letter }}</textarea>
       {% if can_act %}

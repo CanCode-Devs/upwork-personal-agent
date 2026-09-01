@@ -40,6 +40,7 @@ a:hover { text-decoration: underline; }
 }
 
 .poll-form { margin: 0; }
+.poll-form form { margin: 0; }
 .poll-now {
   width: 100%;
   display: inline-flex;
@@ -68,6 +69,26 @@ a:hover { text-decoration: underline; }
   color: #93c5fd;
   font-size: 0.78rem;
   line-height: 1.35;
+}
+.next-poll {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.35;
+  font-variant-numeric: tabular-nums;
+}
+.next-poll-label {
+  display: block;
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.next-poll time {
+  display: block;
+  color: var(--paper);
+  font-weight: 600;
+  font-size: 0.9rem;
+  margin-top: 2px;
 }
 .poll-spinner {
   width: 14px;
@@ -137,6 +158,8 @@ h1 { font-family: "IBM Plex Serif", Georgia, serif; font-weight: 500; margin: 0;
   font-size: 0.95rem;
 }
 .banner.ok { color: #b7d7c2; }
+.critique-list { margin: 8px 0 0; padding-left: 18px; color: var(--paper); }
+.critique-list li { margin: 4px 0; }
 .banner a.btn { display: inline-block; margin-left: 10px; vertical-align: middle; padding: 6px 12px; font-size: 0.85rem; color: #1c1208; text-decoration: none; }
 .banner a.btn:hover { text-decoration: none; }
 

@@ -6,7 +6,7 @@ from typing import Any
 
 from app.db.models import Proposal
 from app.engagement import classify_engagement
-from app.models import ScreeningAnswer
+from app.models import CritiqueResult, ScreeningAnswer
 
 OPENING_HOOK = ""
 
@@ -76,9 +76,19 @@ def job_context(job: JobPayload) -> dict[str, Any]:
     for item in details.get("attachments") or []:
         if isinstance(item, dict) and item.get("filename"):
             attachment_names.append(str(item["filename"]))
+    closed_titles: list[str] = []
+    closed = details.get("closed_contracts") if isinstance(details.get("closed_contracts"), list) else []
+    for row in closed[:6]:
+        if not isinstance(row, dict):
+            continue
+        title = str(row.get("title") or "").strip()
+        if title:
+            closed_titles.append(title)
+    description = (job.get("description") or "")[:8000]
+    attachment_text = str(details.get("attachment_text") or "")[:8000]
     return {
         "title": job.get("title") or "",
-        "description": (job.get("description") or "")[:8000],
+        "description": description,
         "budget": job.get("budget") or job.get("price_label") or "",
         "job_type": job.get("job_type") or "",
         "timezone": job.get("timezone") or str(details.get("timezone") or ""),
@@ -93,8 +103,10 @@ def job_context(job: JobPayload) -> dict[str, Any]:
         "invites_sent": details.get("invites_sent"),
         "interviewing": details.get("interviewing"),
         "client_reviews": review_bits,
+        "closed_contracts": closed_titles,
         "attachment_names": attachment_names,
-        "attachment_text": str(details.get("attachment_text") or "")[:8000],
+        "attachment_text": attachment_text,
+        "posting_mentions_attachments": posting_mentions_attachments(str(job.get("description") or "")),
         "apply_questions": extract_apply_questions(str(job.get("description") or "")),
         "engagement": classify_engagement(
             str(job.get("title") or ""),
@@ -108,6 +120,21 @@ _APPLY_HEADING = re.compile(
     r"(?im)^[ \t]*(?:to apply|please include(?: in your (?:proposal|application))?|your proposal (?:must|should) include)\b[^\n]*$"
 )
 _APPLY_ITEM = re.compile(r"^[ \t]*(?:[-*•]|\d+[.)])\s+(.+)$")
+_ATTACHMENT_MENTION = re.compile(
+    r"\b(?:attach(?:ed|ment|ments)?|screenshots?)\b",
+    re.IGNORECASE,
+)
+
+
+def posting_mentions_attachments(description: str) -> bool:
+    return bool(_ATTACHMENT_MENTION.search(description or ""))
+
+
+def attachments_unreadable(description: str, details: dict[str, Any] | None) -> bool:
+    if not posting_mentions_attachments(description):
+        return False
+    blob = details if isinstance(details, dict) else {}
+    return not str(blob.get("attachment_text") or "").strip()
 
 
 def extract_apply_questions(description: str) -> list[str]:
@@ -206,14 +233,26 @@ def strip_milestone_section(letter: str) -> str:
 
 
 _AI_HOOK = re.compile(
-    r"^(hey[,.]?\s+)?you(?:'ll| will) probably (?:get|receive) a lot of ai[- ]generated proposals?\b[^.]*\.\s*",
+    r"^(hey[,.]?\s+)?you(?:'ll| will) probably (?:get|receive) a lot of ai[- ]generated proposals?\b[^.]*\.\s*(?:let'?s get to it\.?\s*)?",
     re.IGNORECASE | re.DOTALL,
 )
 
 
+def strip_ai_hook(letter: str) -> str:
+    body = (letter or "").strip()
+    changed = True
+    while body and changed:
+        changed = False
+        stripped = _AI_HOOK.sub("", body, count=1)
+        if stripped != body:
+            body = stripped.lstrip()
+            changed = True
+    return body
+
+
 def ensure_opening_hook(letter: str, hook: str | None = None, enforce: bool = True) -> str:
     hook_text = (OPENING_HOOK if hook is None else hook).strip()
-    body = (letter or "").strip()
+    body = strip_ai_hook(letter)
     if not enforce or not hook_text:
         return body
     if not body:
@@ -322,6 +361,30 @@ def load_screening(proposal: Proposal | None) -> list[ScreeningAnswer]:
 
 def dump_apply(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
+
+
+def dump_critique(result: CritiqueResult | None) -> str:
+    if result is None:
+        return "{}"
+    return json.dumps(result.model_dump(), ensure_ascii=False)
+
+
+def load_critique(proposal: Proposal | None) -> CritiqueResult | None:
+    if proposal is None:
+        return None
+    raw = getattr(proposal, "critique_json", "") or ""
+    if not raw.strip() or raw.strip() == "{}":
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    try:
+        return CritiqueResult.model_validate(parsed)
+    except Exception:
+        return None
 
 
 def load_apply(proposal: Proposal | None) -> dict[str, Any]:

@@ -14,7 +14,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 from app.config import Settings, get_settings
-from app.job_attachments import store_job_attachments
+from app.job_attachments import FILE_EXTS, store_job_attachments
 from app.milestones import mcp_milestone_params
 from app.models import ApplyHighlight, ConnectsPanel, JobPayload, McpStatus, ProposalMilestone, ScreeningAnswer, ToolCallArgs
 from app.proposal_writer import clean_screening_question
@@ -437,7 +437,7 @@ def _client_reviews(history: dict[str, Any]) -> list[dict[str, Any]]:
     return reviews
 
 
-_FILE_EXTS = (".pdf", ".docx", ".doc", ".txt", ".md", ".csv", ".json", ".zip", ".xlsx", ".pptx", ".rtf")
+_FILE_EXTS = FILE_EXTS
 
 
 def _looks_like_file(node: dict[str, Any], url: str, name: str) -> bool:
