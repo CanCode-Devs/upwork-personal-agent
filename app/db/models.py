@@ -18,6 +18,8 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     username: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(256))
+    role: Mapped[str] = mapped_column(String(32), default="admin")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -35,6 +37,9 @@ class Job(Base):
     score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     score_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     score_breakdown: Mapped[str | None] = mapped_column(Text, nullable=True)
+    client_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    client_score_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    client_score_breakdown: Mapped[str | None] = mapped_column(Text, nullable=True)
     matched_context: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -64,6 +69,7 @@ class Proposal(Base):
     milestones_json: Mapped[str] = mapped_column(Text, default="[]")
     screening_json: Mapped[str] = mapped_column(Text, default="[]")
     apply_json: Mapped[str] = mapped_column(Text, default="{}")
+    critique_json: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
@@ -77,11 +83,13 @@ class Event(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id"), nullable=True, index=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
     kind: Mapped[str] = mapped_column(String(64), index=True)
     message: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     job: Mapped[Job | None] = relationship(back_populates="events")
+    user: Mapped["User | None"] = relationship()
 
 
 class PreferenceRule(Base):
@@ -163,6 +171,7 @@ class AppRuntimeSettings(Base):
     autonomy_mode: Mapped[str] = mapped_column(String(32), default="manual")
     auto_submit_threshold: Mapped[int] = mapped_column(Integer, default=85)
     min_score: Mapped[int] = mapped_column(Integer, default=70)
+    min_client_score: Mapped[int] = mapped_column(Integer, default=50)
     min_hourly: Mapped[int | None] = mapped_column(Integer, nullable=True)
     min_fixed: Mapped[int | None] = mapped_column(Integer, nullable=True)
     require_verified_payment: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -173,6 +182,12 @@ class AppRuntimeSettings(Base):
     skip_us_work_auth: Mapped[bool] = mapped_column(Boolean, default=True)
     skip_w2_only: Mapped[bool] = mapped_column(Boolean, default=True)
     skip_onsite: Mapped[bool] = mapped_column(Boolean, default=True)
+    skip_entry_level: Mapped[bool] = mapped_column(Boolean, default=True)
+    job_type_filter: Mapped[str] = mapped_column(String(16), default="any")
+    engagement_filter: Mapped[str] = mapped_column(String(16), default="any")
+    blocked_client_countries: Mapped[str] = mapped_column(Text, default="")
+    min_client_spend: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_connects_cost: Mapped[int | None] = mapped_column(Integer, nullable=True)
     pending_search_queries: Mapped[str] = mapped_column(Text, default="[]")
     dismissed_search_queries: Mapped[str] = mapped_column(Text, default="[]")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
@@ -198,6 +213,7 @@ class ProposalSettings(Base):
     screening_instructions: Mapped[str] = mapped_column(Text, default="")
     apply_questions_instructions: Mapped[str] = mapped_column(Text, default="")
     example_count: Mapped[int] = mapped_column(Integer, default=2)
+    critique_rounds: Mapped[int] = mapped_column(Integer, default=1)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 

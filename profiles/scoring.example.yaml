@@ -3,17 +3,6 @@ base_score: 55
 skill_bonus_per_hit: 8
 skill_bonus_cap: 30
 soft_penalty: 12
-payment_unverified: -10
-payment_verified: 6
-low_rating_below: 4.0
-low_rating: -10
-strong_rating_at: 4.8
-strong_rating: 4
-hire_rate_high_at: 50
-hire_rate_high: 4
-hire_rate_low_below: 20
-hire_rate_low_min_hires: 5
-hire_rate_low: -8
 interviewing_at: 5
 interviewing: -6
 invites_at: 10
@@ -25,3 +14,44 @@ similar_wins: 8
 unlike_wins_below: 0.25
 unlike_wins: -4
 over_proposal_cap: -8
+client:
+  base_score: 50
+  payment_verified: 6
+  payment_unverified: -12
+  strong_rating_at: 4.8
+  strong_rating_reviews: 10
+  strong_rating: 12
+  strong_rating_few: 6
+  rating_min_reviews: 3
+  low_rating_below: 4.5
+  low_rating: -8
+  very_low_rating_below: 4.0
+  very_low_rating: -18
+  hire_rate_high_at: 70
+  hire_rate_high: 10
+  hire_rate_mid_at: 50
+  hire_rate_mid: 5
+  hire_rate_low_below: 30
+  hire_rate_low_min_posted: 5
+  hire_rate_low: -12
+  spend_high_at: 50000
+  spend_high: 14
+  spend_mid_at: 10000
+  spend_mid: 10
+  spend_ok_at: 1000
+  spend_ok: 4
+  spend_low: -6
+  hourly_min_hours: 20
+  hourly_high_at: 40
+  hourly_high: 12
+  hourly_mid_at: 25
+  hourly_mid: 4
+  hourly_low_below: 20
+  hourly_low: -16
+  avg_spend_high_at: 1000
+  avg_spend_high: 8
+  avg_spend_low_below: 200
+  avg_spend_low: -8
+  tenure_years: 2
+  tenure: 4
+  active_contracts: 3

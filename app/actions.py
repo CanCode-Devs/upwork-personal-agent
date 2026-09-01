@@ -1,3 +1,5 @@
+import json
+
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -8,8 +10,16 @@ from app.milestones import dump_milestones
 from app.models import EmbeddingSource, FeedbackOutcome, JobStatus, ProposalMilestone, ScreeningAnswer
 from app.profile import load_overlay
 from app.proposal_settings import load_proposal_settings
-from app.proposal_writer import dump_apply, dump_screening, finalize_letter, load_apply
-from app.tools.execution import bid_amount_for_job, cap_highlight_picks, submit_proposal
+from app.proposal_writer import (
+    UnprovenAnswersError,
+    dump_apply,
+    dump_screening,
+    extract_apply_questions,
+    finalize_letter,
+    load_apply,
+    unproven_answer_gaps,
+)
+from app.tools.execution import bid_amount_for_job, cap_highlight_picks, job_is_fixed, quote_amount_for_job, submit_proposal
 from app.tools.memory import log_interaction_feedback
 from app.upwork.mcp_client import UpworkMcpClient
 
@@ -45,6 +55,8 @@ async def approve_and_submit(
     job_history_ids: list[str] | None = None,
     profile_history_ids: list[str] | None = None,
     attachment_uids: list[str] | None = None,
+    user_id: int | None = None,
+    charged_amount: float | None = None,
 ) -> Job:
     if job.applied_on_upwork:
         raise ValueError("Already applied on Upwork")
@@ -68,15 +80,37 @@ async def approve_and_submit(
             certificate_ids=certificate_ids,
             job_history_ids=job_history_ids,
             profile_history_ids=profile_history_ids,
+            user_id=user_id,
+            charged_amount=charged_amount,
         )
+    apply_questions = extract_apply_questions(job.description or "")
+    try:
+        details = json.loads(job.client_json or "{}")
+    except json.JSONDecodeError:
+        details = {}
+    if isinstance(details, dict) and str(details.get("attachment_text") or "").strip():
+        for item in extract_apply_questions(str(details.get("attachment_text") or "")):
+            if item not in apply_questions:
+                apply_questions.append(item)
+    gaps = unproven_answer_gaps(letter, screening_answers or [], apply_questions)
+    if gaps:
+        raise UnprovenAnswersError(gaps)
     overlay = load_overlay(get_settings())
-    bid = bid_amount_for_job(job, overlay.hourly_rate)
+    stored = None
+    raw_stored = load_apply(latest_proposal(job)).get("charged_amount")
+    if isinstance(raw_stored, (int, float)) and float(raw_stored) > 0:
+        stored = float(raw_stored)
+    if job_is_fixed(job):
+        bid = bid_amount_for_job(job, overlay.hourly_rate)
+    else:
+        bid = quote_amount_for_job(job, overlay.hourly_rate, charged_amount if charged_amount else stored)
     job.status = JobStatus.approved.value
     add_event(
         db,
         "approved",
         f"Approved from dashboard boost={max(0, boost_connects)} milestones={len(milestones or [])}",
         job.id,
+        user_id=user_id,
     )
     await log_interaction_feedback(str(job.id), FeedbackOutcome.approved.value, "Approved from dashboard", db=db)
     result = await submit_proposal(
@@ -97,14 +131,37 @@ async def approve_and_submit(
     return job
 
 
-async def reject_job(db: Session, job: Job, reason: str = "") -> Job:
+async def reject_job(db: Session, job: Job, reason: str = "", user_id: int | None = None) -> Job:
     if job.status not in {JobStatus.pending_review.value, JobStatus.submit_failed.value}:
         raise ValueError(f"Job cannot be rejected from status {job.status}")
     job.status = JobStatus.rejected.value
     note = reason.strip() or "Rejected from dashboard"
-    add_event(db, "rejected", note, job.id)
+    add_event(db, "rejected", note, job.id, user_id=user_id)
     await log_interaction_feedback(str(job.id), FeedbackOutcome.rejected.value, note, db=db)
     return job
+
+
+def save_hourly_quote(
+    db: Session,
+    job: Job,
+    amount: float,
+    user_id: int | None = None,
+) -> Proposal:
+    if job_is_fixed(job):
+        raise ValueError("Fixed-price quotes are not editable")
+    if amount <= 0:
+        raise ValueError("Hourly quote must be greater than 0")
+    proposal = latest_proposal(job)
+    if proposal is None:
+        proposal = Proposal(job_id=job.id, draft_text="", edited_text="")
+        db.add(proposal)
+        db.flush()
+    raw = load_apply(proposal)
+    raw["charged_amount"] = int(amount) if float(amount).is_integer() else amount
+    proposal.apply_json = dump_apply(raw)
+    db.flush()
+    add_event(db, "edited", f"Hourly quote set to ${raw['charged_amount']}/hr", job.id, user_id=user_id)
+    return proposal
 
 
 def save_edit(
@@ -117,6 +174,8 @@ def save_edit(
     certificate_ids: list[str] | None = None,
     job_history_ids: list[str] | None = None,
     profile_history_ids: list[str] | None = None,
+    user_id: int | None = None,
+    charged_amount: float | None = None,
 ) -> Proposal:
     writer = load_proposal_settings(db)
     letter = finalize_letter(cover_letter, hook=writer.opening_hook, enforce=writer.enforce_opening_hook)
@@ -131,7 +190,13 @@ def save_edit(
         proposal.milestones_json = dump_milestones(milestones)
     if screening_answers is not None:
         proposal.screening_json = dump_screening(screening_answers)
-    if portfolio_project_ids is not None or certificate_ids is not None or job_history_ids is not None or profile_history_ids is not None:
+    if (
+        portfolio_project_ids is not None
+        or certificate_ids is not None
+        or job_history_ids is not None
+        or profile_history_ids is not None
+        or charged_amount is not None
+    ):
         raw = load_apply(proposal)
         if portfolio_project_ids is not None:
             raw["portfolio_project_ids"] = portfolio_project_ids
@@ -141,6 +206,8 @@ def save_edit(
             raw["job_history_ids"] = job_history_ids
         if profile_history_ids is not None:
             raw["profile_history_ids"] = profile_history_ids
+        if charged_amount is not None and charged_amount > 0:
+            raw["charged_amount"] = charged_amount
         capped = cap_highlight_picks(
             portfolio_project_ids=list(raw.get("portfolio_project_ids") or []),
             certificate_ids=list(raw.get("certificate_ids") or []),
@@ -151,5 +218,5 @@ def save_edit(
         proposal.apply_json = dump_apply(raw)
     db.flush()
     add_embedding(db, EmbeddingSource.proposal, proposal.id, cover_letter)
-    add_event(db, "edited", "Cover letter updated", job.id)
+    add_event(db, "edited", "Cover letter updated", job.id, user_id=user_id)
     return proposal

@@ -3,7 +3,14 @@ from sqlalchemy.orm import Session
 from app.config import Settings, get_settings
 from app.db.models import AppRuntimeSettings
 from app.db.session import SessionLocal
-from app.models import AutonomyMode, RuntimeSettings
+from app.models import AutonomyMode, EngagementFilter, JobTypeFilter, RuntimeSettings
+
+
+def _enum_value(enum_cls: type[AutonomyMode] | type[JobTypeFilter] | type[EngagementFilter], raw: object, fallback: object) -> object:
+    try:
+        return enum_cls(str(raw or ""))
+    except ValueError:
+        return fallback
 
 
 def get_or_create_runtime(db: Session, settings: Settings | None = None) -> AppRuntimeSettings:
@@ -14,6 +21,7 @@ def get_or_create_runtime(db: Session, settings: Settings | None = None) -> AppR
             autonomy_mode=settings.autonomy_mode,
             auto_submit_threshold=settings.auto_submit_threshold,
             min_score=settings.min_score,
+            min_client_score=settings.min_client_score,
             min_hourly=settings.min_hourly,
             min_fixed=settings.min_fixed,
         )
@@ -30,15 +38,11 @@ def load_runtime(db: Session | None = None, settings: Settings | None = None) ->
         row = get_or_create_runtime(session, settings)
         if own:
             session.commit()
-        mode = row.autonomy_mode
-        try:
-            autonomy = AutonomyMode(mode)
-        except ValueError:
-            autonomy = AutonomyMode.manual
         return RuntimeSettings(
-            autonomy_mode=autonomy,
+            autonomy_mode=_enum_value(AutonomyMode, row.autonomy_mode, AutonomyMode.manual),
             auto_submit_threshold=row.auto_submit_threshold,
             min_score=row.min_score,
+            min_client_score=getattr(row, "min_client_score", 50),
             min_hourly=row.min_hourly,
             min_fixed=row.min_fixed,
             require_verified_payment=bool(getattr(row, "require_verified_payment", False)),
@@ -49,6 +53,12 @@ def load_runtime(db: Session | None = None, settings: Settings | None = None) ->
             skip_us_work_auth=bool(getattr(row, "skip_us_work_auth", True)),
             skip_w2_only=bool(getattr(row, "skip_w2_only", True)),
             skip_onsite=bool(getattr(row, "skip_onsite", True)),
+            skip_entry_level=bool(getattr(row, "skip_entry_level", True)),
+            job_type_filter=_enum_value(JobTypeFilter, getattr(row, "job_type_filter", None), JobTypeFilter.any),
+            engagement_filter=_enum_value(EngagementFilter, getattr(row, "engagement_filter", None), EngagementFilter.any),
+            blocked_client_countries=getattr(row, "blocked_client_countries", "") or "",
+            min_client_spend=getattr(row, "min_client_spend", None),
+            max_connects_cost=getattr(row, "max_connects_cost", None),
         )
     finally:
         if own:

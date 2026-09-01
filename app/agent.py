@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime, timedelta
+from typing import Literal, TypedDict
 
 from app.config import Settings, get_settings
 from app.db.models import FeedbackLog, Job, UpworkApplication
@@ -10,7 +11,17 @@ from app.db.session import SessionLocal
 from app.events import add_event
 from app.models import JobPayload, JobStatus
 from app.profile import load_profile
-from app.tools.discovery import _parse_client, execute_scoring_matrix, fetch_live_jobs
+from app.runtime import load_runtime
+from app.tools.discovery import (
+    _parse_client,
+    client_hard_gate_reasons,
+    execute_client_score,
+    execute_scoring_matrix,
+    fetch_live_jobs,
+    job_filter_fields,
+    persist_client_score,
+    settings_block_reasons_for_job,
+)
 from app.upwork.mcp_client import (
     UpworkMcpClient,
     derive_client_stats,
@@ -61,6 +72,104 @@ def _job_url(payload: JobPayload) -> str | None:
     if not job_id:
         return None
     return public_job_url(job_id)
+
+
+class JobActivityPatch(TypedDict, total=False):
+    proposal_count: int | float
+    interviewing: int | float
+    invites_sent: int | float
+    avg_bid: int | float | str
+    hired_on_job: int | float
+    unanswered_invites: int | float
+
+
+_ACTIVITY_KEYS: tuple[Literal[
+    "proposal_count",
+    "interviewing",
+    "invites_sent",
+    "avg_bid",
+    "hired_on_job",
+    "unanswered_invites",
+], ...] = (
+    "proposal_count",
+    "interviewing",
+    "invites_sent",
+    "avg_bid",
+    "hired_on_job",
+    "unanswered_invites",
+)
+
+
+def _activity_from_payload(payload: JobPayload) -> JobActivityPatch:
+    details = _details_dict(payload.get("client_details"))
+    top: JobActivityPatch = {}
+    if payload.get("proposal_count") is not None:
+        top["proposal_count"] = payload["proposal_count"]
+    if payload.get("interviewing") is not None:
+        top["interviewing"] = payload["interviewing"]
+    if payload.get("invites_sent") is not None:
+        top["invites_sent"] = payload["invites_sent"]
+    values: JobActivityPatch = {}
+    for key in _ACTIVITY_KEYS:
+        value = top.get(key)
+        if value is None:
+            value = details.get(key)
+        if value is not None:
+            values[key] = value
+    return values
+
+
+async def refresh_known_job_activity(
+    search_results: list[JobPayload],
+    settings: Settings | None = None,
+) -> int:
+    payload_by_id: dict[str, JobPayload] = {}
+    for item in search_results:
+        job_id = item.get("id")
+        if job_id:
+            payload_by_id[job_id] = item
+    if not payload_by_id:
+        return 0
+    settings = settings or get_settings()
+    db = SessionLocal()
+    try:
+        runtime = load_runtime(db, settings)
+        rows = (
+            db.query(Job)
+            .filter(
+                Job.upwork_id.in_(payload_by_id.keys()),
+                Job.score >= runtime.auto_submit_threshold,
+                Job.status.in_(
+                    [JobStatus.pending_review.value, JobStatus.submit_failed.value]
+                ),
+                Job.applied_on_upwork.is_(False),
+            )
+            .all()
+        )
+        updated = 0
+        for row in rows:
+            payload = payload_by_id.get(row.upwork_id)
+            if payload is None:
+                continue
+            incoming = _activity_from_payload(payload)
+            if not incoming:
+                continue
+            details = _details_dict(row.client_json)
+            changed = False
+            for key, value in incoming.items():
+                if details.get(key) != value:
+                    details[key] = value
+                    changed = True
+            if changed:
+                row.client_json = json.dumps(details, default=str)
+                updated += 1
+        db.commit()
+        return updated
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 def expire_stale_jobs() -> int:
@@ -114,6 +223,7 @@ async def backfill_job_details(mcp: UpworkMcpClient) -> None:
         for item in db.query(UpworkApplication).all():
             applied |= job_ref_keys(item.posting_id)
         pending = db.query(Job).filter(Job.status == JobStatus.pending_review.value).all()
+        runtime = load_runtime(db, mcp.settings)
         for row in pending:
             extra = by_id.get(row.upwork_id, {})
             try:
@@ -144,6 +254,17 @@ async def backfill_job_details(mcp: UpworkMcpClient) -> None:
                     row.client_json = json.dumps(merged, default=str)
             except json.JSONDecodeError:
                 row.client_json = extra.get("client_details") or row.client_json
+            persist_client_score(
+                row,
+                execute_client_score(_details_dict(row.client_json), runtime, settings=mcp.settings),
+            )
+            reasons = settings_block_reasons_for_job(row, db, mcp.settings)
+            if reasons:
+                row.status = JobStatus.skipped.value
+                row.expires_at = None
+                note = "skipped by settings: " + "; ".join(reasons)
+                row.score_reason = note + (f"; {row.score_reason}" if row.score_reason else "")
+                add_event(db, "skipped", note, row.id)
             if any(job_ref_keys(row.upwork_id) & applied) or row.status == JobStatus.submitted.value:
                 row.applied_on_upwork = True
             extra_desc = extra.get("description") or ""
@@ -184,6 +305,7 @@ async def ingest_payload(payload: JobPayload, settings: Settings, mcp: UpworkMcp
         invites_sent = details.get("invites_sent")
         interviewing = details.get("interviewing")
         job_text = "\n".join(part for part in (detailed.get("description") or "", attachment_text) if part)
+        fields = job_filter_fields(details)
         scored = await execute_scoring_matrix(
             client_rating=rating,
             client_payment_status=payment,
@@ -201,10 +323,30 @@ async def ingest_payload(payload: JobPayload, settings: Settings, mcp: UpworkMcp
             attachment_text=attachment_text,
             price_label=str(detailed.get("price_label") or detailed.get("budget") or ""),
             contractor_type=contractor_type,
+            experience_level=fields["experience_level"],
+            client_country=fields["client_country"],
+            client_spend=fields["client_spend"],
+            connects_cost=fields["connects_cost"],
             db=db,
             settings=settings,
         )
-        status = JobStatus.pending_review if scored.go else JobStatus.skipped
+        runtime = load_runtime(db, settings)
+        client_scored = execute_client_score(details, runtime, settings=settings)
+        hires = detailed.get("client_hires")
+        if not isinstance(hires, (int, float)):
+            hires = details.get("hires") if isinstance(details.get("hires"), (int, float)) else None
+        else:
+            hires = int(hires)
+        client_gates = client_hard_gate_reasons(
+            runtime,
+            payment_status=payment,
+            rating=rating,
+            hires=int(hires) if isinstance(hires, (int, float)) else None,
+            client_country=fields["client_country"],
+            client_spend=fields["client_spend"],
+        )
+        go = scored.go and client_scored.score >= runtime.min_client_score and not client_gates
+        status = JobStatus.pending_review if go else JobStatus.skipped
         applied_row = application_for_posting(db, job_id)
         job = Job(
             upwork_id=job_id,
@@ -217,6 +359,9 @@ async def ingest_payload(payload: JobPayload, settings: Settings, mcp: UpworkMcp
             score=scored.score,
             score_reason=scored.reason,
             score_breakdown=json.dumps(scored.breakdown),
+            client_score=client_scored.score,
+            client_score_reason=client_scored.reason,
+            client_score_breakdown=json.dumps(client_scored.breakdown),
             status=status.value,
             price_label=detailed.get("price_label") or detailed.get("budget"),
             timezone=detailed.get("timezone") or "",
@@ -231,9 +376,9 @@ async def ingest_payload(payload: JobPayload, settings: Settings, mcp: UpworkMcp
         )
         db.add(job)
         db.flush()
-        add_event(db, "scored", f"{scored.score}: {scored.reason}", job.id)
+        add_event(db, "scored", f"{scored.score}/{client_scored.score}: {scored.reason}", job.id)
         db.commit()
-        if not scored.go:
+        if not go:
             return "skipped"
         if applied_row is not None:
             return "skipped"
@@ -247,7 +392,16 @@ async def ingest_payload(payload: JobPayload, settings: Settings, mcp: UpworkMcp
 
 async def run_agent_cycle(settings: Settings | None = None) -> dict[str, int]:
     settings = settings or get_settings()
-    counts = {"searched": 0, "new": 0, "queued": 0, "skipped": 0, "submitted": 0, "expired": 0, "errors": 0}
+    counts = {
+        "searched": 0,
+        "new": 0,
+        "queued": 0,
+        "skipped": 0,
+        "submitted": 0,
+        "expired": 0,
+        "errors": 0,
+        "activity_refreshed": 0,
+    }
     counts["expired"] = expire_stale_jobs()
     mcp = UpworkMcpClient(settings)
     if not await mcp.is_authenticated():
@@ -285,6 +439,10 @@ async def run_agent_cycle(settings: Settings | None = None) -> dict[str, int]:
                 break
             continue
         counts["searched"] += len(jobs)
+        try:
+            counts["activity_refreshed"] += await refresh_known_job_activity(jobs, settings)
+        except Exception:
+            logger.exception("activity refresh failed")
         db = SessionLocal()
         try:
             known = {row[0] for row in db.query(Job.upwork_id).all()}
@@ -367,7 +525,9 @@ async def run_agent_cycle(settings: Settings | None = None) -> dict[str, int]:
             (
                 f"searched={counts['searched']} new={counts['new']} "
                 f"queued={counts['queued']} skipped={counts['skipped']} "
-                f"submitted={counts['submitted']} errors={counts['errors']}"
+                f"submitted={counts['submitted']} "
+                f"activity_refreshed={counts['activity_refreshed']} "
+                f"errors={counts['errors']}"
             ),
         )
         db.commit()

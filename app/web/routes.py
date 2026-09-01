@@ -4,26 +4,59 @@ import asyncio
 import json
 import logging
 import time
-from pathlib import Path
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
+from pydantic import ValidationError
 from sqlalchemy import func
 from sqlalchemy.orm import Session, selectinload
 
-from app.actions import approve_and_submit, cover_letter_for, latest_proposal, reject_job, save_edit
-from app.auth import COOKIE_NAME, create_session_value, current_user, verify_password
+from app.actions import approve_and_submit, cover_letter_for, latest_proposal, reject_job, save_edit, save_hourly_quote
+from app.auth import COOKIE_NAME, create_session_value, current_user, hash_password, verify_password
 from app.config import Settings, get_settings
-from app.models import ApplyHighlight, ConnectsPanel, FeedbackOutcome, FreelancerProfile, InboxCounts, InboxSort, JobStatus, MilestoneStageConfig, PitchTone, ScreeningAnswer, SessionUser, WorkKind, WorkOrigin, WriterConfig
+from app.models import (
+    ApplyHighlight,
+    ConnectsPanel,
+    DashboardUserCreate,
+    EngagementFilter,
+    FeedbackOutcome,
+    FreelancerProfile,
+    InboxCounts,
+    InboxSort,
+    JobStatus,
+    JobTypeFilter,
+    MilestoneStageConfig,
+    Permission,
+    PitchTone,
+    ScreeningAnswer,
+    SessionUser,
+    UserRole,
+    WorkKind,
+    WorkOrigin,
+    WriterConfig,
+)
 from app.db.models import ChatMessage, Event, FeedbackLog, Job, MessageRoom, PortfolioItem, PreferenceRule, ProposalExample, UpworkApplication, UpworkProfile, User
+from app.rbac import (
+    UserMutationError,
+    create_dashboard_user,
+    flags_for,
+    is_bootstrap_username,
+    require_permission,
+    reset_user_password,
+    set_user_active,
+    set_user_role,
+)
 from app.llm import llm_suggest_reply
 from app.db.session import SessionLocal, get_db
 from app.engagement import classify_engagement
 from app.events import add_event
-from app.job_attachments import safe_filename
+from app.job_attachments import add_manual_attachment, safe_filename
 from app.job_display import application_card, job_card, sort_job_cards
 from app.milestones import heuristic_milestones, job_needs_milestones, load_milestones, parse_milestone_form
 from app.profile import load_overlay, load_profile, save_overlay
@@ -36,7 +69,19 @@ from app.proposal_settings import (
     reset_role_letter_structure,
     style_rules_for_prompt,
 )
-from app.proposal_writer import dump_apply, finalize_letter, load_apply, load_screening, parse_screening_form
+from app.proposal_writer import (
+    UNPROVEN_SOURCE,
+    UnprovenAnswersError,
+    attachments_unreadable,
+    dump_apply,
+    extract_apply_questions,
+    finalize_letter,
+    load_apply,
+    load_critique,
+    load_screening,
+    parse_screening_form,
+    unproven_answer_gaps,
+)
 from app.runtime import get_or_create_runtime
 from app.search_queries import (
     accept_search_query,
@@ -46,8 +91,8 @@ from app.search_queries import (
     suggest_search_queries,
     work_history_for_prompt,
 )
-from app.tools.discovery import apply_runtime_filters
-from app.tools.execution import HIGHLIGHT_PICK, PitchSkipped, bid_amount_for_job, generate_tailored_pitch, local_job_highlights, rank_highlights
+from app.tools.discovery import apply_runtime_filters, ensure_client_scores
+from app.tools.execution import HIGHLIGHT_PICK, PitchSkipped, generate_tailored_pitch, heal_applied_status, job_is_fixed, local_job_highlights, quote_amount_for_job, rank_highlights
 from app.tools.memory import learn_preference, log_interaction_feedback, save_agent_item, update_portfolio_matrix
 from app.upwork.mcp_client import UpworkMcpClient, already_applied, connects_shortage, format_mcp_error, oauth_needs_login, public_job_url, job_ref_keys
 from app.upwork.oauth import (
@@ -71,7 +116,7 @@ from app.upwork.messages import (
 )
 from app.upwork.sync import mark_jobs_applied, sync_upwork_memory
 from app.upwork.outcomes import application_for_job, index_applications, latest_client_outcome
-from app.worker import run_poll_cycle
+from app.worker import poll_status_payload, trigger_poll_now
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/web/templates")
@@ -100,10 +145,23 @@ def render(request: Request, name: str, context: dict | None = None, status_code
     settings = get_settings()
     payload = dict(context or {})
     payload.pop("request", None)
+    user = payload.get("user") or current_user(request)
     payload.setdefault("app_name", settings.app_name)
     payload.setdefault("app_tagline", settings.app_tagline)
-    payload.setdefault("asset_v", _ASSET_V)
+    payload.setdefault("asset_v", str(int(_STYLE_PATH.stat().st_mtime)) if _STYLE_PATH.exists() else "1")
+    payload.setdefault("user", user)
+    payload.setdefault("can", flags_for(user))
+    payload.setdefault("poll", poll_status_payload())
     return templates.TemplateResponse(request, name, payload, status_code=status_code)
+
+
+def _return_path(request: Request) -> str:
+    referer = request.headers.get("referer") or ""
+    parsed = urlparse(referer)
+    path = parsed.path or "/"
+    if not path.startswith("/") or path.startswith("//"):
+        return "/"
+    return f"{path}?{parsed.query}" if parsed.query else path
 
 
 def _inbox_auth_stale(events: Sequence[Event], oauth: str | None) -> bool:
@@ -180,7 +238,7 @@ def login_submit(
     settings: Settings = Depends(get_settings),
 ) -> Response:
     user = db.query(User).filter(User.username == username).one_or_none()
-    if user is None or not verify_password(password, user.password_hash):
+    if user is None or not user.is_active or not verify_password(password, user.password_hash):
         return render(
             request,
             "login.html",
@@ -212,8 +270,8 @@ async def inbox(
     sort: str = Query(default=InboxSort.recent.value),
     oauth: str | None = Query(default=None),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.review)),
 ) -> Response:
-    user = _user(request)
     allowed = {item.value for item in JobStatus} | {"all", "applied"}
     selected = status if status in allowed else JobStatus.pending_review.value
     selected_sort = InboxSort.recent
@@ -229,6 +287,8 @@ async def inbox(
     elif selected != "all":
         query = query.filter(Job.status == selected)
     jobs: Sequence[Job] = query.limit(200).all()
+    if ensure_client_scores(db, list(jobs)):
+        db.commit()
     application_rows = db.query(UpworkApplication).order_by(UpworkApplication.synced_at.desc()).all()
     app_index = index_applications(list(application_rows))
     cards = []
@@ -245,7 +305,7 @@ async def inbox(
             if not (job_ref_keys(row.posting_id) & seen_keys)
         )
     cards = sort_job_cards(cards, selected_sort)
-    events = db.query(Event).order_by(Event.created_at.desc()).limit(12).all()
+    events = db.query(Event).options(selectinload(Event.user)).order_by(Event.created_at.desc()).limit(12).all()
     mcp = UpworkMcpClient()
     connected = await mcp.is_authenticated()
     stale_auth = _inbox_auth_stale(events, oauth)
@@ -284,11 +344,25 @@ async def inbox(
 
 
 @router.get("/jobs/{job_id}", response_class=HTMLResponse)
-async def job_detail(request: Request, job_id: int, db: Session = Depends(get_db)) -> Response:
-    user = _user(request)
-    job = db.query(Job).options(selectinload(Job.proposals), selectinload(Job.events)).filter(Job.id == job_id).one_or_none()
+async def job_detail(
+    request: Request,
+    job_id: int,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.review)),
+) -> Response:
+    job = db.query(Job).options(
+        selectinload(Job.proposals),
+        selectinload(Job.events).selectinload(Event.user),
+    ).filter(Job.id == job_id).one_or_none()
     if job is None:
         return RedirectResponse("/", status_code=303)
+    if ensure_client_scores(db, [job]):
+        db.commit()
+        db.refresh(job)
+    if heal_applied_status(job):
+        add_event(db, "submitted", "Upwork already accepted this apply", job.id, user_id=user["id"])
+        db.commit()
+        db.refresh(job)
     events = sorted(job.events, key=lambda item: item.created_at, reverse=True)
     breakdown: list[str] = []
     if job.score_breakdown:
@@ -298,6 +372,14 @@ async def job_detail(request: Request, job_id: int, db: Session = Depends(get_db
                 breakdown = [str(item) for item in parsed]
         except json.JSONDecodeError:
             breakdown = [job.score_breakdown]
+    client_breakdown: list[str] = []
+    if job.client_score_breakdown:
+        try:
+            parsed_client = json.loads(job.client_score_breakdown)
+            if isinstance(parsed_client, list):
+                client_breakdown = [str(item) for item in parsed_client]
+        except json.JSONDecodeError:
+            client_breakdown = [job.client_score_breakdown]
     context: list[str] = []
     if job.matched_context:
         try:
@@ -321,7 +403,13 @@ async def job_detail(request: Request, job_id: int, db: Session = Depends(get_db
     letter = cover_letter_for(job, db)
     has_draft = bool(letter.strip())
     overlay = load_overlay(get_settings())
-    bid = bid_amount_for_job(job, overlay.hourly_rate)
+    stored_quote = None
+    raw_quote = load_apply(latest_proposal(job)).get("charged_amount")
+    if isinstance(raw_quote, (int, float)) and float(raw_quote) > 0:
+        stored_quote = float(raw_quote)
+    bid = quote_amount_for_job(job, overlay.hourly_rate, stored_quote)
+    quote_bid = int(bid) if float(bid).is_integer() else bid
+    quote_is_fixed = job_is_fixed(job)
     panel = ConnectsPanel(charged_amount=bid)
     highlights: list[ApplyHighlight] = []
     if can_act and has_draft:
@@ -433,6 +521,20 @@ async def job_detail(request: Request, job_id: int, db: Session = Depends(get_db
     oauth_stale = oauth_needs_login(submit_error)
     application = application_for_job(job, db=db)
     latest_outcome = latest_client_outcome(db, job.id)
+    try:
+        details = json.loads(job.client_json or "{}")
+    except json.JSONDecodeError:
+        details = {}
+    if not isinstance(details, dict):
+        details = {}
+    missing_attachments = attachments_unreadable(job.description or "", details)
+    critique = load_critique(proposal)
+    apply_questions = extract_apply_questions(job.description or "")
+    if str(details.get("attachment_text") or "").strip():
+        for item in extract_apply_questions(str(details.get("attachment_text") or "")):
+            if item not in apply_questions:
+                apply_questions.append(item)
+    unproven_gaps = unproven_answer_gaps(letter, screening, apply_questions) if has_draft else []
     return render(
         request,
         "job.html",
@@ -442,6 +544,7 @@ async def job_detail(request: Request, job_id: int, db: Session = Depends(get_db
             "cover_letter": letter,
             "events": events,
             "breakdown": breakdown,
+            "client_breakdown": client_breakdown,
             "matched_context": context,
             "outcomes": outcomes,
             "can_act": can_act,
@@ -457,6 +560,13 @@ async def job_detail(request: Request, job_id: int, db: Session = Depends(get_db
             "engagement": classify_engagement(job.title or "", job.description or "", job.job_type or ""),
             "submit_error": submit_error,
             "oauth_stale": oauth_stale,
+            "attachments_missing": missing_attachments,
+            "critique": critique,
+            "unproven_gaps": unproven_gaps,
+            "apply_questions": apply_questions,
+            "unproven_source": UNPROVEN_SOURCE,
+            "quote_bid": quote_bid,
+            "quote_is_fixed": quote_is_fixed,
         },
     )
 
@@ -468,8 +578,9 @@ def job_attachment_file(
     filename: str,
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
+    user: SessionUser = Depends(require_permission(Permission.review)),
 ) -> Response:
-    _user(request)
+    _ = user
     job = db.query(Job).filter(Job.id == job_id).one_or_none()
     if job is None:
         raise HTTPException(status_code=404)
@@ -483,10 +594,72 @@ def job_attachment_file(
     return FileResponse(path, filename=safe)
 
 
+@router.post("/jobs/{job_id}/attachments")
+async def add_job_attachments(
+    job_id: int,
+    attachment_text: str = Form(""),
+    files: list[UploadFile] | None = File(default=None),
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+    user: SessionUser = Depends(require_permission(Permission.review)),
+) -> Response:
+    _ = user
+    job = db.query(Job).filter(Job.id == job_id).one_or_none()
+    if job is None:
+        return RedirectResponse("/", status_code=303)
+    try:
+        details = json.loads(job.client_json or "{}")
+    except json.JSONDecodeError:
+        details = {}
+    if not isinstance(details, dict):
+        details = {}
+    pasted = attachment_text.strip()
+    uploads = _read_uploads(files)
+    if not pasted and not uploads:
+        return RedirectResponse(f"/jobs/{job.id}?error=attachments", status_code=303)
+    try:
+        if pasted:
+            details = add_manual_attachment(
+                details,
+                job_id=job.upwork_id,
+                filename="pasted.txt",
+                pasted_text=pasted,
+                settings=settings,
+            )
+        for name, data, _content_type in uploads:
+            details = add_manual_attachment(
+                details,
+                job_id=job.upwork_id,
+                filename=name,
+                data=data,
+                settings=settings,
+            )
+    except Exception:
+        logger.exception("manual attachment failed for job %s", job.id)
+        return RedirectResponse(f"/jobs/{job.id}?error=attachments", status_code=303)
+    job.client_json = json.dumps(details, ensure_ascii=False)
+    add_event(db, "attachments", "Added posting attachment text", job.id, user_id=user["id"])
+    return RedirectResponse(f"/jobs/{job.id}?attachments=1", status_code=303)
+
+
+def _parse_hourly_quote(raw: str) -> float | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return int(value) if value == int(value) else value
+
+
 @router.post("/jobs/{job_id}/edit")
 def edit_job(
     job_id: int,
     cover_letter: str = Form(...),
+    user: SessionUser = Depends(require_permission(Permission.review)),
     milestones_present: str = Form(""),
     ms_title: list[str] = Form(default=[]),
     ms_description: list[str] = Form(default=[]),
@@ -497,6 +670,7 @@ def edit_job(
     certificate_ids: list[str] = Form(default=[]),
     job_history_ids: list[str] = Form(default=[]),
     profile_history_ids: list[str] = Form(default=[]),
+    hourly_quote: str = Form(""),
     db: Session = Depends(get_db),
 ) -> Response:
     job = db.query(Job).options(selectinload(Job.proposals)).filter(Job.id == job_id).one_or_none()
@@ -504,6 +678,7 @@ def edit_job(
         return RedirectResponse("/", status_code=303)
     planned = parse_milestone_form(ms_description, ms_amount, ms_title) if milestones_present.strip() else None
     screening = parse_screening_form(sq_question, sq_answer)
+    rate = None if job_is_fixed(job) else _parse_hourly_quote(hourly_quote)
     save_edit(
         db,
         job,
@@ -514,7 +689,30 @@ def edit_job(
         certificate_ids=certificate_ids,
         job_history_ids=job_history_ids,
         profile_history_ids=profile_history_ids,
+        user_id=user["id"],
+        charged_amount=rate,
     )
+    return RedirectResponse(f"/jobs/{job.id}?saved=1", status_code=303)
+
+
+@router.post("/jobs/{job_id}/quote")
+def save_job_quote(
+    job_id: int,
+    hourly_quote: str = Form(""),
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.review)),
+) -> Response:
+    job = db.query(Job).options(selectinload(Job.proposals)).filter(Job.id == job_id).one_or_none()
+    if job is None:
+        return RedirectResponse("/", status_code=303)
+    if job.applied_on_upwork or job.status not in {JobStatus.pending_review.value, JobStatus.submit_failed.value}:
+        return RedirectResponse(f"/jobs/{job.id}?error=blocked", status_code=303)
+    if job_is_fixed(job):
+        return RedirectResponse(f"/jobs/{job.id}", status_code=303)
+    rate = _parse_hourly_quote(hourly_quote)
+    if rate is None:
+        return RedirectResponse(f"/jobs/{job.id}?error=quote", status_code=303)
+    save_hourly_quote(db, job, rate, user_id=user["id"])
     return RedirectResponse(f"/jobs/{job.id}?saved=1", status_code=303)
 
 
@@ -525,8 +723,8 @@ async def regenerate_job(
     comments: str = Form(""),
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
+    user: SessionUser = Depends(require_permission(Permission.review)),
 ) -> Response:
-    _user(request)
     job = db.query(Job).options(selectinload(Job.proposals)).filter(Job.id == job_id).one_or_none()
     if job is None:
         return RedirectResponse("/", status_code=303)
@@ -549,7 +747,7 @@ async def regenerate_job(
         flag = "drafted"
     if comments.strip():
         note += f": {comments.strip()[:240]}"
-    add_event(db, "regenerated" if had_draft else "drafted", note, job.id)
+    add_event(db, "regenerated" if had_draft else "drafted", note, job.id, user_id=user["id"])
     return RedirectResponse(f"/jobs/{job.id}?{flag}=1", status_code=303)
 
 
@@ -570,7 +768,9 @@ async def approve_job(
     profile_history_ids: list[str] = Form(default=[]),
     attach_choice: str = Form("skip"),
     proposal_files: list[UploadFile] | None = File(default=None),
+    hourly_quote: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.submit)),
 ) -> Response:
     job = db.query(Job).options(selectinload(Job.proposals)).filter(Job.id == job_id).one_or_none()
     if job is None:
@@ -583,6 +783,7 @@ async def approve_job(
             boost = 0
     planned = parse_milestone_form(ms_description, ms_amount, ms_title) if milestones_present.strip() else None
     screening = parse_screening_form(sq_question, sq_answer)
+    rate = None if job_is_fixed(job) else _parse_hourly_quote(hourly_quote)
     attachment_uids: list[str] = []
     try:
         if attach_choice.strip() == "files":
@@ -611,9 +812,13 @@ async def approve_job(
             job_history_ids=job_history_ids,
             profile_history_ids=profile_history_ids,
             attachment_uids=attachment_uids,
+            user_id=user["id"],
+            charged_amount=rate,
         )
+    except UnprovenAnswersError:
+        return RedirectResponse(f"/jobs/{job.id}?error=unproven", status_code=303)
     except (ValueError, RuntimeError, Exception) as exc:
-        add_event(db, "submit_failed", format_mcp_error(exc), job.id)
+        add_event(db, "submit_failed", format_mcp_error(exc), job.id, user_id=user["id"])
         logger.exception("approve/submit failed for job %s", job.id)
     return RedirectResponse(f"/jobs/{job.id}", status_code=303)
 
@@ -623,18 +828,32 @@ async def reject(
     job_id: int,
     reason: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.review)),
 ) -> Response:
     job = db.query(Job).options(selectinload(Job.proposals)).filter(Job.id == job_id).one_or_none()
     if job is None:
         return RedirectResponse("/", status_code=303)
-    await reject_job(db, job, reason)
+    await reject_job(db, job, reason, user_id=user["id"])
     return RedirectResponse(f"/jobs/{job.id}", status_code=303)
 
 
+@router.get("/poll/status")
+async def poll_status(user: SessionUser = Depends(require_permission(Permission.review))) -> JSONResponse:
+    _ = user
+    return JSONResponse(poll_status_payload())
+
+
 @router.post("/poll")
-async def poll_now() -> Response:
-    await run_poll_cycle()
-    return RedirectResponse("/", status_code=303)
+async def poll_now(
+    request: Request,
+    user: SessionUser = Depends(require_permission(Permission.poll)),
+) -> Response:
+    _ = user
+    await trigger_poll_now()
+    snapshot = poll_status_payload()
+    if "application/json" in request.headers.get("accept", ""):
+        return JSONResponse(snapshot)
+    return RedirectResponse(_return_path(request), status_code=303)
 
 
 async def _complete_web_login(flow: WebOAuthFlow) -> None:
@@ -672,8 +891,11 @@ def _abandon_web_login(flow: WebOAuthFlow, message: str) -> None:
 
 
 @router.get("/upwork/connect")
-async def upwork_connect(request: Request, db: Session = Depends(get_db)) -> Response:
-    user = _user(request)
+async def upwork_connect(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.upwork_connect)),
+) -> Response:
     force = request.query_params.get("force") == "1"
     client = UpworkMcpClient()
     if await client.is_authenticated() and not force:
@@ -738,8 +960,8 @@ async def upwork_callback(
 def history(
     request: Request,
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.review)),
 ) -> Response:
-    user = _user(request)
     jobs = (
         db.query(Job)
         .filter(Job.status.in_([
@@ -752,6 +974,8 @@ def history(
         .limit(200)
         .all()
     )
+    if ensure_client_scores(db, jobs):
+        db.commit()
     return render(
         request,
         "history.html",
@@ -765,7 +989,9 @@ async def job_outcome(
     outcome: str = Form(""),
     client_notes: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.review)),
 ) -> Response:
+    _ = user
     job = db.query(Job).filter(Job.id == job_id).one_or_none()
     if job is None:
         return RedirectResponse("/", status_code=303)
@@ -785,7 +1011,8 @@ async def job_outcome(
 
 
 @router.get("/settings")
-def settings_alias() -> Response:
+def settings_alias(user: SessionUser = Depends(require_permission(Permission.settings))) -> Response:
+    _ = user
     return RedirectResponse("/preferences", status_code=303)
 
 
@@ -818,6 +1045,7 @@ def _writer_from_form(
     screening_instructions: str,
     apply_questions_instructions: str,
     example_count: str,
+    critique_rounds: str,
 ) -> WriterConfig:
     stages: list[MilestoneStageConfig] = []
     count = max(len(ms_title), len(ms_weight), len(ms_description))
@@ -856,12 +1084,16 @@ def _writer_from_form(
         screening_instructions=screening_instructions.strip(),
         apply_questions_instructions=apply_questions_instructions.strip(),
         example_count=max(0, _opt_int(example_count) or 0),
+        critique_rounds=max(0, _opt_int(critique_rounds) if _opt_int(critique_rounds) is not None else 1),
     )
 
 
 @router.get("/proposal", response_class=HTMLResponse)
-def proposal_page(request: Request, db: Session = Depends(get_db)) -> Response:
-    user = _user(request)
+def proposal_page(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.writer)),
+) -> Response:
     writer = load_proposal_settings(db)
     overlay = load_overlay(get_settings())
     examples = db.query(ProposalExample).order_by(ProposalExample.created_at.desc()).all()
@@ -902,9 +1134,11 @@ def save_proposal_settings(
     screening_instructions: str = Form(""),
     apply_questions_instructions: str = Form(""),
     example_count: str = Form("2"),
+    critique_rounds: str = Form("1"),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.writer)),
 ) -> Response:
-    _user(request)
+    _ = user
     row = get_or_create_proposal_settings(db)
     apply_config_to_row(
         row,
@@ -927,21 +1161,28 @@ def save_proposal_settings(
             screening_instructions,
             apply_questions_instructions,
             example_count,
+            critique_rounds,
         ),
     )
     return RedirectResponse("/proposal?saved=1", status_code=303)
 
 
 @router.post("/proposal/reset")
-def reset_proposal(request: Request, db: Session = Depends(get_db)) -> Response:
-    _user(request)
+def reset_proposal(
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.writer)),
+) -> Response:
+    _ = user
     reset_proposal_settings(db)
     return RedirectResponse("/proposal?reset=1", status_code=303)
 
 
 @router.post("/proposal/reset-role")
-def reset_role_structure(request: Request, db: Session = Depends(get_db)) -> Response:
-    _user(request)
+def reset_role_structure(
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.writer)),
+) -> Response:
+    _ = user
     reset_role_letter_structure(db)
     return RedirectResponse("/proposal?reset=role", status_code=303)
 
@@ -954,8 +1195,9 @@ def add_proposal_example(
     cover_letter: str = Form(""),
     notes: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.writer)),
 ) -> Response:
-    _user(request)
+    _ = user
     if not job_post.strip() or not cover_letter.strip():
         return RedirectResponse("/proposal?error=example", status_code=303)
     db.add(
@@ -979,8 +1221,9 @@ def update_proposal_example(
     cover_letter: str = Form(""),
     notes: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.writer)),
 ) -> Response:
-    _user(request)
+    _ = user
     row = db.query(ProposalExample).filter(ProposalExample.id == example_id).one_or_none()
     if row is None:
         return RedirectResponse("/proposal", status_code=303)
@@ -992,8 +1235,12 @@ def update_proposal_example(
 
 
 @router.post("/proposal/examples/{example_id}/delete")
-def delete_proposal_example(request: Request, example_id: int, db: Session = Depends(get_db)) -> Response:
-    _user(request)
+def delete_proposal_example(
+    example_id: int,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.writer)),
+) -> Response:
+    _ = user
     row = db.query(ProposalExample).filter(ProposalExample.id == example_id).one_or_none()
     if row is not None:
         db.delete(row)
@@ -1001,8 +1248,12 @@ def delete_proposal_example(request: Request, example_id: int, db: Session = Dep
 
 
 @router.post("/proposal/examples/{example_id}/toggle")
-def toggle_proposal_example(request: Request, example_id: int, db: Session = Depends(get_db)) -> Response:
-    _user(request)
+def toggle_proposal_example(
+    example_id: int,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.writer)),
+) -> Response:
+    _ = user
     row = db.query(ProposalExample).filter(ProposalExample.id == example_id).one_or_none()
     if row is not None:
         row.active = not row.active
@@ -1010,8 +1261,11 @@ def toggle_proposal_example(request: Request, example_id: int, db: Session = Dep
 
 
 @router.get("/preferences", response_class=HTMLResponse)
-def preferences_page(request: Request, db: Session = Depends(get_db)) -> Response:
-    user = _user(request)
+def preferences_page(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
+) -> Response:
     runtime = get_or_create_runtime(db)
     rules = db.query(PreferenceRule).order_by(PreferenceRule.created_at.desc()).all()
     overlay = load_overlay(get_settings())
@@ -1047,6 +1301,7 @@ def save_runtime(
     autonomy_mode: str = Form(...),
     auto_submit_threshold: int = Form(85),
     min_score: int = Form(70),
+    min_client_score: int = Form(50),
     min_hourly: str = Form(""),
     min_fixed: str = Form(""),
     min_client_rating: str = Form(""),
@@ -1057,18 +1312,39 @@ def save_runtime(
     skip_us_work_auth: str | None = Form(default=None),
     skip_w2_only: str | None = Form(default=None),
     skip_onsite: str | None = Form(default=None),
+    skip_entry_level: str | None = Form(default=None),
+    job_type_filter: str = Form("any"),
+    engagement_filter: str = Form("any"),
+    blocked_client_countries: str = Form(""),
+    min_client_spend: str = Form(""),
+    max_connects_cost: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
 ) -> Response:
+    _ = user
     runtime = get_or_create_runtime(db)
     runtime.autonomy_mode = autonomy_mode
     runtime.auto_submit_threshold = auto_submit_threshold
     runtime.min_score = min_score
+    runtime.min_client_score = min_client_score
     runtime.min_hourly = _opt_int(min_hourly)
     runtime.min_fixed = _opt_int(min_fixed)
     runtime.require_verified_payment = bool(require_verified_payment)
     runtime.skip_us_work_auth = bool(skip_us_work_auth)
     runtime.skip_w2_only = bool(skip_w2_only)
     runtime.skip_onsite = bool(skip_onsite)
+    runtime.skip_entry_level = bool(skip_entry_level)
+    try:
+        runtime.job_type_filter = JobTypeFilter(job_type_filter).value
+    except ValueError:
+        runtime.job_type_filter = JobTypeFilter.any.value
+    try:
+        runtime.engagement_filter = EngagementFilter(engagement_filter).value
+    except ValueError:
+        runtime.engagement_filter = EngagementFilter.any.value
+    runtime.blocked_client_countries = blocked_client_countries.strip()
+    runtime.min_client_spend = _opt_int(min_client_spend)
+    runtime.max_connects_cost = _opt_int(max_connects_cost)
     try:
         runtime.min_client_rating = float(min_client_rating) if min_client_rating.strip() else None
     except ValueError:
@@ -1086,14 +1362,21 @@ async def add_rule(
     rule: str = Form(...),
     enforcement_level: str = Form("soft_penalty"),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
 ) -> Response:
+    _ = user
     await learn_preference(category, rule, enforcement_level, db=db)
     apply_runtime_filters(db)
     return RedirectResponse("/preferences", status_code=303)
 
 
 @router.post("/preferences/rules/{rule_id}/toggle")
-def toggle_rule(rule_id: int, db: Session = Depends(get_db)) -> Response:
+def toggle_rule(
+    rule_id: int,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
+) -> Response:
+    _ = user
     row = db.query(PreferenceRule).filter(PreferenceRule.id == rule_id).one_or_none()
     if row is not None:
         row.active = not row.active
@@ -1102,7 +1385,12 @@ def toggle_rule(rule_id: int, db: Session = Depends(get_db)) -> Response:
 
 
 @router.post("/preferences/rules/{rule_id}/delete")
-def delete_rule(rule_id: int, db: Session = Depends(get_db)) -> Response:
+def delete_rule(
+    rule_id: int,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
+) -> Response:
+    _ = user
     row = db.query(PreferenceRule).filter(PreferenceRule.id == rule_id).one_or_none()
     if row is not None:
         db.delete(row)
@@ -1121,7 +1409,9 @@ def save_profile_overlay(
     exclude_keywords: str = Form(""),
     search_queries: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
 ) -> Response:
+    _ = user
     rate = int(hourly_rate) if hourly_rate.strip().isdigit() else None
     overlay = FreelancerProfile(
         name=name.strip(),
@@ -1143,8 +1433,8 @@ def suggest_profile_queries(
     request: Request,
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
 ) -> Response:
-    _user(request)
     try:
         pending = suggest_search_queries(db, settings)
     except Exception:
@@ -1156,11 +1446,11 @@ def suggest_profile_queries(
 
 @router.post("/preferences/search-queries/add")
 def add_suggested_query(
-    request: Request,
     query: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
 ) -> Response:
-    _user(request)
+    _ = user
     overlay = load_overlay(get_settings())
     overlay = accept_search_query(overlay, query)
     save_overlay(overlay)
@@ -1171,19 +1461,22 @@ def add_suggested_query(
 
 @router.post("/preferences/search-queries/dismiss")
 def dismiss_suggested_query(
-    request: Request,
     query: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
 ) -> Response:
-    _user(request)
+    _ = user
     runtime = get_or_create_runtime(db)
     dismiss_search_query(runtime, query)
     return RedirectResponse("/preferences?dismissed=1", status_code=303)
 
 
 @router.get("/portfolio", response_class=HTMLResponse)
-def portfolio_page(request: Request, db: Session = Depends(get_db)) -> Response:
-    user = _user(request)
+def portfolio_page(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.portfolio)),
+) -> Response:
     items = db.query(PortfolioItem).order_by(PortfolioItem.created_at.desc()).all()
     parsed = []
     for item in items:
@@ -1233,7 +1526,9 @@ async def add_portfolio(
     associated_keywords: str = Form(""),
     description: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.portfolio)),
 ) -> Response:
+    _ = user
     stack = [part.strip() for part in tech_stack.split(",") if part.strip()]
     keys = [part.strip() for part in associated_keywords.split(",") if part.strip()]
     await update_portfolio_matrix(
@@ -1248,11 +1543,14 @@ async def add_portfolio(
 
 
 @router.post("/portfolio/sync-upwork")
-async def sync_upwork_portfolio(db: Session = Depends(get_db)) -> Response:
+async def sync_upwork_portfolio(
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.portfolio)),
+) -> Response:
     try:
         await sync_upwork_memory(db)
     except Exception as exc:
-        add_event(db, "upwork", f"Sync failed: {exc}")
+        add_event(db, "upwork", f"Sync failed: {exc}", user_id=user["id"])
     return RedirectResponse("/portfolio", status_code=303)
 
 
@@ -1265,7 +1563,9 @@ async def edit_portfolio(
     associated_keywords: str = Form(""),
     description: str = Form(""),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.portfolio)),
 ) -> Response:
+    _ = user
     stack = [part.strip() for part in tech_stack.split(",") if part.strip()]
     keys = [part.strip() for part in associated_keywords.split(",") if part.strip()]
     await save_agent_item(
@@ -1281,7 +1581,12 @@ async def edit_portfolio(
 
 
 @router.post("/portfolio/{item_id}/delete")
-def delete_portfolio(item_id: int, db: Session = Depends(get_db)) -> Response:
+def delete_portfolio(
+    item_id: int,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.portfolio)),
+) -> Response:
+    _ = user
     row = db.query(PortfolioItem).filter(PortfolioItem.id == item_id).one_or_none()
     if row is not None and row.origin == WorkOrigin.agent.value:
         db.delete(row)
@@ -1348,12 +1653,22 @@ async def _messages_context(
 
 
 @router.get("/messages", response_class=HTMLResponse)
-async def messages_page(request: Request, db: Session = Depends(get_db)) -> Response:
+async def messages_page(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.messages)),
+) -> Response:
+    _ = user
     return render(request, "messages.html", await _messages_context(request, db))
 
 
 @router.post("/messages/sync")
-async def messages_sync(next: str = Form(""), db: Session = Depends(get_db)) -> Response:
+async def messages_sync(
+    next: str = Form(""),
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.messages)),
+) -> Response:
+    _ = user
     dest = _safe_room_next(next)
     mcp = UpworkMcpClient()
     if not await mcp.is_authenticated():
@@ -1370,7 +1685,13 @@ async def messages_sync(next: str = Form(""), db: Session = Depends(get_db)) -> 
 
 
 @router.get("/messages/{room_id}", response_class=HTMLResponse)
-async def message_thread(request: Request, room_id: str, db: Session = Depends(get_db)) -> Response:
+async def message_thread(
+    request: Request,
+    room_id: str,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.messages)),
+) -> Response:
+    _ = user
     exists = db.query(MessageRoom).filter(MessageRoom.room_id == room_id).one_or_none()
     if exists is None:
         return RedirectResponse("/messages", status_code=303)
@@ -1378,7 +1699,12 @@ async def message_thread(request: Request, room_id: str, db: Session = Depends(g
 
 
 @router.post("/messages/{room_id}/suggest")
-async def suggest_reply(room_id: str, db: Session = Depends(get_db)) -> Response:
+async def suggest_reply(
+    room_id: str,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.messages)),
+) -> Response:
+    _ = user
     room = db.query(MessageRoom).filter(MessageRoom.room_id == room_id).one_or_none()
     if room is None:
         return RedirectResponse("/messages", status_code=303)
@@ -1408,6 +1734,7 @@ async def send_reply(
     body: str = Form(""),
     chat_files: list[UploadFile] | None = File(default=None),
     db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.messages)),
 ) -> Response:
     room = db.query(MessageRoom).filter(MessageRoom.room_id == room_id).one_or_none()
     if room is None:
@@ -1440,7 +1767,7 @@ async def send_reply(
             await refresh_room(mcp, db, room)
         except Exception:
             logger.exception("refresh after send failed")
-        add_event(db, "messages", f"sent room={room.room_id} {result[:180]}")
+        add_event(db, "messages", f"sent room={room.room_id} {result[:180]}", user_id=user["id"])
         return RedirectResponse(f"/messages/{room.room_id}?sent=1", status_code=303)
     except Exception as exc:
         detail = format_mcp_error(exc)
@@ -1454,4 +1781,120 @@ async def send_reply(
             return RedirectResponse(f"/messages/{room.room_id}?error=connect", status_code=303)
         logger.exception("send message failed")
         return RedirectResponse(f"/messages/{room.room_id}?error=send", status_code=303)
+
+
+_USER_ERRORS = {
+    "duplicate": "That username is already taken.",
+    "empty": "Username and password are required.",
+    "invalid_role": "Choose Admin or Reviewer.",
+    "last_admin": "Keep at least one active admin.",
+    "owner": "The env bootstrap account stays admin and active.",
+    "missing": "That user is gone.",
+}
+
+
+@router.get("/users", response_class=HTMLResponse)
+def users_page(
+    request: Request,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+    user: SessionUser = Depends(require_permission(Permission.users)),
+) -> Response:
+    rows = db.query(User).order_by(User.created_at.asc()).all()
+    error = request.query_params.get("error") or ""
+    return render(
+        request,
+        "users.html",
+        {
+            "user": user,
+            "counts": _counts(db),
+            "people": [
+                {
+                    "id": row.id,
+                    "username": row.username,
+                    "role": row.role,
+                    "is_active": row.is_active,
+                    "created_at": row.created_at,
+                    "is_owner": is_bootstrap_username(row.username, settings),
+                }
+                for row in rows
+            ],
+            "roles": list(UserRole),
+            "error": _USER_ERRORS.get(error, ""),
+            "created": request.query_params.get("created") or "",
+        },
+    )
+
+
+@router.post("/users")
+def create_user(
+    username: str = Form(""),
+    password: str = Form(""),
+    role: str = Form(UserRole.reviewer.value),
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.users)),
+) -> Response:
+    _ = user
+    try:
+        chosen = UserRole(role)
+    except ValueError:
+        return RedirectResponse("/users?error=invalid_role", status_code=303)
+    try:
+        payload = DashboardUserCreate(username=username, password=password, role=chosen)
+    except ValidationError:
+        return RedirectResponse("/users?error=empty", status_code=303)
+    try:
+        create_dashboard_user(db, payload.username, hash_password(payload.password), payload.role.value)
+    except UserMutationError as exc:
+        return RedirectResponse(f"/users?error={exc.code}", status_code=303)
+    return RedirectResponse("/users?created=1", status_code=303)
+
+
+@router.post("/users/{user_id}/role")
+def change_user_role(
+    user_id: int,
+    role: str = Form(""),
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+    user: SessionUser = Depends(require_permission(Permission.users)),
+) -> Response:
+    _ = user
+    try:
+        set_user_role(db, user_id, role, settings)
+    except UserMutationError as exc:
+        return RedirectResponse(f"/users?error={exc.code}", status_code=303)
+    return RedirectResponse("/users", status_code=303)
+
+
+@router.post("/users/{user_id}/password")
+def change_user_password(
+    user_id: int,
+    password: str = Form(""),
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.users)),
+) -> Response:
+    _ = user
+    if not password.strip():
+        return RedirectResponse("/users?error=empty", status_code=303)
+    try:
+        reset_user_password(db, user_id, hash_password(password.strip()))
+    except UserMutationError as exc:
+        return RedirectResponse(f"/users?error={exc.code}", status_code=303)
+    return RedirectResponse("/users", status_code=303)
+
+
+@router.post("/users/{user_id}/active")
+def change_user_active(
+    user_id: int,
+    active: str = Form(""),
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+    user: SessionUser = Depends(require_permission(Permission.users)),
+) -> Response:
+    _ = user
+    try:
+        set_user_active(db, user_id, active.strip() == "1", settings)
+    except UserMutationError as exc:
+        return RedirectResponse(f"/users?error={exc.code}", status_code=303)
+    return RedirectResponse("/users", status_code=303)
 

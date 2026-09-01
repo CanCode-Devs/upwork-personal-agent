@@ -11,20 +11,38 @@ from app.embeddings import cosine, embed_texts
 from app.models import FreelancerProfile, MilestoneStageConfig, StyleExample, WriterConfig
 from app.proposal_writer import OPENING_HOOK
 
-DEFAULT_LETTER_STRUCTURE = """Opening hook
-Technical hook: 1-2 lines on what you would actually build for THIS job
+DEFAULT_TARGET_WORDS = 150
+
+DEFAULT_LETTER_STRUCTURE = """Technical hook: 1-2 lines on what you would actually build for THIS job
 Hardest part: the risk or engineering effort beyond the job-post happy path
 Solution: 1-3 sentences on the approach
 Relevant work: ONE project from the provided proof. Proof is completed work only. Never cite a job you only applied to. Do not invent contracts, metrics, clients, or employers
 Posting apply items: if job.apply_questions is non-empty, add one labeled section per item AFTER relevant work and BEFORE the offer/CTA
 Offer: a low-risk reason to start talking, only when the job is substantial
-Direct CTA: tell them what to send or do next. If a client timezone and working hours are provided, make availability specific to those. Do not invent hours"""
+Direct CTA: one specific next step. If a client timezone and working hours are provided, make availability specific to those. Do not invent hours. Do not ask them to send files, screenshots, or requirements the posting says are already attached"""
 
-DEFAULT_ROLE_LETTER_STRUCTURE = """Opening hook
-Role read: 1-2 lines showing you understood they are hiring a person for ongoing work, not a one-off build
+DEFAULT_ROLE_LETTER_STRUCTURE = """Role read: 1-2 lines showing you understood they are hiring a person for ongoing work, not a one-off build
 Fit: how you work vs their how-we-work (async, AI-with vs without, with a team)
 Proof: ONE similar seat or platform from the provided proof. Do not invent a delivery plan, architecture, or escrow stages
-Trial/CTA: answer their trial, start date, hours, or links ask. Do not invent hours"""
+Trial/CTA: answer their trial, start date, hours, or links ask. Do not invent hours. Do not ask them to send files or screenshots the posting says are already attached"""
+
+HUMAN_STYLE_RULES = """Write like a human engineer, not a template.
+- Use contractions (I'll, I'd, it's, don't).
+- Vary sentence length. Mix a short sentence with a longer one.
+- Do not use "The hardest part is not X. It is Y" or "It's not X, it's Y".
+- Avoid three-item parallel lists (A, B, and C) more than once.
+- Prefer concrete words over stacked abstractions (do not chain nouns like native Kotlin Android core).
+- At most one short list in the letter.
+- Never start by saying the client will get AI-generated proposals, or that this letter is written manually.
+
+Skill honesty:
+Position the approach only around skills, stacks, and work that appear in the Profile and the ONE provided proof. Never imply expertise the profile does not contain. If the job wants a stack you do not have, say the closest real skill in one sentence and what you would actually do.
+
+Personalization:
+If closed_contracts or client_reviews contain a concrete product or stack, mention it in one sentence. Skip this if nothing specific is there.
+
+Attachments:
+If the posting mentions attached files, screenshots, or questions and job.attachment_text is empty, do not ask the client to send them. Answer from the posting text you can see."""
 
 DEFAULT_NEVER_SAY = """excited to apply
 would love to work
@@ -74,6 +92,7 @@ Never put escrow milestones, numbered delivery stages, or dollar amounts for sta
 If job.attachment_text is present, use those requirements in the technical hook. Do not quote long passages.
 If job.client_first_name is provided, you may use it in the CTA. Never invent a name.
 Never paste the client's job description back at them.
+If job.attachment_text is empty and the posting mentions attachments or screenshots, do not ask the client to send them.
 Separate every section with a blank line. The cover_letter MUST contain real paragraph breaks (newline + newline). Never return a single wall of text.
 No em dashes. No decorative quotation marks around ordinary phrases."""
 
@@ -88,7 +107,7 @@ def default_writer_config() -> WriterConfig:
         must_include="",
         never_say=DEFAULT_NEVER_SAY,
         extra_instructions="",
-        target_words=None,
+        target_words=DEFAULT_TARGET_WORDS,
         milestone_instructions=DEFAULT_MILESTONE_INSTRUCTIONS,
         milestone_stages=list(DEFAULT_MILESTONE_STAGES),
         milestone_min=3,
@@ -96,6 +115,7 @@ def default_writer_config() -> WriterConfig:
         screening_instructions=DEFAULT_SCREENING_INSTRUCTIONS,
         apply_questions_instructions=DEFAULT_APPLY_INSTRUCTIONS,
         example_count=2,
+        critique_rounds=1,
     )
 
 
@@ -131,7 +151,7 @@ def row_to_config(row: ProposalSettings) -> WriterConfig:
         must_include=row.must_include or "",
         never_say=row.never_say or "",
         extra_instructions=row.extra_instructions or "",
-        target_words=row.target_words,
+        target_words=row.target_words or DEFAULT_TARGET_WORDS,
         milestone_instructions=row.milestone_instructions or DEFAULT_MILESTONE_INSTRUCTIONS,
         milestone_stages=parse_milestone_stages(row.milestone_stages),
         milestone_min=row.milestone_min or 3,
@@ -139,6 +159,7 @@ def row_to_config(row: ProposalSettings) -> WriterConfig:
         screening_instructions=row.screening_instructions or DEFAULT_SCREENING_INSTRUCTIONS,
         apply_questions_instructions=row.apply_questions_instructions or DEFAULT_APPLY_INSTRUCTIONS,
         example_count=max(0, row.example_count or 0),
+        critique_rounds=max(0, row.critique_rounds if row.critique_rounds is not None else 1),
     )
 
 
@@ -159,6 +180,50 @@ def apply_config_to_row(row: ProposalSettings, config: WriterConfig) -> None:
     row.screening_instructions = config.screening_instructions
     row.apply_questions_instructions = config.apply_questions_instructions
     row.example_count = config.example_count
+    row.critique_rounds = max(0, config.critique_rounds)
+
+
+_AI_HOOK_MARKERS = ("ai-generated proposal", "ai generated proposal")
+
+
+def _looks_like_ai_hook(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _AI_HOOK_MARKERS)
+
+
+def _normalize_structure_text(text: str) -> str:
+    cleaned = (text or "").replace("\r\n", "\n").strip()
+    lines = cleaned.split("\n")
+    if lines and lines[0].strip() == "Opening hook":
+        cleaned = "\n".join(lines[1:]).strip()
+    cleaned = cleaned.replace(
+        "Direct CTA: tell them what to send or do next.",
+        "Direct CTA: one specific next step. Do not ask them to send files, screenshots, or requirements the posting says are already attached.",
+    )
+    return cleaned
+
+
+def _normalize_writer_row(row: ProposalSettings) -> bool:
+    changed = False
+    if _looks_like_ai_hook(row.opening_hook or ""):
+        row.opening_hook = ""
+        row.enforce_opening_hook = False
+        changed = True
+    letter = _normalize_structure_text(row.letter_structure or "")
+    if letter != (row.letter_structure or "").replace("\r\n", "\n").strip():
+        row.letter_structure = letter or DEFAULT_LETTER_STRUCTURE
+        changed = True
+    elif not letter:
+        row.letter_structure = DEFAULT_LETTER_STRUCTURE
+        changed = True
+    role = _normalize_structure_text(row.role_letter_structure or "")
+    if role != (row.role_letter_structure or "").replace("\r\n", "\n").strip():
+        row.role_letter_structure = role or DEFAULT_ROLE_LETTER_STRUCTURE
+        changed = True
+    elif not (row.role_letter_structure or "").strip():
+        row.role_letter_structure = DEFAULT_ROLE_LETTER_STRUCTURE
+        changed = True
+    return changed
 
 
 def get_or_create_proposal_settings(db: Session) -> ProposalSettings:
@@ -168,8 +233,8 @@ def get_or_create_proposal_settings(db: Session) -> ProposalSettings:
         apply_config_to_row(row, default_writer_config())
         db.add(row)
         db.flush()
-    elif not (row.role_letter_structure or "").strip():
-        row.role_letter_structure = DEFAULT_ROLE_LETTER_STRUCTURE
+        return row
+    if _normalize_writer_row(row):
         db.flush()
     return row
 
@@ -285,8 +350,15 @@ def build_system_prompt(
         parts.extend(["", "Screening questions:", config.screening_instructions.strip()])
     if config.milestone_instructions.strip() and not role_hire:
         parts.extend(["", "Milestones:", config.milestone_instructions.strip()])
-    if config.target_words:
-        parts.extend(["", f"Aim for about {config.target_words} words in the cover letter."])
+    target = config.target_words or DEFAULT_TARGET_WORDS
+    parts.extend(
+        [
+            "",
+            f"Aim for about {target} words in the letter body, excluding labeled apply-item answers.",
+            "",
+            HUMAN_STYLE_RULES,
+        ]
+    )
     rules = [item.strip() for item in (style_rules or []) if item.strip()]
     if rules:
         parts.extend(["", "Proposal style rules from Settings:"])

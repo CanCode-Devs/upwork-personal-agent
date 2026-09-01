@@ -10,24 +10,50 @@
     <script src="https://unpkg.com/htmx.org@2.0.4"></script>
     {% block extra_head %}{% endblock %}
 </head>
-<body class="{% block body_class %}{% endblock %}">
+<body class="{% block body_class %}{% endblock %}{% if poll is defined and poll.polling %} is-polling{% endif %}">
   <div class="shell">
     <aside class="rail">
-      <form id="poll-form" class="poll-form" action="/poll" method="post">
-        <button id="poll-btn" class="poll-now" type="submit">Poll now</button>
-        <p id="poll-status" class="poll-status" hidden>Searching Upwork for new jobs…</p>
-      </form>
+      <div id="poll-widget" class="poll-form" data-polling="{{ '1' if poll is defined and poll.polling else '0' }}" data-next="{{ poll.next_poll_at if poll is defined and poll.next_poll_at else '' }}">
+        {% if can is defined and can.poll %}
+        <form id="poll-form" action="/poll" method="post">
+          <button id="poll-btn" class="poll-now" type="submit"{% if poll is defined and poll.polling %} disabled aria-busy="true"{% endif %}>
+            {% if poll is defined and poll.polling %}
+            <span class="poll-spinner" aria-hidden="true"></span> Polling…
+            {% else %}
+            Poll now
+            {% endif %}
+          </button>
+        </form>
+        {% endif %}
+        <p id="poll-status" class="poll-status"{% if poll is not defined or not poll.polling %} hidden{% endif %}>Searching Upwork for new jobs…</p>
+        <p id="next-poll" class="next-poll"{% if poll is defined and poll.polling %} hidden{% endif %}>
+          <span class="next-poll-label">Next poll</span>
+          <time id="next-poll-at" datetime="{{ poll.next_poll_at if poll is defined and poll.next_poll_at else '' }}"></time>
+          <span id="next-poll-in"></span>
+        </p>
+      </div>
       <div class="brand">
         {{ app_name }}
         <span>{{ app_tagline }}</span>
       </div>
       <nav>
         <a href="/?status=pending_review" class="{% if request.url.path == '/' %}active{% endif %}">Inbox</a>
+        {% if can is defined and can.messages %}
         <a href="/messages" class="{% if request.url.path.startswith('/messages') %}active{% endif %}">Messages</a>
+        {% endif %}
+        {% if can is defined and can.portfolio %}
         <a href="/portfolio" class="{% if request.url.path.startswith('/portfolio') %}active{% endif %}">Portfolio</a>
+        {% endif %}
+        {% if can is defined and can.writer %}
         <a href="/proposal" class="{% if request.url.path.startswith('/proposal') %}active{% endif %}">Proposal</a>
+        {% endif %}
+        {% if can is defined and can.settings %}
         <a href="/preferences" class="{% if request.url.path.startswith('/preferences') or request.url.path.startswith('/settings') %}active{% endif %}">Settings</a>
+        {% endif %}
         <a href="/history" class="{% if request.url.path == '/history' %}active{% endif %}">History</a>
+        {% if can is defined and can.users %}
+        <a href="/users" class="{% if request.url.path.startswith('/users') %}active{% endif %}">Users</a>
+        {% endif %}
         <form action="/logout" method="post">
           <button class="btn ghost" type="submit">Log out</button>
         </form>
@@ -41,8 +67,8 @@
         <div>Rejected <b>{{ counts.rejected }}</b></div>
       </div>
       {% endif %}
-      {% if user is defined %}
-      <div class="user">{{ user.username }}</div>
+      {% if user is defined and user %}
+      <div class="user">{{ user.username }}<span class="role">{{ user.role }}</span></div>
       {% endif %}
     </aside>
     <section class="main">
@@ -51,19 +77,137 @@
   </div>
   <script>
   (function () {
+    const widget = document.getElementById("poll-widget");
     const form = document.getElementById("poll-form");
     const btn = document.getElementById("poll-btn");
     const status = document.getElementById("poll-status");
-    if (!form || !btn) return;
-    form.addEventListener("submit", function () {
-      if (btn.classList.contains("is-polling")) return;
-      btn.classList.add("is-polling");
-      btn.disabled = true;
-      btn.setAttribute("aria-busy", "true");
-      btn.innerHTML = '<span class="poll-spinner" aria-hidden="true"></span> Polling…';
-      if (status) status.hidden = false;
-      document.body.classList.add("is-polling");
-    });
+    const nextEl = document.getElementById("next-poll");
+    const nextAt = document.getElementById("next-poll-at");
+    const nextIn = document.getElementById("next-poll-in");
+    if (!widget) return;
+
+    let nextIso = widget.getAttribute("data-next") || "";
+    let polling = widget.getAttribute("data-polling") === "1";
+    let userTriggered = false;
+    let wasPolling = polling;
+
+    function pad(n) {
+      return String(n).padStart(2, "0");
+    }
+
+    function formatClock(iso) {
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return "";
+      return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    }
+
+    function formatRemaining(ms) {
+      const total = Math.max(0, Math.ceil(ms / 1000));
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      if (h > 0) return "in " + h + "h " + m + "m";
+      if (m > 0) return "in " + m + "m " + pad(s) + "s";
+      return "in " + s + "s";
+    }
+
+    function applyPolling(on) {
+      polling = on;
+      document.body.classList.toggle("is-polling", on);
+      if (status) status.hidden = !on;
+      if (nextEl) nextEl.hidden = on;
+      if (!btn) return;
+      if (on) {
+        btn.classList.add("is-polling");
+        btn.disabled = true;
+        btn.setAttribute("aria-busy", "true");
+        btn.innerHTML = '<span class="poll-spinner" aria-hidden="true"></span> Polling…';
+      } else {
+        btn.classList.remove("is-polling");
+        btn.disabled = false;
+        btn.removeAttribute("aria-busy");
+        btn.textContent = "Poll now";
+      }
+    }
+
+    function renderCountdown() {
+      if (!nextAt || !nextIn) return;
+      if (!nextIso) {
+        nextAt.removeAttribute("datetime");
+        nextAt.textContent = "soon";
+        nextIn.textContent = "";
+        return;
+      }
+      const d = new Date(nextIso);
+      if (Number.isNaN(d.getTime())) {
+        nextAt.textContent = "";
+        nextIn.textContent = "";
+        return;
+      }
+      nextAt.setAttribute("datetime", nextIso);
+      nextAt.textContent = formatClock(nextIso) || "soon";
+      const ms = d.getTime() - Date.now();
+      nextIn.textContent = ms <= 0 ? "now" : formatRemaining(ms);
+    }
+
+    async function readJson(res) {
+      const ctype = res.headers.get("content-type") || "";
+      if (!res.ok || !ctype.includes("application/json")) return null;
+      return res.json();
+    }
+
+    function applySnapshot(data) {
+      if (!data) return;
+      const nowPolling = Boolean(data.polling);
+      nextIso = data.next_poll_at || "";
+      widget.setAttribute("data-next", nextIso);
+      widget.setAttribute("data-polling", nowPolling ? "1" : "0");
+      if (nowPolling !== polling) applyPolling(nowPolling);
+      renderCountdown();
+      if (wasPolling && !nowPolling && userTriggered) {
+        userTriggered = false;
+        const path = window.location.pathname;
+        if (path === "/" || path === "/messages") {
+          window.location.reload();
+        }
+      }
+      wasPolling = nowPolling;
+    }
+
+    async function refreshStatus() {
+      try {
+        const res = await fetch("/poll/status", {
+          headers: { Accept: "application/json" },
+          credentials: "same-origin",
+        });
+        applySnapshot(await readJson(res));
+      } catch (err) {}
+    }
+
+    if (form && btn) {
+      form.addEventListener("submit", async function (event) {
+        event.preventDefault();
+        if (polling || btn.classList.contains("is-polling")) return;
+        userTriggered = true;
+        applyPolling(true);
+        try {
+          const res = await fetch(form.action, {
+            method: "POST",
+            headers: { Accept: "application/json" },
+            credentials: "same-origin",
+          });
+          applySnapshot(await readJson(res));
+        } catch (err) {
+          userTriggered = false;
+          applyPolling(false);
+        }
+      });
+    }
+
+    applyPolling(polling);
+    renderCountdown();
+    setInterval(renderCountdown, 1000);
+    setInterval(refreshStatus, 2000);
   })();
   </script>
 </body>

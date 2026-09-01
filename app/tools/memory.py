@@ -22,6 +22,7 @@ from app.models import (
 )
 from app.tools import register_tool
 from app.events import add_event
+from app.style_learning import schedule_style_learning
 
 
 def _session(db: Session | None) -> tuple[Session, bool]:
@@ -285,6 +286,8 @@ async def log_interaction_feedback(
                 )
         if own:
             session.commit()
+        if job is not None:
+            schedule_style_learning(job.id, args.outcome.value, args.client_notes)
         return {
             "id": row.id,
             "job_id": job.id if job else None,

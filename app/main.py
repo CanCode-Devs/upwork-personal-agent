@@ -15,8 +15,9 @@ from app.auth import SessionMiddleware, bootstrap_user, is_public_path
 from app.config import get_settings
 from app.db.session import SessionLocal, init_db
 from app.profile import ensure_profile_file
+from app.rbac import ForbiddenError
 from app.runtime import get_or_create_runtime
-from app.web.routes import router
+from app.web.routes import render, router
 from app.worker import poll_loop
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -66,6 +67,10 @@ def create_app() -> FastAPI:
     app.add_middleware(SessionMiddleware, settings=settings)
     app.mount("/static", StaticFiles(directory="app/web/static"), name="static")
     app.include_router(router)
+
+    @app.exception_handler(ForbiddenError)
+    async def forbidden_handler(request: Request, _exc: ForbiddenError) -> Response:
+        return render(request, "forbidden.html", status_code=403)
 
     @app.get("/health")
     def health() -> JSONResponse:

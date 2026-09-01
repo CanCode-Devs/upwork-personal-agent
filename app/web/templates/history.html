@@ -11,7 +11,8 @@
 <table>
   <thead>
     <tr>
-      <th>Score</th>
+      <th>Rel</th>
+      <th>Client</th>
       <th>Job</th>
       <th>Status</th>
       <th>Updated</th>
@@ -21,6 +22,7 @@
     {% for job in jobs %}
     <tr>
       <td class="score">{{ job.score if job.score is not none else "—" }}</td>
+      <td class="score">{{ job.client_score if job.client_score is not none else "—" }}</td>
       <td class="title"><a href="/jobs/{{ job.id }}">{{ job.title }}</a></td>
       <td><span class="badge {{ job.status }}">{{ job.status }}</span></td>
       <td>{{ job.updated_at|dt }}</td>

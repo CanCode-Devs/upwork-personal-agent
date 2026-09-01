@@ -10,10 +10,10 @@ from sqlalchemy.orm import Session, selectinload
 from app.config import Settings, get_settings
 from app.db.models import Job, PortfolioItem, Proposal
 from app.db.session import SessionLocal
-from app.embeddings import cosine, embed_texts, query_similar
+from app.embeddings import add_embedding, catalog_prefix, cosine, embed_texts, portfolio_blob, query_similar
 from app.engagement import classify_engagement
 from app.events import add_event
-from app.llm import llm_draft, llm_screening_answers
+from app.llm import llm_critique, llm_draft, llm_pick_proof, llm_screening_answers
 from app.milestones import (
     align_milestone_total,
     coerce_milestones,
@@ -25,6 +25,7 @@ from app.milestones import (
 from app.models import (
     ApplyHighlight,
     ContextMatch,
+    CritiqueResult,
     DraftResult,
     EmbeddingSource,
     FunnelStatus,
@@ -32,6 +33,7 @@ from app.models import (
     HighlightPicks,
     JobStatus,
     PitchTone,
+    ProofCandidate,
     ProposalMilestone,
     ScreeningAnswer,
     SubmitProposalArgs,
@@ -40,8 +42,22 @@ from app.models import (
     WorkKind,
 )
 from app.profile import load_overlay, load_profile
-from app.proposal_settings import build_system_prompt, load_proposal_settings, select_examples, style_rules_for_prompt
-from app.proposal_writer import dump_apply, dump_screening, finalize_letter, load_apply, load_screening
+from app.proposal_settings import (
+    DEFAULT_TARGET_WORDS,
+    build_system_prompt,
+    load_proposal_settings,
+    select_examples,
+    style_rules_for_prompt,
+)
+from app.proposal_writer import (
+    dump_apply,
+    dump_critique,
+    dump_screening,
+    extract_apply_questions,
+    finalize_letter,
+    load_apply,
+    load_screening,
+)
 from app.tools import register_tool
 from app.tools.discovery import settings_block_reasons_for_job
 from app.upwork.mcp_client import UpworkMcpClient, already_applied, format_mcp_error
@@ -251,24 +267,93 @@ def _proof_origin_label(item: PortfolioItem) -> str:
     return "portfolio project"
 
 
-def _pick_proof(session: Session, matches: list[ContextMatch]) -> tuple[str, PortfolioItem | None]:
-    ranked: list[tuple[ContextMatch, PortfolioItem]] = []
-    for match in matches:
-        if match.source_type != EmbeddingSource.portfolio.value:
-            continue
-        item = session.query(PortfolioItem).filter(PortfolioItem.id == match.source_id).one_or_none()
-        if item is None or item.kind not in _PROOF_KINDS:
-            continue
-        ranked.append((match, item))
-    if not ranked:
-        return "", None
+def _keywords_text(item: PortfolioItem) -> str:
+    raw = (item.associated_keywords or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if isinstance(parsed, list):
+        return ", ".join(str(part).strip() for part in parsed if str(part).strip())
+    return raw
+
+
+def _proof_items(session: Session) -> list[PortfolioItem]:
+    return (
+        session.query(PortfolioItem)
+        .filter(PortfolioItem.kind.in_(_PROOF_KINDS))
+        .order_by(PortfolioItem.id.asc())
+        .all()
+    )
+
+
+def _fallback_item(items: list[PortfolioItem], scores: dict[int, float]) -> PortfolioItem:
+    scored = [item for item in items if item.id in scores]
+    pool = scored or items
+    ranked = sorted(pool, key=lambda item: scores.get(item.id, 0.0), reverse=True)
     preferred = [
-        pair for pair in ranked if pair[1].kind == WorkKind.job_history.value and not _is_employment(pair[1])
+        item for item in ranked if item.kind == WorkKind.job_history.value and not _is_employment(item)
     ]
-    chosen, item = (preferred or ranked)[0]
-    label = chosen.title or item.project_title or "relevant work"
+    return (preferred or ranked)[0]
+
+
+def _proof_line(item: PortfolioItem) -> str:
     origin = _proof_origin_label(item)
-    return f"[{origin}] {label}: {chosen.text[:1200]}", item
+    return f"[{origin}] {item.project_title}: {portfolio_blob(item)[:1200]}"
+
+
+def _pick_proof(
+    items: list[PortfolioItem],
+    matches: list[ContextMatch],
+    job_title: str,
+    job_description: str,
+    settings: Settings,
+    catalog: str,
+) -> tuple[str, PortfolioItem | None, str]:
+    if not items:
+        return "", None, ""
+    scores = {
+        match.source_id: match.score
+        for match in matches
+        if match.source_type == EmbeddingSource.portfolio.value
+    }
+    by_id = {item.id: item for item in items}
+    candidates: list[ProofCandidate] = [
+        {
+            "id": item.id,
+            "score": scores.get(item.id, 0.0),
+            "kind": item.kind,
+            "origin": _proof_origin_label(item),
+            "title": item.project_title,
+            "keywords": _keywords_text(item),
+            "blob": "",
+        }
+        for item in items
+    ]
+    pick = None
+    try:
+        pick = llm_pick_proof(
+            job_title,
+            job_description,
+            candidates,
+            settings,
+            catalog_prefix=catalog,
+        )
+    except Exception:
+        logger.exception("llm_pick_proof failed")
+    if pick is not None and pick.portfolio_item_id in by_id:
+        item = by_id[pick.portfolio_item_id]
+        return _proof_line(item), item, (pick.reason or "").strip()
+    if pick is not None:
+        logger.warning("llm_pick_proof returned unknown id %s", pick.portfolio_item_id)
+    item = _fallback_item(items, scores)
+    return (
+        _proof_line(item),
+        item,
+        "MiniLM fallback: nearest neighbor or completed Upwork contract.",
+    )
 
 
 def rank_highlights(
@@ -390,8 +475,22 @@ async def generate_tailored_pitch(
             details = {}
         attachment_text = str(details.get("attachment_text") or "") if isinstance(details, dict) else ""
         blob = f"{job.title}\n{job.description}\n{attachment_text}"
-        matches = query_similar(session, blob, top_k=8, source_type=EmbeddingSource.portfolio.value)
-        proof_text, proof_item = _pick_proof(session, matches)
+        items = _proof_items(session)
+        catalog = catalog_prefix(items)
+        matches = query_similar(
+            session,
+            blob,
+            top_k=max(8, len(items)),
+            source_type=EmbeddingSource.portfolio.value,
+        )
+        proof_text, proof_item, pick_reason = _pick_proof(
+            items,
+            matches,
+            job.title or "",
+            job.description or "",
+            settings,
+            catalog,
+        )
         payload = _job_payload(job)
         bid = bid_amount_for_job(job, profile.hourly_rate)
         need_plan = job_needs_milestones(job, bid)
@@ -399,34 +498,71 @@ async def generate_tailored_pitch(
         engagement = classify_engagement(job.title or "", job.description or "", job.job_type or "")
         system_prompt = build_system_prompt(writer, profile, style_rules_for_prompt(session), engagement=engagement)
         stage_payload = [item.model_dump() for item in writer.milestone_stages]
-        drafted = llm_draft(
-            payload,
-            profile,
-            settings,
-            proof=proof_text,
-            tone=args.tone.value,
-            focus_points=args.focus_points,
-            milestones_budget=bid if need_plan else None,
-            system_prompt=system_prompt,
-            style_examples=style_examples,
-            milestone_min=writer.milestone_min,
-            milestone_max=writer.milestone_max,
-            apply_questions_instructions=writer.apply_questions_instructions,
-            screening_instructions=writer.screening_instructions,
-            opening_hook=writer.opening_hook,
-            enforce_hook=writer.enforce_opening_hook,
-        )
-        if need_plan:
-            planned = coerce_milestones([item.model_dump() for item in drafted.milestones], bid) or heuristic_milestones(
-                job, bid, stage_payload
+
+        def run_draft(focus: list[str]) -> DraftResult:
+            result = llm_draft(
+                payload,
+                profile,
+                settings,
+                proof=proof_text,
+                tone=args.tone.value,
+                focus_points=focus,
+                milestones_budget=bid if need_plan else None,
+                system_prompt=system_prompt,
+                style_examples=style_examples,
+                milestone_min=writer.milestone_min,
+                milestone_max=writer.milestone_max,
+                apply_questions_instructions=writer.apply_questions_instructions,
+                screening_instructions=writer.screening_instructions,
+                opening_hook=writer.opening_hook,
+                enforce_hook=writer.enforce_opening_hook,
+                catalog_prefix=catalog,
+                proof_id=proof_item.id if proof_item else None,
             )
-            drafted.milestones = planned
-        drafted.cover_letter = finalize_letter(
-            drafted.cover_letter,
-            hook=writer.opening_hook,
-            enforce=writer.enforce_opening_hook,
-        )
-        drafted.matched_context = [proof_text] if proof_text else []
+            if need_plan:
+                planned = coerce_milestones([item.model_dump() for item in result.milestones], bid) or heuristic_milestones(
+                    job, bid, stage_payload
+                )
+                result.milestones = planned
+            result.cover_letter = finalize_letter(
+                result.cover_letter,
+                hook=writer.opening_hook,
+                enforce=writer.enforce_opening_hook,
+            )
+            return result
+
+        drafted = run_draft(list(args.focus_points))
+        critique = CritiqueResult(passed=True, issues=[], rounds=0)
+        rounds = max(0, writer.critique_rounds)
+        target_words = writer.target_words or DEFAULT_TARGET_WORDS
+        apply_items = extract_apply_questions(job.description or "")
+        for round_index in range(rounds):
+            try:
+                critique = llm_critique(
+                    drafted.cover_letter,
+                    payload,
+                    profile,
+                    settings,
+                    target_words=target_words,
+                    apply_questions=apply_items,
+                    catalog_prefix=catalog,
+                )
+            except Exception:
+                logger.exception("critique failed for job %s", job.id)
+                critique = CritiqueResult(passed=True, issues=[], rounds=round_index + 1)
+                break
+            critique.rounds = round_index + 1
+            if critique.passed:
+                break
+            focus = list(args.focus_points) + critique.issues
+            drafted = run_draft(focus)
+        drafted.critique = critique
+        matched: list[str] = []
+        if proof_text:
+            matched.append(proof_text)
+        if pick_reason:
+            matched.append(f"Picker: {pick_reason}")
+        drafted.matched_context = matched
         portfolio_ids: list[str] = []
         certificate_ids: list[str] = []
         job_ids: list[str] = []
@@ -465,6 +601,7 @@ async def generate_tailored_pitch(
                     questions,
                     screening_instructions=writer.screening_instructions,
                     proof=proof_text,
+                    catalog_prefix=catalog,
                 )
         drafted.screening_answers = screening
         drafted.portfolio_project_ids = portfolio_ids
@@ -472,23 +609,27 @@ async def generate_tailored_pitch(
         drafted.job_history_ids = job_ids
         drafted.profile_history_ids = profile_ids
         proposal = _latest_proposal(job)
+        existing_apply = load_apply(proposal)
         if proposal is None:
             proposal = Proposal(job_id=job.id, draft_text=drafted.cover_letter, edited_text=drafted.cover_letter)
             session.add(proposal)
         else:
             proposal.draft_text = drafted.cover_letter
             proposal.edited_text = drafted.cover_letter
+        apply_payload: dict[str, object] = {
+            "portfolio_project_ids": portfolio_ids,
+            "certificate_ids": certificate_ids,
+            "job_history_ids": job_ids,
+            "profile_history_ids": profile_ids,
+            "proof": proof_text[:300],
+        }
+        stored_quote = existing_apply.get("charged_amount")
+        if isinstance(stored_quote, (int, float)) and float(stored_quote) > 0:
+            apply_payload["charged_amount"] = stored_quote
         proposal.milestones_json = dump_milestones(drafted.milestones)
         proposal.screening_json = dump_screening(drafted.screening_answers)
-        proposal.apply_json = dump_apply(
-            {
-                "portfolio_project_ids": portfolio_ids,
-                "certificate_ids": certificate_ids,
-                "job_history_ids": job_ids,
-                "profile_history_ids": profile_ids,
-                "proof": proof_text[:300],
-            }
-        )
+        proposal.apply_json = dump_apply(apply_payload)
+        proposal.critique_json = dump_critique(critique)
         job.matched_context = json.dumps(drafted.matched_context)
         session.flush()
         add_event(
@@ -520,8 +661,19 @@ _FUNNEL_TO_JOB = {
 }
 
 
+def heal_applied_status(job: Job) -> bool:
+    if job.applied_on_upwork and job.status == JobStatus.submit_failed.value:
+        job.status = JobStatus.submitted.value
+        return True
+    return False
+
+
+def job_is_fixed(job: Job) -> bool:
+    return (job.job_type or "").lower() in {"fixed", "fixed_price"}
+
+
 def bid_amount_for_job(job: Job, hourly_rate: int | None) -> float:
-    if (job.job_type or "").lower() in {"fixed", "fixed_price"}:
+    if job_is_fixed(job):
         try:
             data = json.loads(job.client_json or "{}")
         except json.JSONDecodeError:
@@ -542,6 +694,14 @@ def bid_amount_for_job(job: Job, hourly_rate: int | None) -> float:
     if hourly_rate:
         return float(hourly_rate)
     return 50.0
+
+
+def quote_amount_for_job(job: Job, hourly_rate: int | None, stored: float | None) -> float:
+    if job_is_fixed(job):
+        return bid_amount_for_job(job, hourly_rate)
+    if stored is not None and stored > 0:
+        return float(stored)
+    return bid_amount_for_job(job, hourly_rate)
 
 
 async def track_application_funnel(
@@ -671,21 +831,26 @@ async def submit_proposal(
                         **apply_payload,
                         "portfolio_project_ids": portfolio_ids,
                         "certificate_ids": cert_ids,
+                        "charged_amount": bid,
                     }
                 )
             note = "Already on Upwork" if already_applied(result) or result == "already_applied" else f"{result[:1500]} bid={bid:g}"
             add_event(session, "submitted", note, job.id)
-            add_embedding(session, EmbeddingSource.job, job.id, f"{job.title}\n{job.description}")
-            if proposal is not None:
-                add_embedding(session, EmbeddingSource.proposal, proposal.id, letter)
+            try:
+                add_embedding(session, EmbeddingSource.job, job.id, f"{job.title}\n{job.description}")
+                if proposal is not None:
+                    add_embedding(session, EmbeddingSource.proposal, proposal.id, letter)
+            except Exception:
+                logger.exception("embedding after submit failed for job %s", job.id)
+                add_event(session, "submitted", "Proposal sent; local embedding index failed", job.id)
             if own:
                 session.commit()
             return {"status": job.status, "result": result}
         except Exception as exc:
             detail = format_mcp_error(exc)
-            if already_applied(detail):
-                job.status = JobStatus.submitted.value
+            if already_applied(detail) or job.applied_on_upwork:
                 job.applied_on_upwork = True
+                job.status = JobStatus.submitted.value
                 add_event(session, "submitted", "Already applied on Upwork", job.id)
                 if own:
                     session.commit()

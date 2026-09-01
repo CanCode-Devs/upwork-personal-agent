@@ -43,6 +43,8 @@ class JobCard(TypedDict):
     title: str
     score: int | None
     score_reason: str
+    client_score: int | None
+    client_score_reason: str
     price_label: str
     timezone: str
     location: str
@@ -352,6 +354,8 @@ def job_card(job: Job, applied_status: str = "") -> JobCard:
         "title": job.title,
         "score": job.score,
         "score_reason": job.score_reason or "",
+        "client_score": job.client_score,
+        "client_score_reason": job.client_score_reason or "",
         "price_label": job.price_label or job.budget or "—",
         "timezone": timezone or "—",
         "location": location,
@@ -388,6 +392,8 @@ def application_card(row: UpworkApplication) -> JobCard:
         "title": row.title or "Untitled application",
         "score": None,
         "score_reason": "",
+        "client_score": None,
+        "client_score_reason": "",
         "price_label": row.rate or "Applied",
         "timezone": "—",
         "location": "",

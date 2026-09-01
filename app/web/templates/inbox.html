@@ -14,13 +14,21 @@
 {% if mcp and mcp.stale %}
 <div class="banner">
   Upwork login expired, so polls cannot search. Sign in again on this machine.
+  {% if can.upwork_connect %}
   <a class="btn" href="/upwork/connect?force=1" target="_blank" rel="noopener noreferrer">Connect Upwork</a>
+  {% else %}
+  Ask an admin to connect Upwork.
+  {% endif %}
   {% if mcp.error %}<div class="sub">{{ mcp.error }}</div>{% endif %}
 </div>
 {% elif mcp and not mcp.connected %}
 <div class="banner">
   Upwork is not connected, so polls skip. Sign in with Upwork on this machine.
+  {% if can.upwork_connect %}
   <a class="btn" href="/upwork/connect" target="_blank" rel="noopener noreferrer">Connect Upwork</a>
+  {% else %}
+  Ask an admin to connect Upwork.
+  {% endif %}
   {% if oauth_detail %}<div class="sub">{{ oauth_detail }}</div>{% endif %}
 </div>
 {% elif mcp and mcp.connected and oauth != 'ok' %}
@@ -59,7 +67,16 @@
       {% for job in jobs %}
       <details class="job-card">
         <summary>
-          <span class="score">{{ job.score if job.score is not none else "—" }}</span>
+          <span class="score-stack">
+            <span class="score-pair">
+              <span class="score-label">Rel</span>
+              <span class="score">{{ job.score if job.score is not none else "—" }}</span>
+            </span>
+            <span class="score-pair">
+              <span class="score-label">Client</span>
+              <span class="score score-client">{{ job.client_score if job.client_score is not none else "—" }}</span>
+            </span>
+          </span>
           <span class="job-summary-main">
             {% if job.local %}
             <a href="/jobs/{{ job.id }}" onclick="event.stopPropagation()">{{ job.title }}</a>
@@ -78,7 +95,10 @@
         </summary>
         <div class="job-expand">
           {% if job.score_reason %}
-          <p class="job-reason">{{ job.score_reason }}</p>
+          <p class="job-reason">Relevance: {{ job.score_reason }}</p>
+          {% endif %}
+          {% if job.client_score_reason %}
+          <p class="job-reason">Client: {{ job.client_score_reason }}</p>
           {% endif %}
           <div class="facts">
             {% for fact in job.facts %}
@@ -144,7 +164,7 @@
     {% for event in events %}
     <div class="event">
       <time>{{ event.created_at|dt }}</time>
-      {{ event.kind }} — {{ event.message }}
+        {{ event.kind }}{% if event.user %} · {{ event.user.username }}{% endif %} — {{ event.message }}
     </div>
     {% else %}
     <div class="event">No events yet.</div>

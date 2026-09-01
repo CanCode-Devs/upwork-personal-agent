@@ -80,7 +80,7 @@
       {% elif error == 'first' %}
       <div class="banner compact">The client has to message first on a proposal thread.</div>
       {% elif error == 'connect' %}
-      <div class="banner compact">Upwork login expired. <a class="btn" href="/upwork/connect?force=1">Connect Upwork</a></div>
+      <div class="banner compact">Upwork login expired.{% if can.upwork_connect %} <a class="btn" href="/upwork/connect?force=1">Connect Upwork</a>{% else %} Ask an admin to connect Upwork.{% endif %}</div>
       {% elif error == 'empty' %}
       <div class="banner compact">Add a message or a file.</div>
       {% elif error == 'long' %}
@@ -131,7 +131,11 @@
     <div class="chat-empty">
       {% if error == 'connect' or not connected %}
       <p>Connect Upwork to load chats.</p>
+      {% if can.upwork_connect %}
       <a class="btn" href="/upwork/connect">Connect Upwork</a>
+      {% else %}
+      <span>Ask an admin to connect Upwork.</span>
+      {% endif %}
       {% elif error == 'sync' %}
       <p>Could not refresh chats. Try again or check History.</p>
       {% elif synced %}
