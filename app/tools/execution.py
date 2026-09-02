@@ -91,6 +91,15 @@ def _latest_proposal(job: Job) -> Proposal | None:
     return sorted(job.proposals, key=lambda item: item.id)[-1]
 
 
+def _load_latest_proposal(session: Session, job_id: int) -> Proposal | None:
+    return (
+        session.query(Proposal)
+        .filter(Proposal.job_id == job_id)
+        .order_by(Proposal.id.desc())
+        .first()
+    )
+
+
 def _job_payload(job: Job) -> dict[str, str]:
     return {
         "id": job.upwork_id,
@@ -608,14 +617,20 @@ async def generate_tailored_pitch(
         drafted.certificate_ids = certificate_ids
         drafted.job_history_ids = job_ids
         drafted.profile_history_ids = profile_ids
-        proposal = _latest_proposal(job)
+        job = _find_job(session, args.job_id)
+        if job is None:
+            raise ValueError(f"Unknown job {args.job_id}")
+        letter = drafted.cover_letter.strip()
+        if not letter:
+            raise ValueError("Draft model returned an empty cover letter")
+        proposal = _load_latest_proposal(session, job.id)
         existing_apply = load_apply(proposal)
         if proposal is None:
-            proposal = Proposal(job_id=job.id, draft_text=drafted.cover_letter, edited_text=drafted.cover_letter)
+            proposal = Proposal(job_id=job.id, draft_text=letter, edited_text=letter)
             session.add(proposal)
         else:
-            proposal.draft_text = drafted.cover_letter
-            proposal.edited_text = drafted.cover_letter
+            proposal.draft_text = letter
+            proposal.edited_text = letter
         apply_payload: dict[str, object] = {
             "portfolio_project_ids": portfolio_ids,
             "certificate_ids": certificate_ids,
@@ -632,6 +647,9 @@ async def generate_tailored_pitch(
         proposal.critique_json = dump_critique(critique)
         job.matched_context = json.dumps(drafted.matched_context)
         session.flush()
+        saved = _load_latest_proposal(session, job.id)
+        if saved is None or not (saved.draft_text or saved.edited_text or "").strip():
+            raise RuntimeError("Cover letter draft was not saved")
         add_event(
             session,
             "drafted",

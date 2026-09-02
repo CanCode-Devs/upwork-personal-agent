@@ -748,6 +748,7 @@ async def regenerate_job(
     if comments.strip():
         note += f": {comments.strip()[:240]}"
     add_event(db, "regenerated" if had_draft else "drafted", note, job.id, user_id=user["id"])
+    db.commit()
     return RedirectResponse(f"/jobs/{job.id}?{flag}=1", status_code=303)
 
 
