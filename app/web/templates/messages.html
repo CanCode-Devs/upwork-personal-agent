@@ -2,6 +2,7 @@
 {% block title %}{% if room %}{{ room.counterpart or room.title }} · Messages{% else %}Messages · {{ app_name }}{% endif %}{% endblock %}
 {% block body_class %}chat-mode{% endblock %}
 {% block content %}
+<div id="live-main">
 <div class="chat">
   <aside class="chat-list">
     <div class="chat-list-head">
@@ -220,4 +221,5 @@
   });
 })();
 </script>
+</div>
 {% endblock %}

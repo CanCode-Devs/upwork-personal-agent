@@ -59,7 +59,7 @@
         </form>
       </nav>
       {% if counts is defined %}
-      <div class="counts">
+      <div id="live-counts" class="counts">
         <div>Pending <b>{{ counts.pending_review }}</b></div>
         <div>Applied <b>{{ counts.applied }}</b></div>
         <div>Submitted <b>{{ counts.submitted }}</b></div>
@@ -75,6 +75,7 @@
       {% block content %}{% endblock %}
     </section>
   </div>
+  <div id="poll-toast" class="poll-toast" hidden role="status"></div>
   <script>
   (function () {
     const widget = document.getElementById("poll-widget");
@@ -90,6 +91,8 @@
     let polling = widget.getAttribute("data-polling") === "1";
     let userTriggered = false;
     let wasPolling = polling;
+    let refreshing = false;
+    let toastTimer = 0;
 
     function pad(n) {
       return String(n).padStart(2, "0");
@@ -156,6 +159,96 @@
       return res.json();
     }
 
+    function jobWord(n) {
+      return n === 1 ? "job" : "jobs";
+    }
+
+    function toastMessage(found, updated) {
+      const n = Number(found) || 0;
+      const u = Number(updated) || 0;
+      if (n === 0 && u === 0) return "No new jobs";
+      return n + " " + jobWord(n) + " found, " + u + " " + jobWord(u) + " updated";
+    }
+
+    function showToast(text) {
+      const el = document.getElementById("poll-toast");
+      if (!el) return;
+      el.textContent = text;
+      el.hidden = false;
+      el.classList.add("is-on");
+      window.clearTimeout(toastTimer);
+      toastTimer = window.setTimeout(function () {
+        el.classList.remove("is-on");
+        el.hidden = true;
+      }, 4000);
+    }
+
+    function captureLiveState() {
+      const openIds = Array.from(document.querySelectorAll("details.job-card[open]"))
+        .map(function (el) { return el.getAttribute("data-job-id"); })
+        .filter(Boolean);
+      const scrolls = {};
+      [".main", ".chat-list-scroll", "#chat-transcript"].forEach(function (sel) {
+        const el = document.querySelector(sel);
+        if (el) scrolls[sel] = el.scrollTop;
+      });
+      return { openIds: openIds, scrolls: scrolls };
+    }
+
+    function restoreLiveState(state) {
+      const open = new Set(state.openIds || []);
+      document.querySelectorAll("details.job-card").forEach(function (card) {
+        const id = card.getAttribute("data-job-id");
+        if (id && open.has(id)) card.open = true;
+      });
+      Object.keys(state.scrolls || {}).forEach(function (sel) {
+        const el = document.querySelector(sel);
+        if (el) el.scrollTop = state.scrolls[sel];
+      });
+    }
+
+    function extractById(html, id) {
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      const el = doc.getElementById(id);
+      return el ? el.outerHTML : "";
+    }
+
+    function swapRegion(id, html) {
+      const current = document.getElementById(id);
+      const next = extractById(html, id);
+      if (!current || !next) return;
+      if (window.htmx && typeof window.htmx.swap === "function") {
+        window.htmx.swap(current, next, { swapStyle: "outerHTML" });
+        return;
+      }
+      current.outerHTML = next;
+    }
+
+    async function softRefresh() {
+      if (refreshing) return;
+      const path = window.location.pathname;
+      const onInbox = path === "/";
+      const onMessages = path === "/messages" || path.startsWith("/messages/");
+      if (!onInbox && !onMessages) return;
+      if (!document.getElementById("live-main") && !document.getElementById("live-counts")) return;
+      refreshing = true;
+      const state = captureLiveState();
+      try {
+        const res = await fetch(path + window.location.search, {
+          credentials: "same-origin",
+          headers: { Accept: "text/html" },
+        });
+        if (!res.ok) return;
+        const html = await res.text();
+        swapRegion("live-main", html);
+        swapRegion("live-counts", html);
+        restoreLiveState(state);
+      } catch (err) {
+      } finally {
+        refreshing = false;
+      }
+    }
+
     function applySnapshot(data) {
       if (!data) return;
       const nowPolling = Boolean(data.polling);
@@ -164,12 +257,10 @@
       widget.setAttribute("data-polling", nowPolling ? "1" : "0");
       if (nowPolling !== polling) applyPolling(nowPolling);
       renderCountdown();
-      if (wasPolling && !nowPolling && userTriggered) {
+      if (wasPolling && !nowPolling) {
         userTriggered = false;
-        const path = window.location.pathname;
-        if (path === "/" || path === "/messages") {
-          window.location.reload();
-        }
+        showToast(toastMessage(data.last_new, data.last_updated));
+        softRefresh();
       }
       wasPolling = nowPolling;
     }
@@ -190,6 +281,7 @@
         if (polling || btn.classList.contains("is-polling")) return;
         userTriggered = true;
         applyPolling(true);
+        wasPolling = true;
         try {
           const res = await fetch(form.action, {
             method: "POST",

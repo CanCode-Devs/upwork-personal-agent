@@ -35,6 +35,7 @@ def create_engine_from_settings(settings: Settings | None = None) -> Engine:
             cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA busy_timeout=30000")
             cursor.close()
 
     return engine

@@ -445,4 +445,11 @@ def sort_job_cards(cards: list[JobCard], sort: InboxSort) -> list[JobCard]:
             return (score if score >= 0 else 10_000, when(card))
 
         return sorted(cards, key=low_key)
+    if sort == InboxSort.proposals_low:
+        def proposals_key(card: JobCard) -> tuple[int, datetime]:
+            count = card.get("proposal_count")
+            proposals = count if isinstance(count, int) else 10_000
+            return (proposals, when(card))
+
+        return sorted(cards, key=proposals_key)
     return sorted(cards, key=when, reverse=True)

@@ -26,6 +26,8 @@ class PollScheduler:
         self._started_at: datetime | None = None
         self._last_finished_at: datetime | None = None
         self._next_poll_at: datetime | None = None
+        self._last_new = 0
+        self._last_updated = 0
         self._interval = 15 * 60
 
     def configure(self, interval_seconds: int) -> None:
@@ -54,6 +56,8 @@ class PollScheduler:
             last_finished_at=self._last_finished_at,
             started_at=self._started_at,
             interval_seconds=self._interval,
+            last_new=self._last_new,
+            last_updated=self._last_updated,
         )
 
     async def trigger(self, settings: Settings | None = None) -> None:
@@ -104,8 +108,12 @@ class PollScheduler:
             self._pending_source = ""
             self._started_at = _utc_now()
             self._next_poll_at = None
+            self._last_new = 0
+            self._last_updated = 0
             try:
-                await run_agent_cycle(settings)
+                counts = await run_agent_cycle(settings)
+                self._last_new = int(counts.get("new", 0))
+                self._last_updated = int(counts.get("activity_refreshed", 0))
             except Exception:
                 logger.exception("Poll cycle failed")
             finally:
