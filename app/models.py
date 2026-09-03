@@ -20,6 +20,7 @@ class InboxSort(StrEnum):
     oldest = "oldest"
     score = "score"
     score_low = "score_low"
+    proposals_low = "proposals_low"
 
 
 class FunnelStatus(StrEnum):
@@ -624,6 +625,8 @@ class PollStatus(TypedDict):
     last_finished_at: str | None
     started_at: str | None
     interval_seconds: int
+    last_new: int
+    last_updated: int
 
 
 class PollStatusView(BaseModel):
@@ -633,6 +636,8 @@ class PollStatusView(BaseModel):
     last_finished_at: datetime | None = None
     started_at: datetime | None = None
     interval_seconds: int
+    last_new: int = 0
+    last_updated: int = 0
 
 
 class McpStatus(TypedDict):

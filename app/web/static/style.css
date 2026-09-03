@@ -137,6 +137,24 @@ nav a.active, nav a:hover { background: #2a241d; text-decoration: none; }
 .counts { font-size: 0.85rem; color: var(--muted); display: grid; gap: 6px; }
 .counts b { color: var(--paper); font-weight: 600; }
 
+.poll-toast {
+  position: fixed;
+  right: 28px;
+  bottom: 24px;
+  z-index: 40;
+  max-width: 360px;
+  padding: 12px 16px;
+  border: 1px solid var(--line);
+  background: #241c14;
+  color: #b7d7c2;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 160ms ease;
+}
+.poll-toast.is-on { opacity: 1; }
+
 .main { padding: 28px 36px 48px; }
 .top {
   display: flex;
@@ -412,6 +430,7 @@ input.compact { width: 10rem; padding: 6px 8px; }
 
 body.chat-mode .shell { height: 100vh; min-height: 100vh; }
 body.chat-mode .main { padding: 0; overflow: hidden; display: flex; flex-direction: column; min-height: 0; }
+body.chat-mode #live-main { flex: 1; min-height: 0; display: flex; flex-direction: column; height: 100%; }
 body.chat-mode .rail { overflow: auto; }
 .chat {
   display: grid;
@@ -639,4 +658,5 @@ body.chat-mode .rail { overflow: auto; }
   .connects-stats { grid-template-columns: 1fr; }
   .milestone-head, .milestone-row { grid-template-columns: 1fr; }
   .chat { grid-template-columns: 1fr; grid-template-rows: 220px 1fr; }
+  .poll-toast { right: 16px; left: 16px; bottom: 16px; max-width: none; }
 }

@@ -35,6 +35,7 @@
 <div class="banner ok">Upwork MCP token on disk. Polling is active.</div>
 {% endif %}
 
+<div id="live-main">
 <div class="inbox-toolbar">
 <div class="filters">
   {% for key, label in [
@@ -65,7 +66,7 @@
     {% if jobs %}
     <div class="job-list">
       {% for job in jobs %}
-      <details class="job-card">
+      <details class="job-card" data-job-id="{{ job.id if job.local else job.url }}">
         <summary>
           <span class="score-stack">
             <span class="score-pair">
@@ -170,5 +171,6 @@
     <div class="event">No events yet.</div>
     {% endfor %}
   </aside>
+</div>
 </div>
 {% endblock %}

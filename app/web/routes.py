@@ -183,6 +183,7 @@ INBOX_SORTS: tuple[tuple[InboxSort, str], ...] = (
     (InboxSort.score, "Score"),
     (InboxSort.oldest, "Oldest"),
     (InboxSort.score_low, "Score (low)"),
+    (InboxSort.proposals_low, "Proposals (low)"),
 )
 
 
