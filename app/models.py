@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, TypedDict
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class JobStatus(StrEnum):
@@ -607,6 +609,26 @@ class DashboardUserCreate(BaseModel):
         if not text:
             raise ValueError("required")
         return text
+
+
+class SetupCreate(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=256)
+    password_confirm: str = Field(min_length=1, max_length=256)
+
+    @field_validator("username", "password", "password_confirm")
+    @classmethod
+    def strip_setup(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("required")
+        return text
+
+    @model_validator(mode="after")
+    def passwords_match(self) -> SetupCreate:
+        if self.password != self.password_confirm:
+            raise ValueError("mismatch")
+        return self
 
 
 class InboxCounts(TypedDict):

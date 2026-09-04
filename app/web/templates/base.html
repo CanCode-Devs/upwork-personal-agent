@@ -4,9 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}{{ app_name }}{% endblock %}</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@500&display=swap">
-    <link rel="stylesheet" href="/static/style.css?v={{ asset_v }}">
+  {% include "brand_meta.html" %}
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_v }}">
     <script src="https://unpkg.com/htmx.org@2.0.4"></script>
     {% block extra_head %}{% endblock %}
 </head>
@@ -33,8 +32,12 @@
         </p>
       </div>
       <div class="brand">
-        {{ app_name }}
-        <span>{{ app_tagline }}</span>
+        <a class="studio-mark" href="{{ studio_url|default('https://cancodedevs.com') }}" target="_blank" rel="noopener noreferrer" aria-label="{{ studio_name|default('CanCode Devs') }}">
+          <img src="/static/logo-mark.png" alt="" width="32" height="32">
+          <span class="studio-name">CanCode <em>Devs</em></span>
+        </a>
+        <div class="product-name">{{ app_name }}</div>
+        <span class="product-tagline">{{ app_tagline }}</span>
       </div>
       <nav>
         <a href="/?status=pending_review" class="{% if request.url.path == '/' %}active{% endif %}">Inbox</a>
@@ -48,6 +51,7 @@
         <a href="/proposal" class="{% if request.url.path.startswith('/proposal') %}active{% endif %}">Proposal</a>
         {% endif %}
         {% if can is defined and can.settings %}
+        <a href="/config" class="{% if request.url.path.startswith('/config') %}active{% endif %}">Config</a>
         <a href="/preferences" class="{% if request.url.path.startswith('/preferences') or request.url.path.startswith('/settings') %}active{% endif %}">Settings</a>
         {% endif %}
         <a href="/history" class="{% if request.url.path == '/history' %}active{% endif %}">History</a>
@@ -70,8 +74,22 @@
       {% if user is defined and user %}
       <div class="user">{{ user.username }}<span class="role">{{ user.role }}</span></div>
       {% endif %}
+      <p class="studio-foot">
+        <a href="{{ studio_url|default('https://cancodedevs.com') }}" target="_blank" rel="noopener noreferrer">{{ studio_name|default('CanCode Devs') }}</a>
+        <span>{{ studio_slogan|default('Ideas compile. Products ship.') }}</span>
+      </p>
     </aside>
     <section class="main">
+      {% if openai_key_missing is defined and openai_key_missing and not request.url.path.startswith('/config') %}
+      <div class="banner">
+        OpenAI API key is not set. Drafting, scoring, and suggestions need it.
+        {% if can is defined and can.settings %}
+        <a class="btn" href="/config">Add on Config</a>
+        {% else %}
+        Ask an admin to add it on Config.
+        {% endif %}
+      </div>
+      {% endif %}
       {% block content %}{% endblock %}
     </section>
   </div>

@@ -18,8 +18,18 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session, selectinload
 
 from app.actions import approve_and_submit, cover_letter_for, latest_proposal, reject_job, save_edit, save_hourly_quote
-from app.auth import COOKIE_NAME, create_session_value, current_user, hash_password, verify_password
-from app.config import Settings, get_settings
+from app.auth import COOKIE_NAME, create_session_value, current_user, hash_password, needs_setup, user_count, verify_password
+from app.config import STUDIO_NAME, STUDIO_SLOGAN, STUDIO_URL, Settings, get_settings
+from app.env_store import (
+    SecretWrite,
+    VariablesWrite,
+    config_page_view,
+    delete_secret,
+    persist_and_reload,
+    save_secret,
+    save_variables,
+    set_owner_username,
+)
 from app.models import (
     ApplyHighlight,
     ConnectsPanel,
@@ -36,6 +46,7 @@ from app.models import (
     PitchTone,
     ScreeningAnswer,
     SessionUser,
+    SetupCreate,
     UserRole,
     WorkKind,
     WorkOrigin,
@@ -148,10 +159,14 @@ def render(request: Request, name: str, context: dict | None = None, status_code
     user = payload.get("user") or current_user(request)
     payload.setdefault("app_name", settings.app_name)
     payload.setdefault("app_tagline", settings.app_tagline)
+    payload.setdefault("studio_name", STUDIO_NAME)
+    payload.setdefault("studio_url", STUDIO_URL)
+    payload.setdefault("studio_slogan", STUDIO_SLOGAN)
     payload.setdefault("asset_v", str(int(_STYLE_PATH.stat().st_mtime)) if _STYLE_PATH.exists() else "1")
     payload.setdefault("user", user)
     payload.setdefault("can", flags_for(user))
     payload.setdefault("poll", poll_status_payload())
+    payload.setdefault("openai_key_missing", not bool((settings.openai_api_key or "").strip()))
     return templates.TemplateResponse(request, name, payload, status_code=status_code)
 
 
@@ -223,8 +238,29 @@ def _user(request: Request) -> SessionUser:
     return user
 
 
+def _session_redirect(settings: Settings, username: str, url: str) -> Response:
+    response = RedirectResponse(url, status_code=303)
+    response.set_cookie(
+        COOKIE_NAME,
+        create_session_value(settings, username),
+        httponly=True,
+        samesite="lax",
+        max_age=60 * 60 * 24 * 14,
+    )
+    return response
+
+
+def _setup_error_message(exc: ValidationError) -> str:
+    for item in exc.errors():
+        if "mismatch" in str(item.get("msg", "")):
+            return "Passwords do not match."
+    return "Username and password are required."
+
+
 @router.get("/login", response_class=HTMLResponse)
 def login_page(request: Request, error: str | None = None) -> Response:
+    if needs_setup():
+        return RedirectResponse("/setup", status_code=303)
     if current_user(request) is not None:
         return RedirectResponse("/", status_code=303)
     return render(request, "login.html", {"error": error})
@@ -238,6 +274,8 @@ def login_submit(
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> Response:
+    if needs_setup():
+        return RedirectResponse("/setup", status_code=303)
     user = db.query(User).filter(User.username == username).one_or_none()
     if user is None or not user.is_active or not verify_password(password, user.password_hash):
         return render(
@@ -246,15 +284,47 @@ def login_submit(
             {"error": "Invalid username or password"},
             status_code=401,
         )
-    response = RedirectResponse("/", status_code=303)
-    response.set_cookie(
-        COOKIE_NAME,
-        create_session_value(settings, user.username),
-        httponly=True,
-        samesite="lax",
-        max_age=60 * 60 * 24 * 14,
-    )
-    return response
+    return _session_redirect(settings, user.username, "/")
+
+
+@router.get("/setup", response_class=HTMLResponse)
+def setup_page(request: Request, db: Session = Depends(get_db)) -> Response:
+    if user_count(db) > 0:
+        return RedirectResponse("/login", status_code=303)
+    return render(request, "setup.html", {"error": ""})
+
+
+@router.post("/setup")
+def setup_submit(
+    request: Request,
+    username: str = Form(""),
+    password: str = Form(""),
+    password_confirm: str = Form(""),
+    db: Session = Depends(get_db),
+) -> Response:
+    if user_count(db) > 0:
+        return RedirectResponse("/login", status_code=303)
+    try:
+        payload = SetupCreate(username=username, password=password, password_confirm=password_confirm)
+    except ValidationError as exc:
+        return render(
+            request,
+            "setup.html",
+            {"error": _setup_error_message(exc)},
+            status_code=400,
+        )
+    try:
+        create_dashboard_user(db, payload.username, hash_password(payload.password), UserRole.admin.value)
+    except UserMutationError:
+        return render(
+            request,
+            "setup.html",
+            {"error": "Could not create that account. Try a different username."},
+            status_code=400,
+        )
+    set_owner_username(db, payload.username)
+    settings = persist_and_reload(db)
+    return _session_redirect(settings, payload.username, "/config")
 
 
 @router.post("/logout")
@@ -1016,6 +1086,92 @@ async def job_outcome(
 def settings_alias(user: SessionUser = Depends(require_permission(Permission.settings))) -> Response:
     _ = user
     return RedirectResponse("/preferences", status_code=303)
+
+
+@router.get("/config", response_class=HTMLResponse)
+def config_page(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
+) -> Response:
+    saved = request.query_params.get("saved") or ""
+    error = request.query_params.get("error") or ""
+    return render(
+        request,
+        "config.html",
+        {
+            "user": user,
+            "page": config_page_view(settings),
+            "saved": saved,
+            "error": error,
+        },
+    )
+
+
+@router.post("/config/secrets/{key}")
+def config_save_secret(
+    key: str,
+    value: str = Form(""),
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
+) -> Response:
+    _ = user
+    try:
+        payload = SecretWrite(key=key, value=value)
+    except ValidationError:
+        return RedirectResponse("/config?error=secret", status_code=303)
+    save_secret(db, payload)
+    persist_and_reload(db)
+    return RedirectResponse("/config?saved=secret", status_code=303)
+
+
+@router.post("/config/secrets/{key}/delete")
+def config_delete_secret(
+    key: str,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
+) -> Response:
+    _ = user
+    try:
+        delete_secret(db, key)
+    except ValueError:
+        return RedirectResponse("/config?error=secret", status_code=303)
+    persist_and_reload(db)
+    return RedirectResponse("/config?saved=deleted", status_code=303)
+
+
+@router.post("/config/variables")
+def config_save_variables(
+    openai_base_url: str = Form(""),
+    openai_model: str = Form(""),
+    openai_draft_model: str = Form(""),
+    app_name: str = Form(""),
+    app_tagline: str = Form(""),
+    poll_interval_minutes: str = Form(""),
+    approval_ttl_hours: str = Form(""),
+    embedding_model: str = Form(""),
+    upwork_mcp_url: str = Form(""),
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
+) -> Response:
+    _ = user
+    try:
+        payload = VariablesWrite(
+            openai_base_url=openai_base_url,
+            openai_model=openai_model,
+            openai_draft_model=openai_draft_model,
+            app_name=app_name,
+            app_tagline=app_tagline,
+            poll_interval_minutes=int(poll_interval_minutes),
+            approval_ttl_hours=int(approval_ttl_hours),
+            embedding_model=embedding_model,
+            upwork_mcp_url=upwork_mcp_url,
+        )
+    except (ValidationError, ValueError):
+        return RedirectResponse("/config?error=variables", status_code=303)
+    save_variables(db, payload)
+    persist_and_reload(db)
+    return RedirectResponse("/config?saved=vars", status_code=303)
 
 
 def _opt_int(value: str) -> int | None:
@@ -1790,7 +1946,7 @@ _USER_ERRORS = {
     "empty": "Username and password are required.",
     "invalid_role": "Choose Admin or Reviewer.",
     "last_admin": "Keep at least one active admin.",
-    "owner": "The env bootstrap account stays admin and active.",
+    "owner": "The owner account stays admin and active.",
     "missing": "That user is gone.",
 }
 

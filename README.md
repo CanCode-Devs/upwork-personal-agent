@@ -6,7 +6,7 @@ Upwork treats freelancer accounts as personal. This app uses **one OAuth login**
 
 It is not a cloud SaaS and not an auto-apply bot unless you turn that on. You run it with Docker on your machine. Tokens, letters, and examples stay in `./data/` on disk.
 
-Built by [CanCode Devs](https://github.com/CanCode-Devs). [MIT License](LICENSE).
+Built by [CanCode Devs](https://cancodedevs.com). [MIT License](LICENSE).
 
 ## What you get
 
@@ -25,7 +25,7 @@ Built by [CanCode Devs](https://github.com/CanCode-Devs). [MIT License](LICENSE)
 - Polls score only. They do not call the writer
 
 **Drafting**
-- Open a scored job and click **Write proposal** when you want a letter (larger model: `OPENAI_DRAFT_MODEL`)
+- Open a scored job and click **Write proposal** when you want a letter (larger model: draft model on **Config**, default `gpt-4o`)
 - Cover letter, Upwork screening answers, posting “please include” items, and escrow milestones for fixed-price jobs
 - Highlights capped at the closest real work (not invented case studies)
 - **Proposal** page: hook, **project** vs **role hire** letter structures, never-say list, milestone template, few-shot examples, and **self-critique rounds** (0 skips the auto-review; 1 drafts, grades, and rewrites once if it fails)
@@ -51,25 +51,23 @@ The dashboard binds to `127.0.0.1:8000` by default. Keep it local; it can spend 
 ```bash
 git clone https://github.com/CanCode-Devs/upwork-personal-agent.git
 cd upwork-personal-agent
-cp .env.example .env
-# Set OPENAI_API_KEY, DASHBOARD_USERNAME, DASHBOARD_PASSWORD, and SESSION_SECRET in .env
-# Change DASHBOARD_PASSWORD from change-me; SESSION_SECRET must be a long random string
 mkdir -p data/huggingface profiles
-cp profiles/example.yaml profiles/default.yaml
-# Edit profiles/default.yaml: your name, skills, search queries
 docker compose up --build
 ```
 
+If your Compose version is older than 2.24 and it complains about a missing `.env`, run `touch .env` and start again.
+
 If `profiles/default.yaml` is missing, the app copies `profiles/example.yaml` on boot. First start downloads `all-MiniLM-L6-v2` into `./data/huggingface`. Later starts reuse that folder.
 
-Open [http://127.0.0.1:8000](http://127.0.0.1:8000) and sign in as the bootstrap **Admin** (`DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` from `.env`; defaults: `admin` / `change-me`). That account is created on every start. Extra operators are added later on **Users** (see [Admin and access control](#admin-and-access-control)).
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000). The first visit creates the owner **Admin**. Then **Config** — paste your OpenAI API key (it cannot be viewed after save). Extra operators are added later on **Users** (see [Admin and access control](#admin-and-access-control)).
 
 Then:
 
-1. **Settings** — budget floors, exclude keywords, autonomy
-2. **Proposal** — opening hook, letter structure, never-say list, optional style examples
-3. **Connect Upwork** from the inbox
-4. **Users** (optional) — add a Reviewer if someone else will draft and submit from this machine
+1. **Config** — API key, models, poll interval (required details that used to live in `.env`)
+2. **Settings** — budget floors, exclude keywords, autonomy, profile text
+3. **Proposal** — opening hook, letter structure, never-say list, optional style examples
+4. **Connect Upwork** from the inbox
+5. **Users** (optional) — add a Reviewer if someone else will draft and submit from this machine
 
 ### Upwork login (once)
 
@@ -89,11 +87,12 @@ docker compose exec app python -m app.cli.redraft_pending
 
 ## Configuration
 
-Copy `.env.example` to `.env` and set at least `OPENAI_API_KEY`, `DASHBOARD_PASSWORD`, and `SESSION_SECRET`. `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` create the owner Admin (see [Admin and access control](#admin-and-access-control)).
+`.env` is optional. Copy `.env.example` to `.env` only if you want file-based overrides. The **Config** page owns the OpenAI key, models, poll interval, and related values after first boot. `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` still auto-create the owner Admin when the password is not `change-me` (see [Admin and access control](#admin-and-access-control)).
 
 | Layer | Owns | When it applies |
 |-------|------|-----------------|
-| `.env` | OpenAI (`OPENAI_MODEL` for chat and query suggestions, `OPENAI_DRAFT_MODEL` for letters; optional `OPENAI_BASE_URL` for compatible APIs), poll interval, dashboard login, `PROFILE_PATH`, `APP_NAME` / `APP_TAGLINE`, `SEED_DEMO_PORTFOLIO`, `EMBEDDING_MODEL` | Always |
+| **Config page** | OpenAI API key (write-only), `OPENAI_MODEL` for chat and query suggestions, `OPENAI_DRAFT_MODEL` for letters, optional `OPENAI_BASE_URL`, poll interval, approval window, `APP_NAME` / `APP_TAGLINE`, `EMBEDDING_MODEL`, Upwork MCP URL | After you save in the UI. Seeded from `.env` on first boot |
+| `.env` | Optional overrides for Config keys, dashboard login bootstrap, `PROFILE_PATH`, `SEED_DEMO_PORTFOLIO`, bind host, database path | Seeds Config and Settings; infrastructure pins in Compose still apply |
 | `.env` → SQLite (once) | Scoring floors (`min_score`, `min_client_score`, rate floors), autonomy | Seeded on first boot; **Settings** owns them after that |
 | `profiles/default.yaml` | Name, title, rate, skills, search queries, exclude keywords, voice | Identity and search. Voice reaches the writer |
 | **Proposal page** | Hook, tone, project vs role structure, critique rounds, must/never lists, extra instructions, milestones, screening, few-shot examples | Every new draft or **Regenerate**. Stored in `./data/` |
@@ -124,10 +123,11 @@ Polls never write or submit a letter. Use **Write proposal** then **Approve & su
 2. Open a job, click **Write proposal** if you want to apply, fill unproven answers and the hourly quote if asked, edit, **Regenerate** if needed, then **Approve & submit**, or **Reject** with a reason
 3. Polls update the outcome log from proposal status and messages. On applied jobs, add an outcome note so scoring and style learning get extra context
 4. Settings: autonomy, rate floors, eligibility and search skips (job type, engagement, countries, Connects, US work auth / W-2 / on-site / entry-level), **Suggest search queries**
-5. Proposal: voice, project vs role structure, critique rounds, and examples for the next draft
-6. **Portfolio**: **Sync from Upwork** for imported history; add agent notes for off-platform work the writer can retrieve
-7. **History** lists submitted, rejected, failed, and expired jobs
-8. **Poll now** runs a discovery cycle immediately (score only; no letters)
+5. Config: API key, models, poll interval if you need to change them
+6. Proposal: voice, project vs role structure, critique rounds, and examples for the next draft
+7. **Portfolio**: **Sync from Upwork** for imported history; add agent notes for off-platform work the writer can retrieve
+8. **History** lists submitted, rejected, failed, and expired jobs
+9. **Poll now** runs a discovery cycle immediately (score only; no letters)
 
 Keep the machine awake; Compose uses `restart: unless-stopped`.
 
@@ -137,11 +137,11 @@ One Upwork freelancer account, one OAuth token, one Connects balance. Dashboard 
 
 ### Bootstrap the owner Admin
 
-1. In `.env`, set `DASHBOARD_USERNAME`, `DASHBOARD_PASSWORD`, and `SESSION_SECRET` **before** the first `docker compose up`. Do not leave `DASHBOARD_PASSWORD=change-me`.
-2. On every start the app creates that username as **Admin** if it is missing, or re-applies Admin + active and syncs the password from `.env` if the hash differs.
-3. Sign in at [http://127.0.0.1:8000](http://127.0.0.1:8000) with those credentials. This env account is the **owner**: you cannot demote or deactivate it from **Users**.
+1. Start the app and open [http://127.0.0.1:8000](http://127.0.0.1:8000). If there are no users yet, **setup** asks for a username and password and creates the owner Admin.
+2. Optional: set `DASHBOARD_USERNAME` and a non-default `DASHBOARD_PASSWORD` in `.env` before the first start. The app then creates that owner instead of showing setup, and re-applies Admin + active and syncs that password on later starts if the hash differs.
+3. `SESSION_SECRET` is optional. If it is missing or still the example value, the app writes a random secret to `./data/session_secret`.
 
-Extra operators are stored in SQLite (`./data/app.db`), not in `.env`. Changing `DASHBOARD_USERNAME` later creates a second owner Admin; it does not rename the old one.
+This account is the **owner**: you cannot demote or deactivate it from **Users**. Extra operators are stored in SQLite (`./data/app.db`). Changing `DASHBOARD_USERNAME` later creates a second owner Admin; it does not rename the old one.
 
 ### Add operators (Users page)
 
@@ -155,8 +155,8 @@ You cannot demote or deactivate the last remaining Admin. Deactivated users cann
 
 | Role | Can | Cannot |
 |------|-----|--------|
-| **Admin** | Inbox, History, Messages, write/edit/submit drafts, Poll now, Settings, Proposal writer, Portfolio, Connect Upwork, Users | — |
-| **Reviewer** | Inbox, History, Messages, write/edit drafts, **Approve & submit**, reject, Poll now | Settings, Proposal page, Portfolio, Connect Upwork, Users |
+| **Admin** | Inbox, History, Messages, write/edit/submit drafts, Poll now, Config, Settings, Proposal writer, Portfolio, Connect Upwork, Users | — |
+| **Reviewer** | Inbox, History, Messages, write/edit drafts, **Approve & submit**, reject, Poll now | Config, Settings, Proposal page, Portfolio, Connect Upwork, Users |
 
 The job log records which dashboard user edited, approved, or sent. Everyone shares `./data/upwork_oauth.json`. Keep the UI off the public internet.
 
@@ -166,7 +166,7 @@ The job log records which dashboard user edited, approved, or sent. Everyone sha
 - `app/agent.py` — poll orchestrator
 - `app/tools/` — memory, discovery, execution
 - `app/embeddings.py` — local vector store (sentence-transformers)
-- `app/web` — dashboard (Inbox, Messages, Portfolio, Proposal, Settings, History, Users)
+- `app/web` — dashboard (Inbox, Messages, Portfolio, Proposal, Config, Settings, History, Users)
 - `profiles/example.yaml` — generic starter profile (committed)
 - `profiles/default.yaml` — your profile (gitignored; copy from example)
 - `profiles/scoring.example.yaml` — scoring matrix template
@@ -181,11 +181,11 @@ The `warmup` service exits immediately if `.all-minilm-l6-v2.ready` exists in th
 
 ## Security
 
-Do not commit `.env`, `profiles/default.yaml`, `./data/` (includes Proposal examples and OAuth tokens). Approving a proposal spends Connects on **your** Upwork account. Dashboard seats share that token; do not expose this UI on the public internet. Prefer `manual` until you trust scoring and drafts. Leave `SEED_DEMO_PORTFOLIO=false` unless you want the bundled demo case studies.
+Do not commit `.env`, `profiles/default.yaml`, `./data/` (includes Proposal examples, OAuth tokens, the session secret, and Config secrets). Approving a proposal spends Connects on **your** Upwork account. Dashboard seats share that token; do not expose this UI on the public internet. Prefer `manual` until you trust scoring and drafts. Leave `SEED_DEMO_PORTFOLIO=false` unless you want the bundled demo case studies.
 
 ## Future plans
 
-These are not in the current release. Chat replies and search-query suggestions use `OPENAI_MODEL` (default `gpt-4o-mini`). Cover letters use `OPENAI_DRAFT_MODEL` (default `gpt-4o`). Embeddings use a local Hugging Face MiniLM model.
+These are not in the current release. Chat replies and search-query suggestions use the chat model on **Config** (default `gpt-4o-mini`). Cover letters use the draft model (default `gpt-4o`). Embeddings use a local Hugging Face MiniLM model.
 
 - **Multiple LLM providers**, including local runtimes such as [vLLM](https://docs.vllm.ai/) and [Ollama](https://ollama.com/), plus other hosted APIs — pick a provider per environment without rewriting the writer
 - **Multiple embedding backends**: Hugging Face models, OpenAI embeddings, and other APIs, so scoring and example matching are not tied to one MiniLM checkpoint

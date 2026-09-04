@@ -11,9 +11,10 @@ from starlette.middleware.base import BaseHTTPMiddleware
 import app.tools.discovery  # noqa: F401
 import app.tools.execution  # noqa: F401
 import app.tools.memory  # noqa: F401
-from app.auth import SessionMiddleware, bootstrap_user, is_public_path
-from app.config import get_settings
+from app.auth import SessionMiddleware, bootstrap_user, is_public_path, needs_setup
+from app.config import Settings, enable_store_overlay, get_settings, reload_settings
 from app.db.session import SessionLocal, init_db
+from app.env_store import seed_from_env
 from app.profile import ensure_profile_file
 from app.rbac import ForbiddenError
 from app.runtime import get_or_create_runtime
@@ -25,17 +26,30 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 class AuthGateMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
-        if is_public_path(request.url.path):
+        path = request.url.path
+        if is_public_path(path):
+            if path == "/login" and needs_setup():
+                return RedirectResponse("/setup", status_code=303)
             return await call_next(request)
         if getattr(request.state, "username", None):
             return await call_next(request)
+        if needs_setup():
+            return RedirectResponse("/setup", status_code=303)
         return RedirectResponse("/login", status_code=303)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    settings = get_settings()
     init_db()
+    enable_store_overlay()
+    env = Settings()
+    db = SessionLocal()
+    try:
+        seed_from_env(db, env)
+        db.commit()
+    finally:
+        db.close()
+    settings = reload_settings()
     ensure_profile_file(settings)
     db = SessionLocal()
     try:
@@ -51,6 +65,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         db.commit()
     finally:
         db.close()
+    settings = reload_settings()
     task = asyncio.create_task(poll_loop(settings))
     yield
     task.cancel()
@@ -64,7 +79,7 @@ def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
     app.add_middleware(AuthGateMiddleware)
-    app.add_middleware(SessionMiddleware, settings=settings)
+    app.add_middleware(SessionMiddleware)
     app.mount("/static", StaticFiles(directory="app/web/static"), name="static")
     app.include_router(router)
 

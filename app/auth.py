@@ -4,12 +4,13 @@ from fastapi import Request
 from fastapi.responses import RedirectResponse
 from itsdangerous import BadSignature, TimestampSigner
 from pwdlib import PasswordHash
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 from starlette.types import ASGIApp
 
-from app.config import Settings
+from app.config import DEFAULT_DASHBOARD_PASSWORD, Settings, get_settings
 from app.db.models import User
 from app.db.session import SessionLocal
 from app.models import SessionUser, UserRole
@@ -34,7 +35,39 @@ def session_user_from_row(row: User) -> SessionUser:
     return SessionUser(id=row.id, username=row.username, role=row.role)
 
 
+def user_count(db: Session) -> int:
+    return int(db.query(User).count())
+
+
+def needs_setup() -> bool:
+    db = SessionLocal()
+    try:
+        return user_count(db) == 0
+    except (OperationalError, ProgrammingError):
+        return False
+    finally:
+        db.close()
+
+
 def bootstrap_user(db: Session, settings: Settings) -> None:
+    from app.env_store import set_owner_username
+
+    if user_count(db) == 0:
+        if settings.dashboard_password == DEFAULT_DASHBOARD_PASSWORD:
+            return
+        db.add(
+            User(
+                username=settings.dashboard_username,
+                password_hash=hash_password(settings.dashboard_password),
+                role=UserRole.admin.value,
+                is_active=True,
+            )
+        )
+        set_owner_username(db, settings.dashboard_username)
+        db.commit()
+        return
+    if settings.dashboard_password == DEFAULT_DASHBOARD_PASSWORD:
+        return
     existing = db.query(User).filter(User.username == settings.dashboard_username).one_or_none()
     if existing is None:
         db.add(
@@ -45,6 +78,7 @@ def bootstrap_user(db: Session, settings: Settings) -> None:
                 is_active=True,
             )
         )
+        set_owner_username(db, settings.dashboard_username)
         db.commit()
         return
     existing.role = UserRole.admin.value
@@ -83,13 +117,13 @@ def current_user(request: Request) -> SessionUser | None:
 
 
 class SessionMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app: ASGIApp, settings: Settings) -> None:
+    def __init__(self, app: ASGIApp) -> None:
         super().__init__(app)
-        self.settings = settings
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         cookie = request.cookies.get(COOKIE_NAME)
-        username = read_session_value(self.settings, cookie) if cookie else None
+        settings = get_settings()
+        username = read_session_value(settings, cookie) if cookie else None
         db = SessionLocal()
         try:
             session_user = load_session_user(db, username)
@@ -107,12 +141,13 @@ def require_login(request: Request) -> SessionUser | RedirectResponse:
     return user
 
 
-PUBLIC_PATHS = {"/login", "/health", "/static", "/upwork/callback"}
+PUBLIC_PATHS = {"/login", "/setup", "/health", "/static", "/upwork/callback"}
 
 
 def is_public_path(path: str) -> bool:
     return (
         path == "/login"
+        or path == "/setup"
         or path == "/health"
         or path == "/upwork/callback"
         or path.startswith("/static/")

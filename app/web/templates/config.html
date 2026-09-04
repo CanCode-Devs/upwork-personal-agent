@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}Config · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="top">
+  <div>
+    <h1>Config</h1>
+    <div class="sub">Secrets cannot be viewed after you save them. Variables stay visible and editable. Scoring and profile stay on Settings.</div>
+  </div>
+</div>
+
+{% if saved == "secret" %}
+<div class="banner ok">Secret saved. It will not be shown again.</div>
+{% elif saved == "deleted" %}
+<div class="banner ok">Secret removed. Add a new value if you still need it.</div>
+{% elif saved == "vars" %}
+<div class="banner ok">Variables saved. They apply without a restart.</div>
+{% elif error == "secret" %}
+<div class="banner">That secret could not be saved. Add a non-empty value.</div>
+{% elif error == "variables" %}
+<div class="banner">Check the variable values. Numbers must be at least 1, and required fields cannot be blank.</div>
+{% endif %}
+
+<div class="job-grid">
+  <div class="card">
+    <h2>Secrets</h2>
+    <p class="muted">Once saved, a secret is only marked as set. Delete it to enter a new value.</p>
+    {% for item in page.secrets %}
+    <div class="config-secret">
+      <div class="config-secret-head">
+        <strong>{{ item.label }}</strong>
+        {% if item.is_set and item.source == "saved" %}
+        <span class="badge">Set</span>
+        {% elif item.is_set %}
+        <span class="badge">Set from environment</span>
+        {% else %}
+        <span class="badge">Not set</span>
+        {% endif %}
+      </div>
+      <p class="muted">{{ item.help }}</p>
+      {% if item.stored %}
+      <form method="post" action="/config/secrets/{{ item.key }}/delete">
+        <button class="btn danger" type="submit">Delete</button>
+      </form>
+      {% else %}
+      {% if item.source == "environment" %}
+      <p class="muted">A value is already set from the environment. Saving stores it in the app instead. It will not be shown.</p>
+      {% endif %}
+      <form method="post" action="/config/secrets/{{ item.key }}" autocomplete="off">
+        <label for="secret-{{ item.key }}">{{ item.label }}</label>
+        <input id="secret-{{ item.key }}" name="value" type="password" autocomplete="new-password" required>
+        <div class="actions" style="margin-top:12px">
+          <button class="btn" type="submit">Save</button>
+        </div>
+      </form>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+
+  <div class="card">
+    <h2>Variables</h2>
+    <p class="muted">These stay visible. Saving updates the running app.</p>
+    <form method="post" action="/config/variables">
+      {% for item in page.variables %}
+      <label for="var-{{ item.key }}">{{ item.label }}</label>
+      {% if item.value_type == "int" %}
+      <input id="var-{{ item.key }}" name="{{ item.key }}" type="number" min="1" step="1" value="{{ item.value }}" required>
+      {% else %}
+      <input id="var-{{ item.key }}" name="{{ item.key }}" type="text" value="{{ item.value }}" {% if item.value_type != "optional_str" %}required{% endif %}>
+      {% endif %}
+      <p class="muted config-help">{{ item.help }}{% if item.note %} {{ item.note }}{% endif %}</p>
+      {% endfor %}
+      <div class="actions" style="margin-top:16px">
+        <button class="btn" type="submit">Save variables</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

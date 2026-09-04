@@ -4,7 +4,7 @@
 <div class="top">
   <div>
     <h1>Users</h1>
-    <div class="sub">Dashboard seats on this machine. They share one Upwork OAuth token. The env bootstrap account stays admin.</div>
+    <div class="sub">Dashboard seats on this machine. They share one Upwork OAuth token. The owner account stays admin.</div>
   </div>
 </div>
 
@@ -69,7 +69,7 @@
       </td>
       <td class="actions">
         {% if person.is_owner %}
-        <span class="muted">Env account</span>
+        <span class="muted">Owner</span>
         {% elif person.is_active %}
         <form method="post" action="/users/{{ person.id }}/active">
           <input type="hidden" name="active" value="0">

@@ -3,25 +3,27 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Sign in · {{ app_name }}</title>
+  <title>Set up · {{ app_name }}</title>
   {% include "brand_meta.html" %}
   <link rel="stylesheet" href="/static/style.css?v={{ asset_v }}">
 </head>
 <body>
   <div class="login-wrap">
-    <form class="login" method="post" action="/login">
+    <form class="login" method="post" action="/setup">
       <a class="studio-mark login-mark" href="{{ studio_url }}" target="_blank" rel="noopener noreferrer" aria-label="{{ studio_name }}">
         <img src="/static/logo-mark.png" alt="" width="36" height="36">
         <span class="studio-name">CanCode <em>Devs</em></span>
       </a>
       <h1>{{ app_name }}</h1>
-      <p class="sub">{{ app_tagline }}. Sign in to review drafts and approve submissions.</p>
+      <p class="sub">Create the owner admin for this machine. You will add the OpenAI key next.</p>
       <label for="username">Username</label>
       <input id="username" name="username" type="text" autocomplete="username" required>
       <label for="password">Password</label>
-      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <input id="password" name="password" type="password" autocomplete="new-password" required>
+      <label for="password_confirm">Confirm password</label>
+      <input id="password_confirm" name="password_confirm" type="password" autocomplete="new-password" required>
       {% if error %}<p class="error">{{ error }}</p>{% endif %}
-      <p style="margin-top:20px"><button class="btn" type="submit">Sign in</button></p>
+      <p style="margin-top:20px"><button class="btn" type="submit">Create admin</button></p>
       <p class="studio-foot login-foot">
         <a href="{{ studio_url }}" target="_blank" rel="noopener noreferrer">{{ studio_name }}</a>
         <span>{{ studio_slogan }}</span>

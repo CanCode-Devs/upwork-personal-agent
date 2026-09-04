@@ -1,7 +1,17 @@
+from __future__ import annotations
+
+import secrets
 from pathlib import Path
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+DEFAULT_DASHBOARD_PASSWORD = "change-me"
+DEFAULT_SESSION_SECRET = "replace-with-a-long-random-string"
+SESSION_SECRET_FILENAME = "session_secret"
+STUDIO_NAME = "CanCode Devs"
+STUDIO_URL = "https://cancodedevs.com"
+STUDIO_SLOGAN = "Ideas compile. Products ship."
 
 
 class Settings(BaseSettings):
@@ -12,8 +22,8 @@ class Settings(BaseSettings):
     )
 
     dashboard_username: str = "admin"
-    dashboard_password: str = "change-me"
-    session_secret: str = "replace-with-a-long-random-string"
+    dashboard_password: str = DEFAULT_DASHBOARD_PASSWORD
+    session_secret: str = DEFAULT_SESSION_SECRET
 
     openai_api_key: str = ""
     openai_base_url: str | None = None
@@ -54,5 +64,78 @@ class Settings(BaseSettings):
         return value
 
 
+_cache: Settings | None = None
+_overlay_enabled = False
+
+
+def session_secret_path(data_dir: Path) -> Path:
+    return data_dir / SESSION_SECRET_FILENAME
+
+
+def resolve_session_secret(data_dir: Path, env_secret: str) -> str:
+    path = session_secret_path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    custom = env_secret.strip()
+    if custom and custom != DEFAULT_SESSION_SECRET:
+        if not path.exists():
+            path.write_text(custom, encoding="utf-8")
+        return custom
+    if path.exists():
+        stored = path.read_text(encoding="utf-8").strip()
+        if stored:
+            return stored
+    generated = secrets.token_urlsafe(48)
+    path.write_text(generated, encoding="utf-8")
+    return generated
+
+
+def enable_store_overlay() -> None:
+    global _overlay_enabled
+    _overlay_enabled = True
+
+
+def _apply_overlay(base: Settings, overlay: dict[str, str]) -> Settings:
+    updates: dict[str, object] = {}
+    for key, raw in overlay.items():
+        if key not in Settings.model_fields:
+            continue
+        if key in {"poll_interval_minutes", "approval_ttl_hours"}:
+            try:
+                updates[key] = int(raw)
+            except ValueError:
+                continue
+        elif key == "openai_base_url":
+            updates[key] = raw.strip() or None
+        else:
+            updates[key] = raw
+    if not updates:
+        return base
+    return base.model_copy(update=updates)
+
+
+def _load_settings() -> Settings:
+    base = Settings()
+    data_dir = Path(base.data_dir)
+    secret = resolve_session_secret(data_dir, base.session_secret)
+    base = base.model_copy(update={"session_secret": secret})
+    if not _overlay_enabled:
+        return base
+    from app.env_store import load_overlay_map
+
+    overlay = load_overlay_map()
+    if not overlay:
+        return base
+    return _apply_overlay(base, overlay)
+
+
 def get_settings() -> Settings:
-    return Settings()
+    global _cache
+    if _cache is None:
+        _cache = _load_settings()
+    return _cache
+
+
+def reload_settings() -> Settings:
+    global _cache
+    _cache = _load_settings()
+    return _cache
