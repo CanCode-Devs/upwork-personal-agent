@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import re
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -13,16 +14,43 @@ from typing import Any, Literal
 import httpx2
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from mcp.types import ListToolsResult, PaginatedRequestParams
 
 from app.config import Settings, get_settings
 from app.job_attachments import FILE_EXTS, store_job_attachments
 from app.milestones import mcp_milestone_params
-from app.models import ApplyHighlight, ConnectsPanel, JobPayload, McpStatus, ProposalMilestone, ScreeningAnswer, ToolCallArgs
+from app.models import ApplyHighlight, ConnectsPanel, JobPayload, McpStatus, McpToolSignature, ProposalMilestone, ScreeningAnswer, ToolCallArgs
+from app.upwork.mcp_catalog import signatures_from_tools
 from app.proposal_writer import clean_screening_question
 from app.upwork.oauth import build_oauth_provider
 from app.upwork.token_store import token_storage
 
 logger = logging.getLogger(__name__)
+
+FIND_JOBS_RATE_LIMIT_RETRIES = 3
+FIND_JOBS_RATE_LIMIT_BACKOFF_SECONDS = 6.0
+
+
+class _CallThrottle:
+    def __init__(self) -> None:
+        self._last = 0.0
+        self._lock = asyncio.Lock()
+
+    async def wait(self) -> None:
+        interval = max(1.0, float(get_settings().find_jobs_min_interval_seconds))
+        async with self._lock:
+            delay = self._last + interval - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._last = time.monotonic()
+
+
+_find_jobs_throttle = _CallThrottle()
+
+
+def is_rate_limited(detail: str) -> bool:
+    lowered = (detail or "").lower()
+    return "rate_limit" in lowered or "rate limit" in lowered
 
 
 def format_mcp_error(exc: BaseException) -> str:
@@ -60,6 +88,22 @@ def format_mcp_error(exc: BaseException) -> str:
     return "; ".join(parts) or type(exc).__name__
 
 
+def compact_tool_message(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        for key in ("message", "error", "reason"):
+            found = parsed.get(key)
+            if found:
+                return str(found).strip()[:500]
+    return text[:500]
+
+
 def oauth_needs_login(message: str) -> bool:
     lower = (message or "").lower()
     return "interactive oauth" in lower or "connect from the dashboard" in lower
@@ -81,21 +125,39 @@ def _absorb_listing(session: Any, listed: Any) -> Any:
 
 
 async def list_session_tools(session: Any) -> list[Any]:
-    from mcp.types import ListToolsResult
-
+    collected: list[Any] = []
+    cursor: str | None = None
     try:
-        listed = await session.list_tools()
-        return list(listed.tools)
+        while True:
+            params = PaginatedRequestParams(cursor=cursor) if cursor else None
+            listed = await session.list_tools(params=params)
+            collected.extend(list(listed.tools))
+            nxt = listed.next_cursor
+            if not nxt or nxt == cursor:
+                break
+            cursor = nxt
+        return collected
     except Exception:
-        pass
+        collected = []
     dispatcher = getattr(session, "_dispatcher", None)
     if dispatcher is None:
-        return []
-    raw = _sanitize_list_tools_raw(await dispatcher.send_raw_request("tools/list", None, {}))
-    if not raw:
-        return []
-    listed = _absorb_listing(session, ListToolsResult.model_validate(raw))
-    return list(listed.tools)
+        return collected
+    seen: set[str] = set()
+    cursor = None
+    while True:
+        raw = _sanitize_list_tools_raw(
+            await dispatcher.send_raw_request("tools/list", {"cursor": cursor} if cursor else None, {})
+        )
+        if not raw:
+            break
+        listed = _absorb_listing(session, ListToolsResult.model_validate(raw))
+        collected.extend(list(listed.tools))
+        nxt = getattr(listed, "next_cursor", None)
+        if not nxt or nxt == cursor or nxt in seen:
+            break
+        seen.add(str(nxt))
+        cursor = str(nxt)
+    return collected
 
 
 async def call_session_tool(session: Any, name: str, arguments: dict[str, Any] | None = None) -> Any:
@@ -107,6 +169,43 @@ async def call_session_tool(session: Any, name: str, arguments: dict[str, Any] |
     if isinstance(raw, dict) and raw.get("isError"):
         raise RuntimeError(_tool_text(raw) or f"{name} failed")
     return raw
+
+
+async def call_find_jobs(session: Any, arguments: dict[str, Any]) -> Any:
+    for attempt in range(FIND_JOBS_RATE_LIMIT_RETRIES + 1):
+        await _find_jobs_throttle.wait()
+        try:
+            return await call_session_tool(session, "upwork__find_jobs", arguments)
+        except Exception as exc:
+            if attempt >= FIND_JOBS_RATE_LIMIT_RETRIES or not is_rate_limited(format_mcp_error(exc)):
+                raise
+            logger.warning("find_jobs rate limited, retry %s", attempt + 1)
+            await asyncio.sleep(FIND_JOBS_RATE_LIMIT_BACKOFF_SECONDS * (attempt + 1))
+    raise RuntimeError("find_jobs failed")
+
+
+def payload_posted_at(payload: JobPayload) -> datetime | None:
+    details = _parse_jsonish(payload.get("client_details") or "{}")
+    raw = _parse_jsonish(payload.get("raw") or "{}")
+    details = details if isinstance(details, dict) else {}
+    raw = raw if isinstance(raw, dict) else {}
+    posting = raw.get("marketplaceJobPosting")
+    if not isinstance(posting, dict) and isinstance(raw.get("data"), dict):
+        posting = raw["data"].get("marketplaceJobPosting")
+    posting = posting if isinstance(posting, dict) else {}
+    content = posting.get("content") if isinstance(posting.get("content"), dict) else {}
+    text = _iso_datetime(
+        details.get("published_date"),
+        raw.get("published_date"),
+        raw.get("created_date"),
+        posting.get("publishedDateTime"),
+        posting.get("createdDateTime"),
+        content.get("publishedDateTime"),
+        content.get("createdDateTime"),
+    )
+    if not text:
+        return None
+    return datetime.fromisoformat(text)
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -1179,7 +1278,6 @@ def _file_uids(raw: Any) -> list[str]:
 
 
 def _write_draft(payload: dict[str, Any]) -> tuple[str, str]:
-    data = payload
     nested = payload.get("preview") if isinstance(payload.get("preview"), dict) else None
     inner = payload.get("data") if isinstance(payload.get("data"), dict) else None
     for blob in (payload, nested, inner):
@@ -1189,6 +1287,19 @@ def _write_draft(payload: dict[str, Any]) -> tuple[str, str]:
         if draft_id:
             return draft_id, kind
     return "", ""
+
+
+def _preview_id(payload: dict[str, Any], raw: str = "") -> str:
+    nested = payload.get("preview") if isinstance(payload.get("preview"), dict) else None
+    inner = payload.get("data") if isinstance(payload.get("data"), dict) else None
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else None
+    for blob in (payload, nested, inner, result):
+        found = _first_str(_as_dict(blob), "preview_id", "previewId")
+        if found:
+            return found
+    blob = raw or json.dumps(payload, default=str)
+    match = re.search(r'"preview_id"\s*:\s*"([^"]+)"', blob)
+    return match.group(1) if match else ""
 
 
 def _looks_sent(payload: dict[str, Any], text: str) -> bool:
@@ -1296,10 +1407,15 @@ class UpworkMcpClient:
         *,
         mode: Literal["cli", "web"] = "cli",
         web_flow: Any | None = None,
-    ) -> list[str]:
+    ) -> list[McpToolSignature]:
         async with self._session(interactive=True, mode=mode, web_flow=web_flow) as session:
             listed = await list_session_tools(session)
-            return [getattr(tool, "name", "") for tool in listed]
+            return signatures_from_tools(listed)
+
+    async def list_tool_signatures(self) -> list[McpToolSignature]:
+        async with self._session(interactive=False) as session:
+            listed = await list_session_tools(session)
+            return signatures_from_tools(listed)
 
     async def _resolve_org_uid(self, session: Any) -> str:
         if self._org_uid:
@@ -1311,7 +1427,13 @@ class UpworkMcpClient:
         self._org_uid = org_uid
         return org_uid
 
-    async def search_jobs(self, query: str, *, max_pages: int = 3) -> list[JobPayload]:
+    async def search_jobs(
+        self,
+        query: str,
+        *,
+        max_pages: int = 3,
+        min_posted: datetime | None = None,
+    ) -> list[JobPayload]:
         collected: list[JobPayload] = []
         seen: set[str] = set()
         cursor = ""
@@ -1326,19 +1448,23 @@ class UpworkMcpClient:
                 }
                 if cursor:
                     params["cursor"] = cursor
-                result = await call_session_tool(
+                result = await call_find_jobs(
                     session,
-                    "upwork__find_jobs",
                     {"action": "search", "org_uid": org_uid, "params": params},
                 )
+                page_stale = False
                 for job in jobs_from_tool_result(result):
                     job_id = job.get("id")
                     if not job_id or job_id in seen:
                         continue
                     seen.add(job_id)
                     collected.append(job)
+                    if min_posted is not None:
+                        posted = payload_posted_at(job)
+                        if posted is not None and posted < min_posted:
+                            page_stale = True
                 parsed = _parse_jsonish(_tool_text(result))
-                if not page_has_more(parsed):
+                if page_stale or not page_has_more(parsed):
                     break
                 nxt = next_cursor(parsed)
                 if not nxt or nxt == cursor:
@@ -1350,9 +1476,8 @@ class UpworkMcpClient:
         async with self._session(interactive=False) as session:
             await list_session_tools(session)
             org_uid = await self._resolve_org_uid(session)
-            result = await call_session_tool(
+            result = await call_find_jobs(
                 session,
-                "upwork__find_jobs",
                 {"action": "get", "org_uid": org_uid, "params": {"id": job_id}},
             )
             jobs = jobs_from_tool_result(result)
@@ -1373,14 +1498,14 @@ class UpworkMcpClient:
             org_uid = await self._resolve_org_uid(session)
             for job in jobs:
                 try:
-                    result = await call_session_tool(
+                    result = await call_find_jobs(
                         session,
-                        "upwork__find_jobs",
                         {"action": "get", "org_uid": org_uid, "params": {"id": job["id"]}},
                     )
                     fetched = jobs_from_tool_result(result)
                     detail = fetched[0] if fetched else None
-                except Exception:
+                except Exception as exc:
+                    logger.warning("job detail fetch failed for %s: %s", job.get("id"), format_mcp_error(exc))
                     detail = None
                 if detail is None:
                     enriched.append(job)
@@ -1763,41 +1888,53 @@ class UpworkMcpClient:
                 total = apply_cost + max(0, boost_connects)
                 if available is not None and total > available:
                     raise RuntimeError(f"Not enough Connects: need {total}, have {available}")
-                draft_id = str(parsed.get("draft_id") or "")
-                if not draft_id:
-                    raise RuntimeError(created_text or "Upwork did not return a proposal draft")
+                preview_id = _preview_id(parsed, created_text)
+                draft_id, _draft_kind = _write_draft(parsed)
                 milestone_payload = mcp_milestone_params(milestones or [])
                 attached = 0
-                if milestone_payload and preview.milestones_allowed:
-                    updated = await call_session_tool(
+                if preview_id:
+                    confirmed = await call_session_tool(
                         session,
-                        "upwork__update_draft",
+                        "upwork__confirm_preview",
                         {
-                            "action": "update",
+                            "action": "confirm",
                             "org_uid": org_uid,
-                            "params": {
-                                "type": "proposal",
-                                "id": draft_id,
-                                "content": {"milestones": milestone_payload},
-                                "mode": "merge",
-                            },
+                            "params": {"type": "proposal", "preview_id": preview_id},
                         },
                     )
-                    updated_parsed = _as_dict(_parse_jsonish(_tool_text(updated)))
-                    new_id = str(updated_parsed.get("draft_id") or "")
-                    if not new_id:
-                        raise RuntimeError(_tool_text(updated) or "Upwork did not return an updated proposal draft")
-                    draft_id = new_id
-                    attached = len(milestone_payload)
-                confirmed = await call_session_tool(
-                    session,
-                    "upwork__confirm_draft",
-                    {
-                        "action": "confirm",
-                        "org_uid": org_uid,
-                        "params": {"type": "proposal", "draft_id": draft_id},
-                    },
-                )
+                elif draft_id:
+                    if milestone_payload and preview.milestones_allowed:
+                        updated = await call_session_tool(
+                            session,
+                            "upwork__update_draft",
+                            {
+                                "action": "update",
+                                "org_uid": org_uid,
+                                "params": {
+                                    "type": "proposal",
+                                    "id": draft_id,
+                                    "content": {"milestones": milestone_payload},
+                                    "mode": "merge",
+                                },
+                            },
+                        )
+                        updated_parsed = _as_dict(_parse_jsonish(_tool_text(updated)))
+                        new_id = str(updated_parsed.get("draft_id") or "")
+                        if not new_id:
+                            raise RuntimeError(_tool_text(updated) or "Upwork did not return an updated proposal draft")
+                        draft_id = new_id
+                        attached = len(milestone_payload)
+                    confirmed = await call_session_tool(
+                        session,
+                        "upwork__confirm_draft",
+                        {
+                            "action": "confirm",
+                            "org_uid": org_uid,
+                            "params": {"type": "proposal", "draft_id": draft_id},
+                        },
+                    )
+                else:
+                    raise RuntimeError(created_text or "Upwork did not return a proposal preview")
                 text = _tool_text(confirmed) or "submitted"
                 outcome = f"apply={apply_cost} boost={boost_connects} milestones={attached} {text}"
                 return outcome

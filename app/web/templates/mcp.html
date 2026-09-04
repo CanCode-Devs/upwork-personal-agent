@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}MCP · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="top">
+  <div>
+    <h1>MCP</h1>
+    <div class="sub">Saved Upwork MCP tools. Connect Upwork to match the live catalog. Changes stay here until you accept them.</div>
+  </div>
+</div>
+
+{% if accepted %}
+<div class="banner ok">Saved catalog updated to the current Upwork tools.</div>
+{% endif %}
+
+{% set pending = catalog.pending %}
+{% if pending and (pending.added or pending.removed or pending.changed) %}
+<div class="card" style="margin-bottom:24px">
+  <h2>Pending changes</h2>
+  <p class="muted">Checked {{ pending.checked_at|dt }}. {{ pending.added|length }} added, {{ pending.removed|length }} removed, {{ pending.changed|length }} updated.</p>
+  {% if pending.added %}
+  <h3>Added</h3>
+  {% for tool in pending.added %}
+  <div class="event"><b>{{ tool.name }}</b>{% if tool.description %} — {{ tool.description }}{% endif %}</div>
+  {% endfor %}
+  {% endif %}
+  {% if pending.removed %}
+  <h3>Removed</h3>
+  {% for tool in pending.removed %}
+  <div class="event"><b>{{ tool.name }}</b>{% if tool.description %} — {{ tool.description }}{% endif %}</div>
+  {% endfor %}
+  {% endif %}
+  {% if pending.changed %}
+  <h3>Updated</h3>
+  {% for change in pending.changed %}
+  <div class="event">
+    <b>{{ change.name }}</b>
+    {% if change.notes %}
+    — {{ change.notes|join("; ") }}
+    {% endif %}
+  </div>
+  {% endfor %}
+  {% endif %}
+  {% if can.upwork_connect %}
+  <form method="post" action="/mcp/accept" style="margin-top:16px">
+    <button class="btn" type="submit">Accept as current</button>
+  </form>
+  {% else %}
+  <p class="muted">Ask an admin to accept these as the current catalog.</p>
+  {% endif %}
+</div>
+{% endif %}
+
+<h2>Accepted catalog</h2>
+{% if catalog.accepted_at %}
+<p class="muted">Last accepted {{ catalog.accepted_at|dt }}. {{ catalog.tools|length }} tools.</p>
+{% endif %}
+{% if catalog.tools %}
+{% for tool in catalog.tools %}
+<details class="soft">
+  <summary>{{ tool.name }}</summary>
+  {% if tool.description %}<p class="muted">{{ tool.description }}</p>{% endif %}
+  <pre>{{ tool.input_schema|tojson(indent=2) }}</pre>
+</details>
+{% endfor %}
+{% else %}
+<p class="empty">No catalog yet. Connect Upwork to save the current MCP tools.</p>
+{% endif %}
+{% endblock %}

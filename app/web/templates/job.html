@@ -1,51 +1,53 @@
 {% extends "base.html" %}
 {% block title %}{{ job.title }} · {{ app_name }}{% endblock %}
 {% block content %}
-<div class="top">
-  <div>
+<div class="job-head">
+  <div class="job-head-main">
+    <a href="/">← Inbox</a>
     <h1>{{ job.title }}</h1>
-    <div class="sub"><span class="badge {{ job.status }}">{{ job.status }}</span>{% if engagement == 'role' %} <span class="badge">Role hire</span>{% else %} <span class="badge">Project</span>{% endif %}</div>
+    <div class="job-head-meta">
+      <span class="badge {{ job.status }}">{{ job.status }}</span>
+      {% if engagement == 'role' %}<span class="badge">Role hire</span>{% else %}<span class="badge">Project</span>{% endif %}
+      {% if has_draft %}<span class="badge submitted">Draft ready</span>{% endif %}
+      {% if job.applied_on_upwork %}<span class="badge submitted">Already applied on Upwork</span>{% endif %}
+    </div>
   </div>
-  <a href="/">Back to inbox</a>
+  <div class="job-head-side">
+    <div class="meta scores" style="margin:0">
+      <div class="score-chip"><span>Rel</span><strong>{{ job.score if job.score is not none else "—" }}</strong></div>
+      <div class="score-chip"><span>Client</span><strong>{{ job.client_score if job.client_score is not none else "—" }}</strong></div>
+    </div>
+    {% if job.url or job.upwork_id %}
+    <a class="btn secondary" href="{{ (job.url or job.upwork_id)|upwork_job }}" target="_blank" rel="noreferrer">Open on Upwork</a>
+    {% endif %}
+  </div>
 </div>
 
-<div class="meta scores">
-  <div class="score-chip"><span>Relevance</span><strong>{{ job.score if job.score is not none else "—" }}</strong></div>
-  <div class="score-chip"><span>Client</span><strong>{{ job.client_score if job.client_score is not none else "—" }}</strong></div>
-</div>
-<div class="meta">
-  {% if job.score_reason %}<div>Relevance: {{ job.score_reason }}</div>{% endif %}
-  {% if job.client_score_reason %}<div>Client: {{ job.client_score_reason }}</div>{% endif %}
-  <div>Price: {{ card.price_label if card else job.budget or "—" }}</div>
-  {% if card and card.posted_ago %}<div>{{ card.posted_kind }}: <strong>{{ card.posted_ago }}</strong>{% if card.posted_local %} · {{ card.posted_local }}{% endif %}</div>{% endif %}
-  <div>Timezone: {{ card.timezone if card else "—" }}{% if card and card.location %} · {{ card.location }}{% endif %}</div>
-  <div>Upwork id: {{ job.upwork_id }}</div>
-  {% if job.applied_on_upwork %}<div><span class="badge submitted">Already applied on Upwork</span>{% if application and application.status %} <span class="badge">{{ application.status }}</span>{% endif %}{% if latest_outcome %} <span class="badge {{ latest_outcome }}">{{ latest_outcome }}</span>{% endif %}</div>{% endif %}
-  {% if job.url or job.upwork_id %}<div><a href="{{ (job.url or job.upwork_id)|upwork_job }}" target="_blank" rel="noreferrer">Open on Upwork</a></div>{% endif %}
-  <div>Expires: {{ job.expires_at|dt }}</div>
-</div>
-
-{% if request.query_params.get('drafted') %}
+{% if request.query_params.get('submitted') %}
+<div class="banner ok">Proposal submitted to Upwork.</div>
+{% elif request.query_params.get('drafted') %}
 <div class="banner ok">Proposal drafted. Review the letter and milestones before submit.</div>
 {% elif request.query_params.get('regenerated') %}
 <div class="banner ok">Proposal regenerated. Review the letter and milestones before submit.</div>
 {% elif request.query_params.get('skipped') %}
 <div class="banner">This job no longer passes Settings, so it was skipped instead of drafting a letter.</div>
 {% elif request.query_params.get('error') == 'blocked' %}
-<div class="banner">This job cannot be drafted (already applied or not in Pending).</div>
+<div class="banner">This job cannot be drafted (already applied, expired, or already submitted).</div>
 {% elif request.query_params.get('error') == 'unproven' %}
 <div class="banner">Fix the unproven answers below before submit.</div>
 {% elif request.query_params.get('error') == 'quote' %}
 <div class="banner">Enter an hourly quote greater than 0.</div>
+{% elif request.query_params.get('error') == 'submit' %}
+<div class="banner">Submit to Upwork failed. {{ submit_error or "Check the log on this page." }}{% if oauth_stale %} Open Connect Upwork in a new tab, then retry.{% endif %}</div>
+{% elif request.query_params.get('error') == 'attachments' %}
+<div class="banner">Could not read that attachment. Paste the text or try another file.</div>
 {% elif request.query_params.get('error') %}
 <div class="banner">Could not write the proposal. Check the log on this page.</div>
 {% elif request.query_params.get('attachments') %}
 <div class="banner ok">Attachment text saved. Regenerate the proposal so the letter can use it.</div>
 {% elif request.query_params.get('saved') %}
 <div class="banner ok">Edits saved.</div>
-{% elif request.query_params.get('error') == 'attachments' %}
-<div class="banner">Could not read that attachment. Paste the text or try another file.</div>
-{% elif job.status == 'submit_failed' %}
+{% elif job.status == 'submit_failed' or (submit_error and not job.applied_on_upwork) %}
 <div class="banner">Submit to Upwork failed. {{ submit_error or "Check the log on this page." }}{% if oauth_stale %} Open Connect Upwork in a new tab, then retry.{% endif %}</div>
 {% endif %}
 
@@ -53,114 +55,122 @@
 <div class="banner">This post references attachments the tool cannot read from Upwork. Paste the text or upload the screenshots below so the next draft can answer them.</div>
 {% endif %}
 
-{% if card and card.facts %}
-<div class="card" style="margin-bottom:20px">
-  <h2>Client</h2>
-  <div class="facts">
-    {% for fact in card.facts %}
-    <div><span>{{ fact.label }}</span><b>{{ fact.value }}</b></div>
-    {% endfor %}
-  </div>
-  {% if card.open_contracts %}
-  <h2 style="margin-top:16px">Open contracts</h2>
-  {% for item in card.open_contracts %}
-  <div class="event"><b>{{ item.title }}</b> — {{ item.detail }}</div>
-  {% endfor %}
-  {% endif %}
-  {% if card.closed_contracts %}
-  <h2 style="margin-top:16px">Recent closed contracts</h2>
-  {% for item in card.closed_contracts %}
-  <div class="event"><b>{{ item.title }}</b> — {{ item.detail }}</div>
-  {% endfor %}
-  {% endif %}
-  {% if card.client_reviews %}
-  <h2 style="margin-top:16px">Freelancer reviews of this client</h2>
-  {% for item in card.client_reviews %}
-  <div class="event">
-    {% if item.reviewer %}<b>{{ item.reviewer }}</b> — {% endif %}
-    {% if item.rating is not none %}{{ item.rating }}★ · {% endif %}
-    {{ item.title }}
-    {% if item.comment %}<div>{{ item.comment }}</div>{% endif %}
-  </div>
-  {% endfor %}
-  {% endif %}
-</div>
-{% endif %}
-
-<div class="card" style="margin-bottom:20px">
-  <h2>Posting attachments</h2>
-  {% if card and card.attachments %}
-  {% for item in card.attachments %}
-  <div class="event">
-    {% if item.local_url %}<a href="{{ item.local_url }}">{{ item.filename }}</a>
-    {% elif item.url %}<a href="{{ item.url }}" target="_blank" rel="noreferrer">{{ item.filename }}</a>
-    {% else %}{{ item.filename }}{% endif %}
-    {% if item.error %} — {{ item.error }}{% endif %}
-    {% if item.text %}<div class="prose job-snippet">{{ item.text[:800] }}</div>{% endif %}
-  </div>
-  {% endfor %}
-  {% endif %}
-  <form method="post" action="/jobs/{{ job.id }}/attachments" enctype="multipart/form-data" style="margin-top:12px">
-    <p class="muted">Upwork does not send posting files to this app. Paste the screenshots or questions, or upload a PNG/PDF, then regenerate.</p>
-    <label for="attachment_text">Paste text</label>
-    <textarea id="attachment_text" name="attachment_text" class="short" placeholder="Questions, requirements, screenshot text"></textarea>
-    <label for="attachment_files">Upload screenshot or PDF</label>
-    <input id="attachment_files" name="files" type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.webp,.gif,.txt,.md,.docx">
-    <div class="actions" style="margin-top:8px">
-      <button class="btn secondary" type="submit">Save attachments</button>
-    </div>
-  </form>
-</div>
-
-{% if breakdown %}
-<div class="card" style="margin-bottom:20px">
-  <h2>Relevance score breakdown</h2>
-  {% for item in breakdown %}
-  <div class="event">{{ item }}</div>
-  {% endfor %}
-</div>
-{% endif %}
-
-{% if client_breakdown %}
-<div class="card" style="margin-bottom:20px">
-  <h2>Client score breakdown</h2>
-  {% for item in client_breakdown %}
-  <div class="event">{{ item }}</div>
-  {% endfor %}
-</div>
-{% endif %}
-
-{% if matched_context %}
-<div class="card" style="margin-bottom:20px">
-  <h2>Matched portfolio / history</h2>
-  {% for item in matched_context %}
-  <div class="event">{{ item }}</div>
-  {% endfor %}
-</div>
-{% endif %}
-
-<div class="job-grid">
-  <div>
+<div class="job-split">
+<div class="job-col">
+  <div class="card">
     <h2>Posting</h2>
+    <p class="muted">{{ card.price_label if card else job.budget or "—" }}{% if card and card.posted_ago %} · {{ card.posted_kind }} {{ card.posted_ago }}{% endif %}{% if card and card.timezone %} · {{ card.timezone }}{% endif %}</p>
+    {% if job.score_reason %}<p class="muted">Relevance: {{ job.score_reason }}</p>{% endif %}
+    {% if job.client_score_reason %}<p class="muted">Client: {{ job.client_score_reason }}</p>{% endif %}
+    {% if card and card.facts %}
+    <div class="facts">
+      {% for fact in card.facts %}
+      <div><span>{{ fact.label }}</span><b>{{ fact.value }}</b></div>
+      {% endfor %}
+    </div>
+    {% endif %}
     <div class="prose">{{ job.description or "No description stored." }}</div>
   </div>
-  <div>
-    <h2>Cover letter</h2>
+
+  {% if card and (card.open_contracts or card.closed_contracts or card.client_reviews) %}
+  <details class="soft">
+    <summary>Client contracts and reviews</summary>
+    {% if card.open_contracts %}
+    <h2>Open contracts</h2>
+    {% for item in card.open_contracts %}
+    <div class="event"><b>{{ item.title }}</b> — {{ item.detail }}</div>
+    {% endfor %}
+    {% endif %}
+    {% if card.closed_contracts %}
+    <h2>Recent closed contracts</h2>
+    {% for item in card.closed_contracts %}
+    <div class="event"><b>{{ item.title }}</b> — {{ item.detail }}</div>
+    {% endfor %}
+    {% endif %}
+    {% if card.client_reviews %}
+    <h2>Freelancer reviews of this client</h2>
+    {% for item in card.client_reviews %}
+    <div class="event">
+      {% if item.reviewer %}<b>{{ item.reviewer }}</b> — {% endif %}
+      {% if item.rating is not none %}{{ item.rating }}★ · {% endif %}
+      {{ item.title }}
+      {% if item.comment %}<div>{{ item.comment }}</div>{% endif %}
+    </div>
+    {% endfor %}
+    {% endif %}
+  </details>
+  {% endif %}
+
+  <details class="soft">
+    <summary>Posting attachments</summary>
+    {% if card and card.attachments %}
+    {% for item in card.attachments %}
+    <div class="event">
+      {% if item.local_url %}<a href="{{ item.local_url }}">{{ item.filename }}</a>
+      {% elif item.url %}<a href="{{ item.url }}" target="_blank" rel="noreferrer">{{ item.filename }}</a>
+      {% else %}{{ item.filename }}{% endif %}
+      {% if item.error %} — {{ item.error }}{% endif %}
+      {% if item.text %}<div class="prose job-snippet">{{ item.text[:800] }}</div>{% endif %}
+    </div>
+    {% endfor %}
+    {% endif %}
+    <form method="post" action="/jobs/{{ job.id }}/attachments" enctype="multipart/form-data">
+      <p class="muted">Upwork does not send posting files to this app. Paste the screenshots or questions, or upload a PNG/PDF, then regenerate.</p>
+      <label for="attachment_text">Paste text</label>
+      <textarea id="attachment_text" name="attachment_text" class="short" placeholder="Questions, requirements, screenshot text"></textarea>
+      <label for="attachment_files">Upload screenshot or PDF</label>
+      <input id="attachment_files" name="files" type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.webp,.gif,.txt,.md,.docx">
+      <div class="actions">
+        <button class="btn secondary" type="submit">Save attachments</button>
+      </div>
+    </form>
+  </details>
+
+  {% if breakdown or client_breakdown or matched_context %}
+  <details class="soft">
+    <summary>Score breakdown</summary>
+    {% if breakdown %}
+    <h2>Relevance</h2>
+    {% for item in breakdown %}
+    <div class="event">{{ item }}</div>
+    {% endfor %}
+    {% endif %}
+    {% if client_breakdown %}
+    <h2>Client</h2>
+    {% for item in client_breakdown %}
+    <div class="event">{{ item }}</div>
+    {% endfor %}
+    {% endif %}
+    {% if matched_context %}
+    <h2>Matched portfolio / history</h2>
+    {% for item in matched_context %}
+    <div class="event">{{ item }}</div>
+    {% endfor %}
+    {% endif %}
+  </details>
+  {% endif %}
+</div>
+
+<div class="job-col">
+    <h2>Proposal</h2>
+    {% if job.status == 'skipped' and can_act %}
+    <p class="muted">Skipped by Settings. You can still write a proposal and submit if you want this one.</p>
+    {% endif %}
     {% if can_act and not job.applied_on_upwork %}
-    <form method="post" action="/jobs/{{ job.id }}/regenerate" style="margin-bottom:16px">
+    <form id="regen-form" method="post" action="/jobs/{{ job.id }}/regenerate" style="margin-bottom:16px">
       {% if has_draft %}
       <label for="regen_comments">Regenerate proposal</label>
       <textarea id="regen_comments" name="comments" class="short" placeholder="Optional comments, e.g. stress n8n, answer the 5 apply items, shorter CTA"></textarea>
       <p class="muted">Rewrites the letter, milestones (if fixed-price), screening answers, and highlights with the draft model. Does not submit.</p>
       <div class="actions" style="margin-top:8px">
-        <button class="btn secondary" type="submit">Regenerate</button>
+        <button id="regen-btn" class="btn secondary" type="submit" data-busy-label="Regenerating…">Regenerate</button>
       </div>
       {% else %}
       <label for="regen_comments">Write proposal</label>
       <textarea id="regen_comments" name="comments" class="short" placeholder="Optional focus, e.g. stress RAG evals, skip milestones you dislike"></textarea>
       <p class="muted">Calls the larger draft model for a cover letter, screening answers, and milestones. Does not submit.</p>
       <div class="actions" style="margin-top:8px">
-        <button class="btn" type="submit">Write proposal</button>
+        <button id="regen-btn" class="btn" type="submit" data-busy-label="Writing…">Write proposal</button>
       </div>
       {% endif %}
     </form>
@@ -311,56 +321,51 @@
         </div>
       </div>
       {% endif %}
-      <div class="actions" style="margin-top:12px">
-        <button class="btn secondary" type="submit">Save edit</button>
-        <button id="approve-btn" class="btn" type="submit" formaction="/jobs/{{ job.id }}/approve" {% if unproven_gaps %}disabled{% endif %}>Approve &amp; submit</button>
+      <div class="job-actions">
+        <button class="btn secondary" type="submit">Save</button>
+        <button id="approve-btn" class="btn" type="submit" formaction="/jobs/{{ job.id }}/approve" data-busy-label="Submitting…" {% if unproven_gaps %}disabled{% endif %}>Approve &amp; submit</button>
       </div>
       {% endif %}
     </form>
     {% elif can_act %}
     <p class="muted">No letter yet. Write a proposal when this job is worth the Connects.</p>
     {% if quote_is_fixed %}
-    <p class="sub" style="margin:12px 0 16px">Your quote: <strong>${{ quote_bid }}</strong></p>
+    <p class="sub">Your quote: <strong>${{ quote_bid }}</strong></p>
     {% else %}
-    <form method="post" action="/jobs/{{ job.id }}/quote" style="margin:12px 0 16px">
+    <form method="post" action="/jobs/{{ job.id }}/quote">
       <label for="hourly_quote">Your quote ($/hr)</label>
       <input id="hourly_quote" name="hourly_quote" type="number" min="1" step="1" value="{{ quote_bid }}" required>
-      <div class="actions" style="margin-top:8px">
+      <div class="actions">
         <button class="btn secondary" type="submit">Save quote</button>
       </div>
     </form>
     {% endif %}
     {% else %}
     <p class="empty">No cover letter for this job.</p>
-    <p class="sub" style="margin:12px 0 16px">Your quote: <strong>{% if quote_is_fixed %}${{ quote_bid }}{% else %}${{ quote_bid }}/hr{% endif %}</strong></p>
+    <p class="sub">Your quote: <strong>{% if quote_is_fixed %}${{ quote_bid }}{% else %}${{ quote_bid }}/hr{% endif %}</strong></p>
     {% endif %}
     {% if can_act %}
-    <form method="post" action="/jobs/{{ job.id }}/reject" style="margin-top:16px">
-      <label for="reason">Reject reason (helps the agent learn)</label>
-      <input id="reason" name="reason" type="text" placeholder="e.g. no budget, WordPress, too junior">
-      <div class="actions" style="margin-top:12px">
-        <button class="btn danger" type="submit">Reject</button>
-      </div>
+    <form class="job-actions" method="post" action="/jobs/{{ job.id }}/reject">
+      <input id="reason" name="reason" type="text" placeholder="Reject reason, e.g. no budget">
+      <button class="btn danger" type="submit">Reject</button>
     </form>
     {% endif %}
 
     {% if job.applied_on_upwork or application or outcomes %}
-    <div style="margin-top:24px">
-      <h2>Outcome log</h2>
+    <details class="soft">
+      <summary>Outcome log</summary>
       <p class="muted">Filled from Upwork proposal status and messages on poll / Portfolio sync.</p>
       {% if outcomes %}
-      <div class="card" style="margin-top:12px">
         {% for row in outcomes %}
         <div class="event">
           <time>{{ row.created_at|dt }}</time>
           {{ row.outcome }} — {{ row.client_notes }}
         </div>
         {% endfor %}
-      </div>
       {% else %}
       <p class="muted">Nothing recorded yet.</p>
       {% endif %}
-      <form id="outcome-form" method="post" action="/jobs/{{ job.id }}/outcome" style="margin-top:16px">
+      <form id="outcome-form" method="post" action="/jobs/{{ job.id }}/outcome">
         <p class="muted">Optional. Use this only to correct a synced outcome or add a note.</p>
         <label for="outcome">Correction</label>
         <select id="outcome" name="outcome">
@@ -374,23 +379,23 @@
         </select>
         <label for="client_notes">Notes</label>
         <input id="client_notes" name="client_notes" type="text" placeholder="Optional note">
-        <div class="actions" style="margin-top:12px">
+        <div class="actions">
           <button id="outcome-btn" class="btn secondary" type="submit">Save note</button>
         </div>
       </form>
-    </div>
+    </details>
     {% endif %}
 
-    <div class="card" style="margin-top:20px">
-      <h2>Log</h2>
+    <details class="soft">
+      <summary>Log</summary>
       {% for event in events %}
       <div class="event">
         <time>{{ event.created_at|dt }}</time>
         {{ event.kind }}{% if event.user %} · {{ event.user.username }}{% endif %} — {{ event.message }}
       </div>
       {% endfor %}
-    </div>
-  </div>
+    </details>
+</div>
 </div>
 {% if can_act and has_draft %}
 <script type="application/json" id="unproven-config">{{ {"source": unproven_source, "apply_questions": apply_questions}|tojson }}</script>
@@ -565,7 +570,10 @@
       return;
     }
     approveBtn.disabled = true;
-    approveBtn.textContent = "Submitting…";
+    approveBtn.classList.add("is-busy");
+    approveBtn.setAttribute("aria-busy", "true");
+    const label = approveBtn.getAttribute("data-busy-label") || "Submitting…";
+    approveBtn.innerHTML = '<span class="poll-spinner" aria-hidden="true"></span> ' + label;
     submitting = true;
   });
   sync();
@@ -581,6 +589,21 @@
     if (!btn) return;
     btn.disabled = true;
     btn.textContent = "Saving…";
+  });
+})();
+</script>
+<script>
+(function () {
+  const form = document.getElementById("regen-form");
+  const btn = document.getElementById("regen-btn");
+  if (!form || !btn) return;
+  form.addEventListener("submit", function () {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    btn.classList.add("is-busy");
+    btn.setAttribute("aria-busy", "true");
+    const label = btn.getAttribute("data-busy-label") || "Writing…";
+    btn.innerHTML = '<span class="poll-spinner" aria-hidden="true"></span> ' + label;
   });
 })();
 </script>

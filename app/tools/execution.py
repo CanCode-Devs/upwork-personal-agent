@@ -23,6 +23,7 @@ from app.milestones import (
     load_milestones,
 )
 from app.models import (
+    ACTIONABLE_STATUSES,
     ApplyHighlight,
     ContextMatch,
     CritiqueResult,
@@ -60,11 +61,11 @@ from app.proposal_writer import (
 )
 from app.tools import register_tool
 from app.tools.discovery import settings_block_reasons_for_job
-from app.upwork.mcp_client import UpworkMcpClient, already_applied, format_mcp_error
+from app.upwork.mcp_client import UpworkMcpClient, already_applied, compact_tool_message, format_mcp_error
 
 logger = logging.getLogger(__name__)
 
-_DRAFTABLE_STATUSES = {JobStatus.pending_review.value, JobStatus.submit_failed.value}
+_DRAFTABLE_STATUSES = set(ACTIONABLE_STATUSES)
 
 
 class PitchSkipped(ValueError):
@@ -458,16 +459,17 @@ async def generate_tailored_pitch(
             raise PitchSkipped(f"Job status {job.status} cannot be drafted")
         if not (job.description or "").strip():
             raise ValueError("Job description is empty; cannot draft a proposal")
-        block_reasons = settings_block_reasons_for_job(job, session, settings)
-        if block_reasons:
-            job.status = JobStatus.skipped.value
-            job.expires_at = None
-            note = "skipped by settings: " + "; ".join(block_reasons)
-            job.score_reason = note + (f"; {job.score_reason}" if job.score_reason else "")
-            add_event(session, "skipped", note, job.id)
-            if own:
-                session.commit()
-            raise PitchSkipped(note)
+        if job.status != JobStatus.skipped.value:
+            block_reasons = settings_block_reasons_for_job(job, session, settings)
+            if block_reasons:
+                job.status = JobStatus.skipped.value
+                job.expires_at = None
+                note = "skipped by settings: " + "; ".join(block_reasons)
+                job.score_reason = note + (f"; {job.score_reason}" if job.score_reason else "")
+                add_event(session, "skipped", note, job.id)
+                if own:
+                    session.commit()
+                raise PitchSkipped(note)
         profile = load_profile(settings)
         writer = load_proposal_settings(session)
         try:
@@ -865,7 +867,7 @@ async def submit_proposal(
                 session.commit()
             return {"status": job.status, "result": result}
         except Exception as exc:
-            detail = format_mcp_error(exc)
+            detail = compact_tool_message(format_mcp_error(exc))
             if already_applied(detail) or job.applied_on_upwork:
                 job.applied_on_upwork = True
                 job.status = JobStatus.submitted.value

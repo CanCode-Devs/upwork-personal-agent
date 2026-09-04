@@ -6,10 +6,25 @@
     <h1>Inbox</h1>
     <div class="sub">Score, then write a proposal when you want one. Autonomy: <code>{{ runtime.autonomy_mode if runtime else "manual" }}</code></div>
   </div>
+  <div class="top-actions">
+    {% if mcp and mcp.stale %}
+    <span class="page-chip warn">Upwork expired</span>
+    {% elif mcp and mcp.connected %}
+    <span class="page-chip">Upwork connected</span>
+    {% elif mcp and not mcp.connected %}
+    <span class="page-chip warn">Upwork disconnected</span>
+    {% endif %}
+  </div>
 </div>
 
 {% if oauth_notice %}
 <div class="banner {% if oauth == 'ok' %}ok{% endif %}">{{ oauth_notice }}</div>
+{% endif %}
+{% if mcp_drift %}
+<div class="banner">
+  Upwork MCP changed: {{ mcp_drift.added }} added, {{ mcp_drift.removed }} removed, {{ mcp_drift.changed }} updated.
+  <a class="btn" href="/mcp">Review tools</a>
+</div>
 {% endif %}
 {% if mcp and mcp.stale %}
 <div class="banner">
@@ -31,8 +46,6 @@
   {% endif %}
   {% if oauth_detail %}<div class="sub">{{ oauth_detail }}</div>{% endif %}
 </div>
-{% elif mcp and mcp.connected and oauth != 'ok' %}
-<div class="banner ok">Upwork MCP token on disk. Polling is active.</div>
 {% endif %}
 
 <div id="live-main">
@@ -64,100 +77,44 @@
 <div class="layout">
   <div>
     {% if jobs %}
-    <div class="job-list">
+    <div class="job-list panel card">
       {% for job in jobs %}
-      <details class="job-card" data-job-id="{{ job.id if job.local else job.url }}">
-        <summary>
-          <span class="score-stack">
-            <span class="score-pair">
-              <span class="score-label">Rel</span>
-              <span class="score">{{ job.score if job.score is not none else "—" }}</span>
-            </span>
-            <span class="score-pair">
-              <span class="score-label">Client</span>
-              <span class="score score-client">{{ job.client_score if job.client_score is not none else "—" }}</span>
-            </span>
+      {% if job.local %}
+      <a class="inbox-row" href="/jobs/{{ job.id }}" data-job-id="{{ job.id }}">
+      {% else %}
+      <div class="inbox-row" data-job-id="{{ job.url }}">
+      {% endif %}
+        <span class="score-stack">
+          <span class="score-pair">
+            <span class="score-label">Rel</span>
+            <span class="score">{{ job.score if job.score is not none else "—" }}</span>
           </span>
-          <span class="job-summary-main">
-            {% if job.local %}
-            <a href="/jobs/{{ job.id }}" onclick="event.stopPropagation()">{{ job.title }}</a>
-            {% else %}
-            <span class="job-title">{{ job.title }}</span>
-            {% endif %}
-            <span class="job-inline">{{ job.price_label }}{% if job.posted_ago %} · {{ job.posted_kind }} {{ job.posted_ago }}{% endif %} · {{ job.timezone }}{% if job.location %} · {{ job.location }}{% endif %}{% if job.proposal_count is not none %} · {{ job.proposal_count }} proposals{% endif %}{% if job.interviewing is not none %} · {{ job.interviewing }} interviewing{% endif %}</span>
+          <span class="score-pair">
+            <span class="score-label">Client</span>
+            <span class="score score-client">{{ job.client_score if job.client_score is not none else "—" }}</span>
           </span>
-          <span class="job-summary-meta">
-            {% if job.applied %}<span class="badge submitted">Applied{% if job.applied_status %} · {{ job.applied_status }}{% endif %}</span>{% endif %}
-            {% if job.local and job.status == 'pending_review' and not job.applied %}
-            {% if job.has_draft %}<span class="badge submitted">Draft ready</span>{% else %}<span class="badge needs-draft">Needs draft</span>{% endif %}
-            {% endif %}
-            <span class="badge {{ job.status }}">{{ job.status }}</span>
-          </span>
-        </summary>
-        <div class="job-expand">
-          {% if job.score_reason %}
-          <p class="job-reason">Relevance: {{ job.score_reason }}</p>
+        </span>
+        <span class="job-summary-main">
+          <span class="job-title">{{ job.title }}</span>
+          <span class="job-inline">{{ job.price_label }}{% if job.posted_ago %} · {{ job.posted_kind }} {{ job.posted_ago }}{% endif %}{% if job.proposal_count is not none %} · {{ job.proposal_count }} proposals{% endif %}</span>
+        </span>
+        <span class="job-summary-meta">
+          {% if job.applied %}<span class="badge submitted">Applied{% if job.applied_status %} · {{ job.applied_status }}{% endif %}</span>{% endif %}
+          {% if job.local and job.status == 'pending_review' and not job.applied %}
+          {% if job.has_draft %}<span class="badge submitted">Draft ready</span>{% else %}<span class="badge needs-draft">Needs draft</span>{% endif %}
           {% endif %}
-          {% if job.client_score_reason %}
-          <p class="job-reason">Client: {{ job.client_score_reason }}</p>
-          {% endif %}
-          <div class="facts">
-            {% for fact in job.facts %}
-            <div><span>{{ fact.label }}</span><b>{{ fact.value }}</b></div>
-            {% endfor %}
-          </div>
-          {% if not job.facts %}
-          <p class="empty" style="padding:8px 0">No extra client details yet. Poll again to refresh.</p>
-          {% endif %}
-          {% if job.description %}
-          <h3>Posting</h3>
-          <div class="prose job-snippet">{{ job.description }}</div>
-          {% endif %}
-          {% if job.open_contracts %}
-          <h3>Open client contracts</h3>
-          {% for item in job.open_contracts %}
-          <div class="event"><b>{{ item.title }}</b> — {{ item.detail }}</div>
-          {% endfor %}
-          {% endif %}
-          {% if job.closed_contracts %}
-          <h3>Recent closed contracts</h3>
-          {% for item in job.closed_contracts %}
-          <div class="event"><b>{{ item.title }}</b> — {{ item.detail }}</div>
-          {% endfor %}
-          {% endif %}
-          {% if job.client_reviews %}
-          <h3>Freelancer reviews of this client</h3>
-          {% for item in job.client_reviews %}
-          <div class="event">
-            {% if item.reviewer %}<b>{{ item.reviewer }}</b> — {% endif %}
-            {% if item.rating is not none %}{{ item.rating }}★ · {% endif %}
-            {{ item.title }}
-            {% if item.comment %}<div>{{ item.comment }}</div>{% endif %}
-          </div>
-          {% endfor %}
-          {% endif %}
-          {% if job.attachments %}
-          <h3>Posting attachments</h3>
-          {% for item in job.attachments %}
-          <div class="event">
-            {% if item.local_url %}<a href="{{ item.local_url }}">{{ item.filename }}</a>
-            {% elif item.url %}<a href="{{ item.url }}" target="_blank" rel="noreferrer">{{ item.filename }}</a>
-            {% else %}{{ item.filename }}{% endif %}
-            {% if item.error %} — {{ item.error }}{% endif %}
-            {% if item.text %}<div class="job-snippet">{{ item.text[:400] }}</div>{% endif %}
-          </div>
-          {% endfor %}
-          {% endif %}
-          <div class="actions" style="margin-top:12px">
-            {% if job.local %}<a class="btn secondary" href="/jobs/{{ job.id }}">Open job</a>{% endif %}
-            {% if job.url %}<a class="btn secondary" href="{{ job.url }}" target="_blank" rel="noreferrer">Upwork</a>{% endif %}
-          </div>
-        </div>
-      </details>
+          <span class="badge {{ job.status }}">{{ job.status }}</span>
+        </span>
+        {% if job.local %}<span class="btn secondary inbox-open">Open</span>{% endif %}
+      {% if job.local %}
+      </a>
+      {% else %}
+      </div>
+      {% endif %}
       {% endfor %}
     </div>
     {% else %}
-    <p class="empty">No jobs in this view yet. Connect Upwork and click Poll now, or wait for the next interval.</p>
+    <p class="empty">{% if mcp and not mcp.connected %}No jobs yet. Connect Upwork, then Poll now to fill the inbox.{% else %}No jobs in this view yet. Connect Upwork and click Poll now, or wait for the next interval.{% endif %}</p>
     {% endif %}
   </div>
   <aside class="card">
@@ -165,7 +122,17 @@
     {% for event in events %}
     <div class="event">
       <time>{{ event.created_at|dt }}</time>
+      {% if event.kind == 'search' %}
+        {% set lines = event.message.split('\n') %}
+        <details class="search-report">
+          <summary>search — {{ lines[0] }}</summary>
+          <ul>
+            {% for line in lines[1:] %}<li>{{ line }}</li>{% endfor %}
+          </ul>
+        </details>
+      {% else %}
         {{ event.kind }}{% if event.user %} · {{ event.user.username }}{% endif %} — {{ event.message }}
+      {% endif %}
     </div>
     {% else %}
     <div class="event">No events yet.</div>

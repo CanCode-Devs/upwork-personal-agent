@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from app.agent import run_agent_cycle
 from app.config import Settings, get_settings
 from app.models import PollStatus, PollStatusView
+from app.poll_state import clear_sweep, sweep_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -24,40 +25,70 @@ class PollScheduler:
         self._pending_source = ""
         self._source = ""
         self._started_at: datetime | None = None
+        self._last_started_at: datetime | None = None
         self._last_finished_at: datetime | None = None
         self._next_poll_at: datetime | None = None
         self._last_new = 0
         self._last_updated = 0
-        self._interval = 15 * 60
+        self._interval = 900
+        self._cooldown = 300
 
-    def configure(self, interval_seconds: int) -> None:
-        self._interval = max(60, interval_seconds)
+    def configure(self, interval_seconds: int, cooldown_seconds: int) -> None:
+        self._interval = max(1, interval_seconds)
+        self._cooldown = max(1, cooldown_seconds)
         if self._polling or self._pending_source:
             return
         now = _utc_now()
-        if self._last_finished_at is not None:
-            scheduled = self._last_finished_at + timedelta(seconds=self._interval)
-            new_next = now if scheduled <= now else scheduled
-            if self._next_poll_at != new_next:
-                earlier = self._next_poll_at is None or new_next < self._next_poll_at
-                self._next_poll_at = new_next
-                if earlier and self._loop_running:
-                    self._wake.set()
+        scheduled = self._scheduled_auto_poll()
+        if scheduled is None:
+            if self._next_poll_at is None:
+                self._next_poll_at = now
             return
-        if self._next_poll_at is None:
-            self._next_poll_at = now
+        new_next = now if scheduled <= now else scheduled
+        if self._next_poll_at != new_next:
+            earlier = self._next_poll_at is None or new_next < self._next_poll_at
+            self._next_poll_at = new_next
+            if earlier and self._loop_running:
+                self._wake.set()
+
+    def _scheduled_auto_poll(self) -> datetime | None:
+        if self._last_finished_at is None:
+            return None
+        finished = self._last_finished_at + timedelta(seconds=self._cooldown)
+        if self._last_started_at is None:
+            return finished
+        started = self._last_started_at + timedelta(seconds=self._interval)
+        return max(finished, started)
 
     def snapshot(self) -> PollStatusView:
         pending = bool(self._pending_source)
+        polling = self._polling or pending
+        sweep = sweep_snapshot()
+        next_at = self._next_poll_at
+        phase = "idle"
+        query = ""
+        if self._polling:
+            phase = sweep["phase"] or "searching"
+            query = sweep["query"]
+            iso = sweep["next_at"]
+            next_at = datetime.fromisoformat(iso) if iso else None
+        elif pending:
+            phase = "pending"
+            next_at = None
+        elif self._last_finished_at is not None:
+            phase = "cooldown"
         return PollStatusView(
-            polling=self._polling or pending,
+            polling=polling,
             source=self._source or self._pending_source,
-            next_poll_at=None if (self._polling or pending) else self._next_poll_at,
+            next_poll_at=None if pending else next_at,
             last_finished_at=self._last_finished_at,
             started_at=self._started_at,
             interval_seconds=self._interval,
             last_new=self._last_new,
             last_updated=self._last_updated,
+            phase=phase,
+            query=query,
+            inbox_rev=int(sweep["inbox_rev"]),
         )
 
     async def trigger(self, settings: Settings | None = None) -> None:
@@ -71,13 +102,13 @@ class PollScheduler:
         await self._run_once(settings or get_settings(), "manual")
 
     async def run_loop(self, settings: Settings) -> None:
-        self.configure(settings.poll_interval_minutes * 60)
+        self.configure(settings.poll_interval_seconds, settings.poll_cooldown_seconds)
         self._loop_running = True
         self._pending_source = "auto"
         try:
             while True:
                 current = get_settings()
-                self.configure(current.poll_interval_minutes * 60)
+                self.configure(current.poll_interval_seconds, current.poll_cooldown_seconds)
                 remaining = self._seconds_until_next()
                 if remaining > 0:
                     try:
@@ -107,6 +138,7 @@ class PollScheduler:
             self._source = self._pending_source or source
             self._pending_source = ""
             self._started_at = _utc_now()
+            self._last_started_at = self._started_at
             self._next_poll_at = None
             self._last_new = 0
             self._last_updated = 0
@@ -117,18 +149,24 @@ class PollScheduler:
             except Exception:
                 logger.exception("Poll cycle failed")
             finally:
+                clear_sweep()
                 self._polling = False
                 self._source = ""
                 self._started_at = None
                 self._last_finished_at = _utc_now()
-                self._next_poll_at = self._last_finished_at + timedelta(seconds=self._interval)
+                self._next_poll_at = self._scheduled_auto_poll()
 
 
 _scheduler = PollScheduler()
 
 
+def _sync_scheduler() -> None:
+    settings = get_settings()
+    _scheduler.configure(settings.poll_interval_seconds, settings.poll_cooldown_seconds)
+
+
 def get_poll_status() -> PollStatusView:
-    _scheduler.configure(get_settings().poll_interval_minutes * 60)
+    _sync_scheduler()
     return _scheduler.snapshot()
 
 

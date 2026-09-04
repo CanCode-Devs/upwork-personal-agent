@@ -7,7 +7,7 @@ from app.db.models import Job, Proposal
 from app.embeddings import add_embedding
 from app.events import add_event
 from app.milestones import dump_milestones
-from app.models import EmbeddingSource, FeedbackOutcome, JobStatus, ProposalMilestone, ScreeningAnswer
+from app.models import ACTIONABLE_STATUSES, EmbeddingSource, FeedbackOutcome, JobStatus, ProposalMilestone, ScreeningAnswer
 from app.profile import load_overlay
 from app.proposal_settings import load_proposal_settings
 from app.proposal_writer import (
@@ -60,7 +60,7 @@ async def approve_and_submit(
 ) -> Job:
     if job.applied_on_upwork:
         raise ValueError("Already applied on Upwork")
-    if job.status not in {JobStatus.pending_review.value, JobStatus.submit_failed.value}:
+    if job.status not in ACTIONABLE_STATUSES:
         raise ValueError(f"Job cannot be approved from status {job.status}")
     letter = (cover_letter or "").strip() or cover_letter_for(job)
     if not letter:
@@ -125,14 +125,14 @@ async def approve_and_submit(
         certificate_ids=certificate_ids,
         attachment_uids=attachment_uids,
     )
-    db.refresh(job)
     _ = client
-    _ = result
+    if result.get("status") == JobStatus.submit_failed.value:
+        raise RuntimeError(result.get("result") or "Submit failed")
     return job
 
 
 async def reject_job(db: Session, job: Job, reason: str = "", user_id: int | None = None) -> Job:
-    if job.status not in {JobStatus.pending_review.value, JobStatus.submit_failed.value}:
+    if job.status not in ACTIONABLE_STATUSES:
         raise ValueError(f"Job cannot be rejected from status {job.status}")
     job.status = JobStatus.rejected.value
     note = reason.strip() or "Rejected from dashboard"

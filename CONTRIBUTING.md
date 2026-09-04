@@ -16,12 +16,13 @@ Use this only if you already have Python 3.12+ and can install the packages in `
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
-cp profiles/example.yaml profiles/default.yaml
 mkdir -p data
+cp profiles/example.yaml profiles/default.yaml
 python -m app.cli.warmup_embeddings
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
+
+Open the app and create the admin on first visit. Add the OpenAI key on **Config**. Optional: copy `.env.example` to `.env` for file-based overrides.
 
 Do not add or change dependencies in a PR without saying so in the description. Prefer Docker for a match with production.
 

@@ -285,16 +285,33 @@ def llm_screening_answers(
     return filled
 
 
+def _collect_query_strings(raw: object) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        text = " ".join(str(item or "").split())
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
+
+
 def llm_suggest_search_queries(context: SearchQueryContext, settings: Settings) -> list[str]:
     _require_key(settings)
     client = _client(settings)
     system = (
-        "You propose Upwork job-search keyword queries for one freelancer. "
-        "Return JSON only with key queries: an array of 6 to 10 short strings. "
-        "Each query is 3 to 7 keywords like 'LLM RAG LangGraph production'. "
+        "You propose Upwork job searches for one freelancer. "
+        "Return JSON only with job_titles (2 to 4 client-style titles like 'AI Engineer') "
+        "and title_keywords (4 to 6 short keyword queries). Combined 6 to 10 strings. "
         "Use only skills and work that appear in the profile or history. "
-        "Never suggest excluded keywords. Do not repeat current_queries. "
-        "Prefer specific stacks over generic titles like AI engineer."
+        "Never suggest title_exclude_keywords or exclude_keywords. "
+        "Do not repeat job_titles, title_keywords, or current_queries."
     )
     user = json.dumps(context, ensure_ascii=False, indent=2)
     parsed = _complete_json(
@@ -306,17 +323,14 @@ def llm_suggest_search_queries(context: SearchQueryContext, settings: Settings) 
         ],
         0.3,
     )
-    raw = parsed.get("queries")
-    if not isinstance(raw, list):
-        raw = parsed.get("search_queries")
-    if not isinstance(raw, list):
-        return []
+    titles = _collect_query_strings(parsed.get("job_titles"))
+    keywords = _collect_query_strings(parsed.get("title_keywords"))
+    legacy = _collect_query_strings(parsed.get("queries"))
+    if not legacy:
+        legacy = _collect_query_strings(parsed.get("search_queries"))
     out: list[str] = []
     seen: set[str] = set()
-    for item in raw:
-        text = " ".join(str(item or "").split())
-        if not text:
-            continue
+    for text in [*titles, *keywords, *legacy]:
         key = text.lower()
         if key in seen:
             continue

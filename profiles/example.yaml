@@ -9,6 +9,14 @@ skills:
   - TypeScript
   - APIs
   - PostgreSQL
+job_titles: []
+title_keywords:
+  - Python API backend
+  - TypeScript full stack
+  - PostgreSQL
+title_exclude_keywords:
+  - wordpress
+  - data entry
 exclude_keywords:
   - wordpress
   - data entry

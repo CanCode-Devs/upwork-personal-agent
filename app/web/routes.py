@@ -18,15 +18,26 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session, selectinload
 
 from app.actions import approve_and_submit, cover_letter_for, latest_proposal, reject_job, save_edit, save_hourly_quote
-from app.auth import COOKIE_NAME, create_session_value, current_user, hash_password, verify_password
-from app.config import Settings, get_settings
+from app.auth import COOKIE_NAME, create_session_value, current_user, hash_password, needs_setup, user_count, verify_password
+from app.config import STUDIO_NAME, STUDIO_SLOGAN, STUDIO_URL, Settings, get_settings
+from app.env_store import (
+    SecretWrite,
+    VariablesWrite,
+    config_page_view,
+    delete_secret,
+    ensure_poll_interval_floor,
+    persist_and_reload,
+    save_secret,
+    save_variables,
+    set_owner_username,
+)
 from app.models import (
+    ACTIONABLE_STATUSES,
     ApplyHighlight,
     ConnectsPanel,
     DashboardUserCreate,
     EngagementFilter,
     FeedbackOutcome,
-    FreelancerProfile,
     InboxCounts,
     InboxSort,
     JobStatus,
@@ -36,6 +47,7 @@ from app.models import (
     PitchTone,
     ScreeningAnswer,
     SessionUser,
+    SetupCreate,
     UserRole,
     WorkKind,
     WorkOrigin,
@@ -94,7 +106,8 @@ from app.search_queries import (
 from app.tools.discovery import apply_runtime_filters, ensure_client_scores
 from app.tools.execution import HIGHLIGHT_PICK, PitchSkipped, generate_tailored_pitch, heal_applied_status, job_is_fixed, local_job_highlights, quote_amount_for_job, rank_highlights
 from app.tools.memory import learn_preference, log_interaction_feedback, save_agent_item, update_portfolio_matrix
-from app.upwork.mcp_client import UpworkMcpClient, already_applied, connects_shortage, format_mcp_error, oauth_needs_login, public_job_url, job_ref_keys
+from app.upwork.mcp_catalog import accept_pending, load_catalog, pending_drift_counts, sync_catalog_after_connect
+from app.upwork.mcp_client import UpworkMcpClient, already_applied, compact_tool_message, connects_shortage, format_mcp_error, oauth_needs_login, public_job_url, job_ref_keys
 from app.upwork.oauth import (
     OAuthCallbackPayload,
     WebOAuthFlow,
@@ -148,10 +161,14 @@ def render(request: Request, name: str, context: dict | None = None, status_code
     user = payload.get("user") or current_user(request)
     payload.setdefault("app_name", settings.app_name)
     payload.setdefault("app_tagline", settings.app_tagline)
+    payload.setdefault("studio_name", STUDIO_NAME)
+    payload.setdefault("studio_url", STUDIO_URL)
+    payload.setdefault("studio_slogan", STUDIO_SLOGAN)
     payload.setdefault("asset_v", str(int(_STYLE_PATH.stat().st_mtime)) if _STYLE_PATH.exists() else "1")
     payload.setdefault("user", user)
     payload.setdefault("can", flags_for(user))
     payload.setdefault("poll", poll_status_payload())
+    payload.setdefault("openai_key_missing", not bool((settings.openai_api_key or "").strip()))
     return templates.TemplateResponse(request, name, payload, status_code=status_code)
 
 
@@ -223,8 +240,29 @@ def _user(request: Request) -> SessionUser:
     return user
 
 
+def _session_redirect(settings: Settings, username: str, url: str) -> Response:
+    response = RedirectResponse(url, status_code=303)
+    response.set_cookie(
+        COOKIE_NAME,
+        create_session_value(settings, username),
+        httponly=True,
+        samesite="lax",
+        max_age=60 * 60 * 24 * 14,
+    )
+    return response
+
+
+def _setup_error_message(exc: ValidationError) -> str:
+    for item in exc.errors():
+        if "mismatch" in str(item.get("msg", "")):
+            return "Passwords do not match."
+    return "Username and password are required."
+
+
 @router.get("/login", response_class=HTMLResponse)
 def login_page(request: Request, error: str | None = None) -> Response:
+    if needs_setup():
+        return RedirectResponse("/setup", status_code=303)
     if current_user(request) is not None:
         return RedirectResponse("/", status_code=303)
     return render(request, "login.html", {"error": error})
@@ -238,6 +276,8 @@ def login_submit(
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> Response:
+    if needs_setup():
+        return RedirectResponse("/setup", status_code=303)
     user = db.query(User).filter(User.username == username).one_or_none()
     if user is None or not user.is_active or not verify_password(password, user.password_hash):
         return render(
@@ -246,15 +286,47 @@ def login_submit(
             {"error": "Invalid username or password"},
             status_code=401,
         )
-    response = RedirectResponse("/", status_code=303)
-    response.set_cookie(
-        COOKIE_NAME,
-        create_session_value(settings, user.username),
-        httponly=True,
-        samesite="lax",
-        max_age=60 * 60 * 24 * 14,
-    )
-    return response
+    return _session_redirect(settings, user.username, "/")
+
+
+@router.get("/setup", response_class=HTMLResponse)
+def setup_page(request: Request, db: Session = Depends(get_db)) -> Response:
+    if user_count(db) > 0:
+        return RedirectResponse("/login", status_code=303)
+    return render(request, "setup.html", {"error": ""})
+
+
+@router.post("/setup")
+def setup_submit(
+    request: Request,
+    username: str = Form(""),
+    password: str = Form(""),
+    password_confirm: str = Form(""),
+    db: Session = Depends(get_db),
+) -> Response:
+    if user_count(db) > 0:
+        return RedirectResponse("/login", status_code=303)
+    try:
+        payload = SetupCreate(username=username, password=password, password_confirm=password_confirm)
+    except ValidationError as exc:
+        return render(
+            request,
+            "setup.html",
+            {"error": _setup_error_message(exc)},
+            status_code=400,
+        )
+    try:
+        create_dashboard_user(db, payload.username, hash_password(payload.password), UserRole.admin.value)
+    except UserMutationError:
+        return render(
+            request,
+            "setup.html",
+            {"error": "Could not create that account. Try a different username."},
+            status_code=400,
+        )
+    set_owner_username(db, payload.username)
+    settings = persist_and_reload(db)
+    return _session_redirect(settings, payload.username, "/config")
 
 
 @router.post("/logout")
@@ -340,6 +412,7 @@ async def inbox(
             "oauth_notice": oauth_notice,
             "oauth": oauth or "",
             "oauth_detail": pop_last_oauth_error() if oauth == "failed" else "",
+            "mcp_drift": pending_drift_counts(),
         },
     )
 
@@ -395,11 +468,11 @@ async def job_detail(
         .order_by(FeedbackLog.created_at.desc())
         .all()
     )
-    can_act = job.status in {JobStatus.pending_review.value, JobStatus.submit_failed.value} and not job.applied_on_upwork
+    can_act = job.status in ACTIONABLE_STATUSES and not job.applied_on_upwork
     applied_ids = {row.posting_id for row in db.query(UpworkApplication).all()}
     if can_act and mark_jobs_applied(db, applied_ids, "Matched an Upwork proposal"):
         db.refresh(job)
-        can_act = job.status in {JobStatus.pending_review.value, JobStatus.submit_failed.value} and not job.applied_on_upwork
+        can_act = job.status in ACTIONABLE_STATUSES and not job.applied_on_upwork
     writer = load_proposal_settings(db)
     letter = cover_letter_for(job, db)
     has_draft = bool(letter.strip())
@@ -513,11 +586,11 @@ async def job_detail(
             highlights.append(ApplyHighlight(kind="upwork_job", id=hid, title=hid, selected=True))
     kind_order = {"upwork_job": 0, "portfolio": 1, "certificate": 2, "profile_history": 3}
     highlights.sort(key=lambda item: (not item.selected, kind_order.get(item.kind, 9), item.title.lower()))
-    submit_error = (proposal.submit_error if proposal is not None else None) or ""
+    submit_error = compact_tool_message((proposal.submit_error if proposal is not None else None) or "")
     if not submit_error:
         for event in events:
             if event.kind == "submit_failed" and event.message:
-                submit_error = event.message
+                submit_error = compact_tool_message(event.message)
                 break
     oauth_stale = oauth_needs_login(submit_error)
     application = application_for_job(job, db=db)
@@ -706,7 +779,7 @@ def save_job_quote(
     job = db.query(Job).options(selectinload(Job.proposals)).filter(Job.id == job_id).one_or_none()
     if job is None:
         return RedirectResponse("/", status_code=303)
-    if job.applied_on_upwork or job.status not in {JobStatus.pending_review.value, JobStatus.submit_failed.value}:
+    if job.applied_on_upwork or job.status not in ACTIONABLE_STATUSES:
         return RedirectResponse(f"/jobs/{job.id}?error=blocked", status_code=303)
     if job_is_fixed(job):
         return RedirectResponse(f"/jobs/{job.id}", status_code=303)
@@ -729,7 +802,7 @@ async def regenerate_job(
     job = db.query(Job).options(selectinload(Job.proposals)).filter(Job.id == job_id).one_or_none()
     if job is None:
         return RedirectResponse("/", status_code=303)
-    if job.applied_on_upwork or job.status not in {JobStatus.pending_review.value, JobStatus.submit_failed.value}:
+    if job.applied_on_upwork or job.status not in ACTIONABLE_STATUSES:
         return RedirectResponse(f"/jobs/{job.id}?error=blocked", status_code=303)
     had_draft = bool(cover_letter_for(job, db).strip())
     points = [line.strip(" -•\t") for line in comments.splitlines() if line.strip()]
@@ -820,9 +893,10 @@ async def approve_job(
     except UnprovenAnswersError:
         return RedirectResponse(f"/jobs/{job.id}?error=unproven", status_code=303)
     except (ValueError, RuntimeError, Exception) as exc:
-        add_event(db, "submit_failed", format_mcp_error(exc), job.id, user_id=user["id"])
+        add_event(db, "submit_failed", compact_tool_message(format_mcp_error(exc)), job.id, user_id=user["id"])
         logger.exception("approve/submit failed for job %s", job.id)
-    return RedirectResponse(f"/jobs/{job.id}", status_code=303)
+        return RedirectResponse(f"/jobs/{job.id}?error=submit", status_code=303)
+    return RedirectResponse(f"/jobs/{job.id}?submitted=1", status_code=303)
 
 
 @router.post("/jobs/{job_id}/reject")
@@ -861,9 +935,17 @@ async def poll_now(
 async def _complete_web_login(flow: WebOAuthFlow) -> None:
     try:
         tools = await UpworkMcpClient().login(mode="web", web_flow=flow)
+        catalog = sync_catalog_after_connect(tools)
+        pending = catalog.pending
+        if pending is not None and pending.has_changes():
+            note = (
+                f"MCP catalog changed: +{len(pending.added)} -{len(pending.removed)} ~{len(pending.changed)}"
+            )
+        else:
+            note = f"MCP connected ({len(tools)} tools)"
         db = SessionLocal()
         try:
-            add_event(db, "upwork", f"MCP connected ({len(tools)} tools)")
+            add_event(db, "upwork", note)
             db.commit()
         finally:
             db.close()
@@ -958,6 +1040,37 @@ async def upwork_callback(
     return RedirectResponse("/?oauth=ok", status_code=303)
 
 
+@router.get("/mcp", response_class=HTMLResponse)
+def mcp_catalog_page(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.review)),
+) -> Response:
+    catalog = load_catalog()
+    return render(
+        request,
+        "mcp.html",
+        {
+            "user": user,
+            "counts": _counts(db),
+            "catalog": catalog,
+            "accepted": request.query_params.get("accepted") == "1",
+        },
+    )
+
+
+@router.post("/mcp/accept")
+def mcp_catalog_accept(
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.upwork_connect)),
+) -> Response:
+    catalog = accept_pending()
+    pending = catalog.pending
+    if pending is None or not pending.has_changes():
+        add_event(db, "upwork", f"MCP catalog accepted ({len(catalog.tools)} tools)", user_id=user["id"])
+    return RedirectResponse("/mcp?accepted=1", status_code=303)
+
+
 @router.get("/history", response_class=HTMLResponse)
 def history(
     request: Request,
@@ -1016,6 +1129,98 @@ async def job_outcome(
 def settings_alias(user: SessionUser = Depends(require_permission(Permission.settings))) -> Response:
     _ = user
     return RedirectResponse("/preferences", status_code=303)
+
+
+@router.get("/config", response_class=HTMLResponse)
+def config_page(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
+) -> Response:
+    saved = request.query_params.get("saved") or ""
+    error = request.query_params.get("error") or ""
+    return render(
+        request,
+        "config.html",
+        {
+            "user": user,
+            "page": config_page_view(settings),
+            "saved": saved,
+            "error": error,
+        },
+    )
+
+
+@router.post("/config/secrets/{key}")
+def config_save_secret(
+    key: str,
+    value: str = Form(""),
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
+) -> Response:
+    _ = user
+    try:
+        payload = SecretWrite(key=key, value=value)
+    except ValidationError:
+        return RedirectResponse("/config?error=secret", status_code=303)
+    save_secret(db, payload)
+    persist_and_reload(db)
+    return RedirectResponse("/config?saved=secret", status_code=303)
+
+
+@router.post("/config/secrets/{key}/delete")
+def config_delete_secret(
+    key: str,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
+) -> Response:
+    _ = user
+    try:
+        delete_secret(db, key)
+    except ValueError:
+        return RedirectResponse("/config?error=secret", status_code=303)
+    persist_and_reload(db)
+    return RedirectResponse("/config?saved=deleted", status_code=303)
+
+
+@router.post("/config/variables")
+def config_save_variables(
+    openai_base_url: str = Form(""),
+    openai_model: str = Form(""),
+    openai_draft_model: str = Form(""),
+    app_name: str = Form(""),
+    app_tagline: str = Form(""),
+    search_gap_seconds: str = Form(""),
+    find_jobs_min_interval_seconds: str = Form(""),
+    poll_cooldown_seconds: str = Form(""),
+    poll_interval_seconds: str = Form(""),
+    approval_ttl_hours: str = Form(""),
+    embedding_model: str = Form(""),
+    upwork_mcp_url: str = Form(""),
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.settings)),
+) -> Response:
+    _ = user
+    try:
+        payload = VariablesWrite(
+            openai_base_url=openai_base_url,
+            openai_model=openai_model,
+            openai_draft_model=openai_draft_model,
+            app_name=app_name,
+            app_tagline=app_tagline,
+            search_gap_seconds=int(search_gap_seconds),
+            find_jobs_min_interval_seconds=int(find_jobs_min_interval_seconds),
+            poll_cooldown_seconds=int(poll_cooldown_seconds),
+            poll_interval_seconds=int(poll_interval_seconds),
+            approval_ttl_hours=int(approval_ttl_hours),
+            embedding_model=embedding_model,
+            upwork_mcp_url=upwork_mcp_url,
+        )
+    except (ValidationError, ValueError):
+        return RedirectResponse("/config?error=variables", status_code=303)
+    save_variables(db, payload)
+    persist_and_reload(db)
+    return RedirectResponse("/config?saved=vars", status_code=303)
 
 
 def _opt_int(value: str) -> int | None:
@@ -1408,26 +1613,31 @@ def save_profile_overlay(
     working_hours: str = Form(""),
     voice: str = Form(""),
     skills: str = Form(""),
-    exclude_keywords: str = Form(""),
-    search_queries: str = Form(""),
+    job_titles: str = Form(""),
+    title_keywords: str = Form(""),
+    title_exclude_keywords: str = Form(""),
     db: Session = Depends(get_db),
     user: SessionUser = Depends(require_permission(Permission.settings)),
 ) -> Response:
     _ = user
     rate = int(hourly_rate) if hourly_rate.strip().isdigit() else None
-    overlay = FreelancerProfile(
-        name=name.strip(),
-        title=title.strip(),
-        hourly_rate=rate,
-        working_hours=working_hours.strip(),
-        voice=voice.strip() or "concise, specific, no fluff",
-        skills=[part.strip() for part in skills.split(",") if part.strip()],
-        exclude_keywords=[part.strip() for part in exclude_keywords.split(",") if part.strip()],
-        search_queries=[part.strip() for part in search_queries.split("\n") if part.strip()],
-    )
+    overlay = load_overlay(get_settings())
+    overlay.name = name.strip()
+    overlay.title = title.strip()
+    overlay.hourly_rate = rate
+    overlay.working_hours = working_hours.strip()
+    overlay.voice = voice.strip() or "concise, specific, no fluff"
+    overlay.skills = [part.strip() for part in skills.split(",") if part.strip()]
+    overlay.job_titles = [part.strip() for part in job_titles.split("\n") if part.strip()]
+    overlay.title_keywords = [part.strip() for part in title_keywords.split("\n") if part.strip()]
+    overlay.title_exclude_keywords = [
+        part.strip() for part in title_exclude_keywords.split(",") if part.strip()
+    ]
     save_overlay(overlay)
     apply_runtime_filters(db)
-    return RedirectResponse("/preferences", status_code=303)
+    if ensure_poll_interval_floor(db):
+        persist_and_reload(db)
+    return RedirectResponse("/preferences?tab=profile", status_code=303)
 
 
 @router.post("/preferences/search-queries/suggest")
@@ -1441,9 +1651,9 @@ def suggest_profile_queries(
         pending = suggest_search_queries(db, settings)
     except Exception:
         logger.exception("search query suggestion failed")
-        return RedirectResponse("/preferences?error=suggest", status_code=303)
+        return RedirectResponse("/preferences?tab=profile&error=suggest", status_code=303)
     flag = "suggested" if pending else "empty"
-    return RedirectResponse(f"/preferences?{flag}=1", status_code=303)
+    return RedirectResponse(f"/preferences?tab=profile&{flag}=1", status_code=303)
 
 
 @router.post("/preferences/search-queries/add")
@@ -1458,7 +1668,9 @@ def add_suggested_query(
     save_overlay(overlay)
     runtime = get_or_create_runtime(db)
     remove_pending_query(runtime, query)
-    return RedirectResponse("/preferences?added=1", status_code=303)
+    if ensure_poll_interval_floor(db):
+        persist_and_reload(db)
+    return RedirectResponse("/preferences?tab=profile&added=1", status_code=303)
 
 
 @router.post("/preferences/search-queries/dismiss")
@@ -1470,7 +1682,7 @@ def dismiss_suggested_query(
     _ = user
     runtime = get_or_create_runtime(db)
     dismiss_search_query(runtime, query)
-    return RedirectResponse("/preferences?dismissed=1", status_code=303)
+    return RedirectResponse("/preferences?tab=profile&dismissed=1", status_code=303)
 
 
 @router.get("/portfolio", response_class=HTMLResponse)
@@ -1790,7 +2002,7 @@ _USER_ERRORS = {
     "empty": "Username and password are required.",
     "invalid_role": "Choose Admin or Reviewer.",
     "last_admin": "Keep at least one active admin.",
-    "owner": "The env bootstrap account stays admin and active.",
+    "owner": "The owner account stays admin and active.",
     "missing": "That user is gone.",
 }
 

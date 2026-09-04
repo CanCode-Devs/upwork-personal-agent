@@ -618,8 +618,9 @@ def hard_gate_reasons(
         )
     )
     lowered = (blob or "").lower()
-    for word in profile.exclude_keywords:
-        if word.lower() in lowered:
+    title_l = (title or "").lower()
+    for word in profile.title_exclude_keywords or profile.exclude_keywords:
+        if word.lower() in title_l:
             reasons.append(f"excluded keyword: {word}")
     for rule in rules:
         if rule.enforcement_level == "strict_block" and _rule_matches(rule.rule, lowered):
@@ -754,15 +755,17 @@ async def fetch_live_jobs(
     category_id: str = "",
     limit: int = 30,
     client: UpworkMcpClient | None = None,
+    min_posted: datetime | None = None,
 ) -> list[JobPayload]:
     args = FetchLiveJobsArgs(
         query_keywords=query_keywords,
         category_id=category_id,
         limit=limit,
+        min_posted=min_posted,
     )
     mcp = client or UpworkMcpClient()
     pages = max(1, (max(1, args.limit) + 9) // 10)
-    jobs = await mcp.search_jobs(args.query_keywords, max_pages=pages)
+    jobs = await mcp.search_jobs(args.query_keywords, max_pages=pages, min_posted=args.min_posted)
     return jobs[: max(1, args.limit)]
 
 
@@ -897,8 +900,9 @@ def score_relevance(
                 score -= matrix.soft_penalty
                 breakdown.append(f"soft_penalty: {rule.rule}")
 
-        for word in profile.exclude_keywords:
-            if word.lower() in blob:
+        title_l = (args.title or "").lower()
+        for word in profile.title_exclude_keywords or profile.exclude_keywords:
+            if word.lower() in title_l:
                 blocked = True
                 breakdown.append(f"excluded keyword: {word}")
 

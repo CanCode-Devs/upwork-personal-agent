@@ -15,7 +15,7 @@ from app.models import (
     WorkKind,
     WorkOrigin,
 )
-from app.profile import load_profile
+from app.profile import load_profile, unique_terms
 from app.runtime import get_or_create_runtime
 
 _DESC_LIMIT = 400
@@ -124,17 +124,58 @@ def build_search_context(profile: FreelancerProfile, db: Session) -> SearchQuery
         "skills": list(profile.skills),
         "hourly_rate": profile.hourly_rate,
         "voice": profile.voice,
-        "exclude_keywords": list(profile.exclude_keywords),
-        "current_queries": list(profile.search_queries),
+        "exclude_keywords": list(profile.title_exclude_keywords or profile.exclude_keywords),
+        "job_titles": list(profile.job_titles),
+        "title_keywords": list(profile.title_keywords),
+        "title_exclude_keywords": list(profile.title_exclude_keywords or profile.exclude_keywords),
+        "current_queries": unique_terms([*profile.job_titles, *profile.title_keywords]) or list(profile.search_queries),
         "upwork_overview": (profile.upwork_overview or "")[:2000],
     }
     return {"profile": packed, "upwork_history": upwork, "agent_history": agent}
 
 
+def min_poll_interval_seconds(query_count: int, gap: int, cooldown: int) -> int:
+    return max(0, int(query_count)) * max(1, int(gap)) + max(1, int(cooldown))
+
+
+def clamped_poll_interval_seconds(
+    interval: int,
+    query_count: int,
+    gap: int,
+    cooldown: int,
+) -> int:
+    return max(max(1, int(interval)), min_poll_interval_seconds(query_count, gap, cooldown))
+
+
+def poll_queries(profile: FreelancerProfile, settings: Settings | None = None) -> list[str]:
+    settings = settings or get_settings()
+    combined = unique_terms([*profile.job_titles, *profile.title_keywords])
+    if combined:
+        return combined
+    fallback = unique_terms(profile.search_queries)
+    if fallback:
+        return fallback
+    return unique_terms([part.strip() for part in settings.search_queries.split(",") if part.strip()])
+
+
+def title_exclude_terms(profile: FreelancerProfile) -> list[str]:
+    terms = unique_terms(profile.title_exclude_keywords)
+    if terms:
+        return terms
+    return unique_terms(profile.exclude_keywords)
+
+
+def job_title_excluded(title: str, terms: list[str]) -> bool:
+    lowered = (title or "").lower()
+    return any(word.lower() in lowered for word in terms if word.strip())
+
+
 def _blocked_keys(profile: FreelancerProfile, dismissed: list[str]) -> set[str]:
-    keys = {normalize_query(item) for item in profile.search_queries}
+    keys = {normalize_query(item) for item in profile.job_titles}
+    keys.update(normalize_query(item) for item in profile.title_keywords)
+    keys.update(normalize_query(item) for item in profile.search_queries)
     keys.update(normalize_query(item) for item in dismissed)
-    keys.update(normalize_query(item) for item in profile.exclude_keywords)
+    keys.update(normalize_query(item) for item in title_exclude_terms(profile))
     return {item for item in keys if item}
 
 
@@ -144,7 +185,7 @@ def filter_suggestions(
     dismissed: list[str],
 ) -> list[str]:
     blocked = _blocked_keys(profile, dismissed)
-    exclude = [item.lower() for item in profile.exclude_keywords if item.strip()]
+    exclude = [item.lower() for item in title_exclude_terms(profile) if item.strip()]
     out: list[str] = []
     seen: set[str] = set()
     for item in queries:
@@ -180,8 +221,10 @@ def accept_search_query(overlay: FreelancerProfile, query: str) -> FreelancerPro
     if not text:
         return overlay
     key = normalize_query(text)
-    existing = [item for item in overlay.search_queries if normalize_query(item) != key]
-    overlay.search_queries = [*existing, text]
+    if any(normalize_query(item) == key for item in overlay.job_titles):
+        return overlay
+    existing = [item for item in overlay.title_keywords if normalize_query(item) != key]
+    overlay.title_keywords = [*existing, text]
     return overlay
 
 
