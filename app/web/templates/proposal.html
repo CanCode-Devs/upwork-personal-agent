@@ -1,12 +1,13 @@
 {% extends "base.html" %}
-{% block title %}Proposal · {{ app_name }}{% endblock %}
+{% block title %}Writer · {{ app_name }}{% endblock %}
 {% block content %}
 <div class="top">
   <div>
-    <h1>Proposal writer</h1>
-    <div class="sub">Shape how cover letters, milestones, and screening answers are written. Safety rules (JSON shape, no invented proof, milestones stay out of the letter) stay in code.</div>
+    <h1>Settings</h1>
+    <div class="sub">Shape how cover letters, milestones, and screening answers are written.</div>
   </div>
 </div>
+{% include "settings_nav.html" %}
 
 {% if request.query_params.get('saved') %}
 <div class="banner ok">Proposal settings saved. They apply to the next draft or Regenerate.</div>
@@ -178,9 +179,9 @@
 </div>
 {% endfor %}
 
-<div class="card" style="margin-top:28px">
-  <h2>Prompt preview</h2>
+<details class="soft">
+  <summary>Prompt preview</summary>
   <p class="muted">Project-formula preview. Role hires use the Role hire sections instead.</p>
   <textarea class="preview" readonly>{{ prompt_preview }}</textarea>
-</div>
+</details>
 {% endblock %}

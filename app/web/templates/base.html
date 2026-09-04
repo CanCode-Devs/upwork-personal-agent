@@ -12,6 +12,14 @@
 <body class="{% block body_class %}{% endblock %}{% if poll is defined and poll.polling %} is-polling{% endif %}">
   <div class="shell">
     <aside class="rail">
+      <div class="brand">
+        <div class="product-name">{{ app_name }}</div>
+        <span class="product-tagline">{{ app_tagline }}</span>
+        <a class="studio-mark" href="{{ studio_url|default('https://cancodedevs.com') }}" target="_blank" rel="noopener noreferrer" aria-label="{{ studio_name|default('CanCode Devs') }}">
+          <img src="/static/logo-mark.png" alt="" width="20" height="20">
+          <span class="studio-name">CanCode <em>Devs</em></span>
+        </a>
+      </div>
       <div id="poll-widget" class="poll-form" data-polling="{{ '1' if poll is defined and poll.polling else '0' }}" data-next="{{ poll.next_poll_at if poll is defined and poll.next_poll_at else '' }}">
         {% if can is defined and can.poll %}
         <form id="poll-form" action="/poll" method="post">
@@ -31,58 +39,53 @@
           <span id="next-poll-in"></span>
         </p>
       </div>
-      <div class="brand">
-        <a class="studio-mark" href="{{ studio_url|default('https://cancodedevs.com') }}" target="_blank" rel="noopener noreferrer" aria-label="{{ studio_name|default('CanCode Devs') }}">
-          <img src="/static/logo-mark.png" alt="" width="32" height="32">
-          <span class="studio-name">CanCode <em>Devs</em></span>
-        </a>
-        <div class="product-name">{{ app_name }}</div>
-        <span class="product-tagline">{{ app_tagline }}</span>
-      </div>
       <nav>
-        <a href="/?status=pending_review" class="{% if request.url.path == '/' %}active{% endif %}">Inbox</a>
-        {% if can is defined and can.messages %}
-        <a href="/messages" class="{% if request.url.path.startswith('/messages') %}active{% endif %}">Messages</a>
+        <div class="nav-group">
+          <div class="nav-label">Work</div>
+          <a href="/?status=pending_review" class="{% if request.url.path == '/' or request.url.path.startswith('/jobs') %}active{% endif %}">Inbox</a>
+          {% if can is defined and can.messages %}
+          <a href="/messages" class="{% if request.url.path.startswith('/messages') %}active{% endif %}">Messages</a>
+          {% endif %}
+          <a href="/history" class="{% if request.url.path == '/history' %}active{% endif %}">History</a>
+        </div>
+        {% if can is defined and (can.settings or can.writer or can.portfolio) %}
+        <div class="nav-group">
+          <div class="nav-label">Agent</div>
+          <a href="/preferences" class="{% if request.url.path.startswith('/preferences') or request.url.path.startswith('/settings') or request.url.path.startswith('/proposal') or request.url.path.startswith('/portfolio') %}active{% endif %}">Settings</a>
+        </div>
         {% endif %}
-        {% if can is defined and can.portfolio %}
-        <a href="/portfolio" class="{% if request.url.path.startswith('/portfolio') %}active{% endif %}">Portfolio</a>
+        {% if can is defined and (can.settings or can.users) %}
+        <div class="nav-group">
+          <div class="nav-label">Admin</div>
+          {% if can.settings %}
+          <a href="/config" class="{% if request.url.path.startswith('/config') %}active{% endif %}">Config</a>
+          {% endif %}
+          {% if can.users %}
+          <a href="/users" class="{% if request.url.path.startswith('/users') %}active{% endif %}">Users</a>
+          {% endif %}
+        </div>
         {% endif %}
-        {% if can is defined and can.writer %}
-        <a href="/proposal" class="{% if request.url.path.startswith('/proposal') %}active{% endif %}">Proposal</a>
-        {% endif %}
-        {% if can is defined and can.settings %}
-        <a href="/config" class="{% if request.url.path.startswith('/config') %}active{% endif %}">Config</a>
-        <a href="/preferences" class="{% if request.url.path.startswith('/preferences') or request.url.path.startswith('/settings') %}active{% endif %}">Settings</a>
-        {% endif %}
-        <a href="/history" class="{% if request.url.path == '/history' %}active{% endif %}">History</a>
-        {% if can is defined and can.users %}
-        <a href="/users" class="{% if request.url.path.startswith('/users') %}active{% endif %}">Users</a>
-        {% endif %}
-        <form action="/logout" method="post">
-          <button class="btn ghost" type="submit">Log out</button>
-        </form>
       </nav>
       {% if counts is defined %}
       <div id="live-counts" class="counts">
         <div>Pending <b>{{ counts.pending_review }}</b></div>
         <div>Applied <b>{{ counts.applied }}</b></div>
-        <div>Submitted <b>{{ counts.submitted }}</b></div>
         <div>Failed <b>{{ counts.submit_failed }}</b></div>
-        <div>Rejected <b>{{ counts.rejected }}</b></div>
       </div>
       {% endif %}
-      {% if user is defined and user %}
-      <div class="user">{{ user.username }}<span class="role">{{ user.role }}</span></div>
-      {% endif %}
-      <p class="studio-foot">
-        <a href="{{ studio_url|default('https://cancodedevs.com') }}" target="_blank" rel="noopener noreferrer">{{ studio_name|default('CanCode Devs') }}</a>
-        <span>{{ studio_slogan|default('Ideas compile. Products ship.') }}</span>
-      </p>
+      <div class="rail-foot">
+        {% if user is defined and user %}
+        <div class="user">{{ user.username }}<span class="role">{{ user.role }}</span></div>
+        {% endif %}
+        <form class="logout" action="/logout" method="post">
+          <button class="btn ghost" type="submit">Log out</button>
+        </form>
+      </div>
     </aside>
     <section class="main">
       {% if openai_key_missing is defined and openai_key_missing and not request.url.path.startswith('/config') %}
-      <div class="banner">
-        OpenAI API key is not set. Drafting, scoring, and suggestions need it.
+      <div class="banner compact">
+        OpenAI API key is not set.
         {% if can is defined and can.settings %}
         <a class="btn" href="/config">Add on Config</a>
         {% else %}

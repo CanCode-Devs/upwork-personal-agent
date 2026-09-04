@@ -1583,7 +1583,7 @@ def save_profile_overlay(
     )
     save_overlay(overlay)
     apply_runtime_filters(db)
-    return RedirectResponse("/preferences", status_code=303)
+    return RedirectResponse("/preferences?tab=profile", status_code=303)
 
 
 @router.post("/preferences/search-queries/suggest")
@@ -1597,9 +1597,9 @@ def suggest_profile_queries(
         pending = suggest_search_queries(db, settings)
     except Exception:
         logger.exception("search query suggestion failed")
-        return RedirectResponse("/preferences?error=suggest", status_code=303)
+        return RedirectResponse("/preferences?tab=profile&error=suggest", status_code=303)
     flag = "suggested" if pending else "empty"
-    return RedirectResponse(f"/preferences?{flag}=1", status_code=303)
+    return RedirectResponse(f"/preferences?tab=profile&{flag}=1", status_code=303)
 
 
 @router.post("/preferences/search-queries/add")
@@ -1614,7 +1614,7 @@ def add_suggested_query(
     save_overlay(overlay)
     runtime = get_or_create_runtime(db)
     remove_pending_query(runtime, query)
-    return RedirectResponse("/preferences?added=1", status_code=303)
+    return RedirectResponse("/preferences?tab=profile&added=1", status_code=303)
 
 
 @router.post("/preferences/search-queries/dismiss")
@@ -1626,7 +1626,7 @@ def dismiss_suggested_query(
     _ = user
     runtime = get_or_create_runtime(db)
     dismiss_search_query(runtime, query)
-    return RedirectResponse("/preferences?dismissed=1", status_code=303)
+    return RedirectResponse("/preferences?tab=profile&dismissed=1", status_code=303)
 
 
 @router.get("/portfolio", response_class=HTMLResponse)

@@ -1,0 +1,12 @@
+<nav class="settings-tabs" aria-label="Settings sections">
+  {% if can is defined and can.settings %}
+  <a href="/preferences" class="{% if request.url.path.startswith('/preferences') or request.url.path.startswith('/settings') %}{% if request.query_params.get('tab') != 'profile' %}on{% endif %}{% endif %}">Scoring</a>
+  <a href="/preferences?tab=profile" class="{% if (request.url.path.startswith('/preferences') or request.url.path.startswith('/settings')) and request.query_params.get('tab') == 'profile' %}on{% endif %}">Profile</a>
+  {% endif %}
+  {% if can is defined and can.writer %}
+  <a href="/proposal" class="{% if request.url.path.startswith('/proposal') %}on{% endif %}">Writer</a>
+  {% endif %}
+  {% if can is defined and can.portfolio %}
+  <a href="/portfolio" class="{% if request.url.path.startswith('/portfolio') %}on{% endif %}">Portfolio</a>
+  {% endif %}
+</nav>
