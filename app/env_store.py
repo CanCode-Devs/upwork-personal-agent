@@ -6,9 +6,11 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
 
-from app.config import Settings, reload_settings
+from app.config import Settings, get_settings, reload_settings
 from app.db.models import AppConfig, utcnow
 from app.db.session import SessionLocal
+from app.profile import load_profile
+from app.search_queries import clamped_poll_interval_seconds, min_poll_interval_seconds, poll_queries
 
 OWNER_KEY = "dashboard_username"
 SOURCE_SAVED = "saved"
@@ -62,9 +64,27 @@ VARIABLE_FIELDS: tuple[CatalogField, ...] = (
         help="Short line under the app name in the sidebar.",
     ),
     CatalogField(
-        key="poll_interval_minutes",
-        label="Poll interval (minutes)",
-        help="How often the agent searches Upwork for new jobs.",
+        key="search_gap_seconds",
+        label="Search gap (seconds)",
+        help="Wait after each title or keyword search before the next one. Extra pages of the same search do not use this gap.",
+        value_type="int",
+    ),
+    CatalogField(
+        key="find_jobs_min_interval_seconds",
+        label="Find-jobs min interval (seconds)",
+        help="Minimum space between every Upwork find_jobs call, including extra pages and job-detail fetches.",
+        value_type="int",
+    ),
+    CatalogField(
+        key="poll_cooldown_seconds",
+        label="Poll cooldown (seconds)",
+        help="After a full sweep finishes, wait this long before the next automatic poll. Poll now skips this wait.",
+        value_type="int",
+    ),
+    CatalogField(
+        key="poll_interval_seconds",
+        label="Poll interval (seconds)",
+        help="Target time from one poll start to the next. Cannot go below searches × search gap + cooldown.",
         value_type="int",
     ),
     CatalogField(
@@ -141,7 +161,10 @@ class VariablesWrite(BaseModel):
     openai_draft_model: str = Field(min_length=1)
     app_name: str = Field(min_length=1)
     app_tagline: str = Field(min_length=1)
-    poll_interval_minutes: int = Field(ge=1)
+    search_gap_seconds: int = Field(ge=1)
+    find_jobs_min_interval_seconds: int = Field(ge=1)
+    poll_cooldown_seconds: int = Field(ge=1)
+    poll_interval_seconds: int = Field(ge=1)
     approval_ttl_hours: int = Field(ge=1)
     embedding_model: str = Field(min_length=1)
     upwork_mcp_url: str = Field(min_length=1)
@@ -193,8 +216,27 @@ def _upsert(db: Session, key: str, value: str, is_secret: bool) -> None:
     row.updated_at = utcnow()
 
 
+def _migrate_poll_interval_minutes(db: Session, existing: set[str], env: Settings) -> set[str]:
+    row = db.query(AppConfig).filter(AppConfig.key == "poll_interval_minutes").one_or_none()
+    if row is None:
+        return existing
+    keys = set(existing)
+    if "poll_interval_seconds" not in keys:
+        try:
+            seconds = str(max(1, int(row.value) * 60))
+        except (TypeError, ValueError):
+            seconds = str(env.poll_interval_seconds)
+        _upsert(db, "poll_interval_seconds", seconds, is_secret=False)
+        keys.add("poll_interval_seconds")
+    db.delete(row)
+    keys.discard("poll_interval_minutes")
+    db.flush()
+    return keys
+
+
 def seed_from_env(db: Session, env: Settings) -> None:
     existing = {row.key for row in db.query(AppConfig).all()}
+    existing = _migrate_poll_interval_minutes(db, existing, env)
     for field in SECRET_FIELDS:
         if field.key in existing:
             continue
@@ -255,11 +297,34 @@ def delete_secret(db: Session, key: str) -> None:
 
 def save_variables(db: Session, payload: VariablesWrite) -> None:
     values = payload.model_dump()
+    settings = get_settings()
+    profile = load_profile(settings, db=db)
+    values["poll_interval_seconds"] = clamped_poll_interval_seconds(
+        values["poll_interval_seconds"],
+        len(poll_queries(profile, settings)),
+        values["search_gap_seconds"],
+        values["poll_cooldown_seconds"],
+    )
     for field in VARIABLE_FIELDS:
         raw = values[field.key]
         stored = "" if raw is None else str(raw)
         _upsert(db, field.key, stored, is_secret=False)
     db.flush()
+
+
+def ensure_poll_interval_floor(db: Session, settings: Settings | None = None) -> bool:
+    settings = settings or get_settings()
+    profile = load_profile(settings, db=db)
+    floor = min_poll_interval_seconds(
+        len(poll_queries(profile, settings)),
+        settings.search_gap_seconds,
+        settings.poll_cooldown_seconds,
+    )
+    if settings.poll_interval_seconds >= floor:
+        return False
+    _upsert(db, "poll_interval_seconds", str(floor), is_secret=False)
+    db.flush()
+    return True
 
 
 def _secret_row(field: CatalogField, overlay: dict[str, str], resolved: Settings) -> SecretRow:
@@ -298,7 +363,23 @@ def _variable_row(field: CatalogField, resolved: Settings) -> VariableRow:
 def config_page_view(resolved: Settings) -> ConfigPageView:
     overlay = load_overlay_map()
     secrets = [_secret_row(field, overlay, resolved) for field in SECRET_FIELDS]
-    variables = [_variable_row(field, resolved) for field in VARIABLE_FIELDS]
+    profile = load_profile(resolved)
+    query_count = len(poll_queries(profile, resolved))
+    floor = min_poll_interval_seconds(
+        query_count,
+        resolved.search_gap_seconds,
+        resolved.poll_cooldown_seconds,
+    )
+    variables: list[VariableRow] = []
+    for field in VARIABLE_FIELDS:
+        row = _variable_row(field, resolved)
+        if field.key == "poll_interval_seconds":
+            row["note"] = (
+                f"Current floor is {floor}s "
+                f"({query_count} searches × {resolved.search_gap_seconds}s gap "
+                f"+ {resolved.poll_cooldown_seconds}s cooldown)."
+            )
+        variables.append(row)
     return ConfigPageView(
         secrets=secrets,
         variables=variables,

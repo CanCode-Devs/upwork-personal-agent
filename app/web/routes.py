@@ -25,18 +25,19 @@ from app.env_store import (
     VariablesWrite,
     config_page_view,
     delete_secret,
+    ensure_poll_interval_floor,
     persist_and_reload,
     save_secret,
     save_variables,
     set_owner_username,
 )
 from app.models import (
+    ACTIONABLE_STATUSES,
     ApplyHighlight,
     ConnectsPanel,
     DashboardUserCreate,
     EngagementFilter,
     FeedbackOutcome,
-    FreelancerProfile,
     InboxCounts,
     InboxSort,
     JobStatus,
@@ -105,7 +106,8 @@ from app.search_queries import (
 from app.tools.discovery import apply_runtime_filters, ensure_client_scores
 from app.tools.execution import HIGHLIGHT_PICK, PitchSkipped, generate_tailored_pitch, heal_applied_status, job_is_fixed, local_job_highlights, quote_amount_for_job, rank_highlights
 from app.tools.memory import learn_preference, log_interaction_feedback, save_agent_item, update_portfolio_matrix
-from app.upwork.mcp_client import UpworkMcpClient, already_applied, connects_shortage, format_mcp_error, oauth_needs_login, public_job_url, job_ref_keys
+from app.upwork.mcp_catalog import accept_pending, load_catalog, pending_drift_counts, sync_catalog_after_connect
+from app.upwork.mcp_client import UpworkMcpClient, already_applied, compact_tool_message, connects_shortage, format_mcp_error, oauth_needs_login, public_job_url, job_ref_keys
 from app.upwork.oauth import (
     OAuthCallbackPayload,
     WebOAuthFlow,
@@ -410,6 +412,7 @@ async def inbox(
             "oauth_notice": oauth_notice,
             "oauth": oauth or "",
             "oauth_detail": pop_last_oauth_error() if oauth == "failed" else "",
+            "mcp_drift": pending_drift_counts(),
         },
     )
 
@@ -465,11 +468,11 @@ async def job_detail(
         .order_by(FeedbackLog.created_at.desc())
         .all()
     )
-    can_act = job.status in {JobStatus.pending_review.value, JobStatus.submit_failed.value} and not job.applied_on_upwork
+    can_act = job.status in ACTIONABLE_STATUSES and not job.applied_on_upwork
     applied_ids = {row.posting_id for row in db.query(UpworkApplication).all()}
     if can_act and mark_jobs_applied(db, applied_ids, "Matched an Upwork proposal"):
         db.refresh(job)
-        can_act = job.status in {JobStatus.pending_review.value, JobStatus.submit_failed.value} and not job.applied_on_upwork
+        can_act = job.status in ACTIONABLE_STATUSES and not job.applied_on_upwork
     writer = load_proposal_settings(db)
     letter = cover_letter_for(job, db)
     has_draft = bool(letter.strip())
@@ -583,11 +586,11 @@ async def job_detail(
             highlights.append(ApplyHighlight(kind="upwork_job", id=hid, title=hid, selected=True))
     kind_order = {"upwork_job": 0, "portfolio": 1, "certificate": 2, "profile_history": 3}
     highlights.sort(key=lambda item: (not item.selected, kind_order.get(item.kind, 9), item.title.lower()))
-    submit_error = (proposal.submit_error if proposal is not None else None) or ""
+    submit_error = compact_tool_message((proposal.submit_error if proposal is not None else None) or "")
     if not submit_error:
         for event in events:
             if event.kind == "submit_failed" and event.message:
-                submit_error = event.message
+                submit_error = compact_tool_message(event.message)
                 break
     oauth_stale = oauth_needs_login(submit_error)
     application = application_for_job(job, db=db)
@@ -776,7 +779,7 @@ def save_job_quote(
     job = db.query(Job).options(selectinload(Job.proposals)).filter(Job.id == job_id).one_or_none()
     if job is None:
         return RedirectResponse("/", status_code=303)
-    if job.applied_on_upwork or job.status not in {JobStatus.pending_review.value, JobStatus.submit_failed.value}:
+    if job.applied_on_upwork or job.status not in ACTIONABLE_STATUSES:
         return RedirectResponse(f"/jobs/{job.id}?error=blocked", status_code=303)
     if job_is_fixed(job):
         return RedirectResponse(f"/jobs/{job.id}", status_code=303)
@@ -799,7 +802,7 @@ async def regenerate_job(
     job = db.query(Job).options(selectinload(Job.proposals)).filter(Job.id == job_id).one_or_none()
     if job is None:
         return RedirectResponse("/", status_code=303)
-    if job.applied_on_upwork or job.status not in {JobStatus.pending_review.value, JobStatus.submit_failed.value}:
+    if job.applied_on_upwork or job.status not in ACTIONABLE_STATUSES:
         return RedirectResponse(f"/jobs/{job.id}?error=blocked", status_code=303)
     had_draft = bool(cover_letter_for(job, db).strip())
     points = [line.strip(" -•\t") for line in comments.splitlines() if line.strip()]
@@ -890,9 +893,10 @@ async def approve_job(
     except UnprovenAnswersError:
         return RedirectResponse(f"/jobs/{job.id}?error=unproven", status_code=303)
     except (ValueError, RuntimeError, Exception) as exc:
-        add_event(db, "submit_failed", format_mcp_error(exc), job.id, user_id=user["id"])
+        add_event(db, "submit_failed", compact_tool_message(format_mcp_error(exc)), job.id, user_id=user["id"])
         logger.exception("approve/submit failed for job %s", job.id)
-    return RedirectResponse(f"/jobs/{job.id}", status_code=303)
+        return RedirectResponse(f"/jobs/{job.id}?error=submit", status_code=303)
+    return RedirectResponse(f"/jobs/{job.id}?submitted=1", status_code=303)
 
 
 @router.post("/jobs/{job_id}/reject")
@@ -931,9 +935,17 @@ async def poll_now(
 async def _complete_web_login(flow: WebOAuthFlow) -> None:
     try:
         tools = await UpworkMcpClient().login(mode="web", web_flow=flow)
+        catalog = sync_catalog_after_connect(tools)
+        pending = catalog.pending
+        if pending is not None and pending.has_changes():
+            note = (
+                f"MCP catalog changed: +{len(pending.added)} -{len(pending.removed)} ~{len(pending.changed)}"
+            )
+        else:
+            note = f"MCP connected ({len(tools)} tools)"
         db = SessionLocal()
         try:
-            add_event(db, "upwork", f"MCP connected ({len(tools)} tools)")
+            add_event(db, "upwork", note)
             db.commit()
         finally:
             db.close()
@@ -1026,6 +1038,37 @@ async def upwork_callback(
     if exc is not None:
         return RedirectResponse("/?oauth=failed", status_code=303)
     return RedirectResponse("/?oauth=ok", status_code=303)
+
+
+@router.get("/mcp", response_class=HTMLResponse)
+def mcp_catalog_page(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.review)),
+) -> Response:
+    catalog = load_catalog()
+    return render(
+        request,
+        "mcp.html",
+        {
+            "user": user,
+            "counts": _counts(db),
+            "catalog": catalog,
+            "accepted": request.query_params.get("accepted") == "1",
+        },
+    )
+
+
+@router.post("/mcp/accept")
+def mcp_catalog_accept(
+    db: Session = Depends(get_db),
+    user: SessionUser = Depends(require_permission(Permission.upwork_connect)),
+) -> Response:
+    catalog = accept_pending()
+    pending = catalog.pending
+    if pending is None or not pending.has_changes():
+        add_event(db, "upwork", f"MCP catalog accepted ({len(catalog.tools)} tools)", user_id=user["id"])
+    return RedirectResponse("/mcp?accepted=1", status_code=303)
 
 
 @router.get("/history", response_class=HTMLResponse)
@@ -1147,7 +1190,10 @@ def config_save_variables(
     openai_draft_model: str = Form(""),
     app_name: str = Form(""),
     app_tagline: str = Form(""),
-    poll_interval_minutes: str = Form(""),
+    search_gap_seconds: str = Form(""),
+    find_jobs_min_interval_seconds: str = Form(""),
+    poll_cooldown_seconds: str = Form(""),
+    poll_interval_seconds: str = Form(""),
     approval_ttl_hours: str = Form(""),
     embedding_model: str = Form(""),
     upwork_mcp_url: str = Form(""),
@@ -1162,7 +1208,10 @@ def config_save_variables(
             openai_draft_model=openai_draft_model,
             app_name=app_name,
             app_tagline=app_tagline,
-            poll_interval_minutes=int(poll_interval_minutes),
+            search_gap_seconds=int(search_gap_seconds),
+            find_jobs_min_interval_seconds=int(find_jobs_min_interval_seconds),
+            poll_cooldown_seconds=int(poll_cooldown_seconds),
+            poll_interval_seconds=int(poll_interval_seconds),
             approval_ttl_hours=int(approval_ttl_hours),
             embedding_model=embedding_model,
             upwork_mcp_url=upwork_mcp_url,
@@ -1564,25 +1613,30 @@ def save_profile_overlay(
     working_hours: str = Form(""),
     voice: str = Form(""),
     skills: str = Form(""),
-    exclude_keywords: str = Form(""),
-    search_queries: str = Form(""),
+    job_titles: str = Form(""),
+    title_keywords: str = Form(""),
+    title_exclude_keywords: str = Form(""),
     db: Session = Depends(get_db),
     user: SessionUser = Depends(require_permission(Permission.settings)),
 ) -> Response:
     _ = user
     rate = int(hourly_rate) if hourly_rate.strip().isdigit() else None
-    overlay = FreelancerProfile(
-        name=name.strip(),
-        title=title.strip(),
-        hourly_rate=rate,
-        working_hours=working_hours.strip(),
-        voice=voice.strip() or "concise, specific, no fluff",
-        skills=[part.strip() for part in skills.split(",") if part.strip()],
-        exclude_keywords=[part.strip() for part in exclude_keywords.split(",") if part.strip()],
-        search_queries=[part.strip() for part in search_queries.split("\n") if part.strip()],
-    )
+    overlay = load_overlay(get_settings())
+    overlay.name = name.strip()
+    overlay.title = title.strip()
+    overlay.hourly_rate = rate
+    overlay.working_hours = working_hours.strip()
+    overlay.voice = voice.strip() or "concise, specific, no fluff"
+    overlay.skills = [part.strip() for part in skills.split(",") if part.strip()]
+    overlay.job_titles = [part.strip() for part in job_titles.split("\n") if part.strip()]
+    overlay.title_keywords = [part.strip() for part in title_keywords.split("\n") if part.strip()]
+    overlay.title_exclude_keywords = [
+        part.strip() for part in title_exclude_keywords.split(",") if part.strip()
+    ]
     save_overlay(overlay)
     apply_runtime_filters(db)
+    if ensure_poll_interval_floor(db):
+        persist_and_reload(db)
     return RedirectResponse("/preferences?tab=profile", status_code=303)
 
 
@@ -1614,6 +1668,8 @@ def add_suggested_query(
     save_overlay(overlay)
     runtime = get_or_create_runtime(db)
     remove_pending_query(runtime, query)
+    if ensure_poll_interval_floor(db):
+        persist_and_reload(db)
     return RedirectResponse("/preferences?tab=profile&added=1", status_code=303)
 
 

@@ -23,27 +23,31 @@
   </div>
 </div>
 
-{% if request.query_params.get('drafted') %}
+{% if request.query_params.get('submitted') %}
+<div class="banner ok">Proposal submitted to Upwork.</div>
+{% elif request.query_params.get('drafted') %}
 <div class="banner ok">Proposal drafted. Review the letter and milestones before submit.</div>
 {% elif request.query_params.get('regenerated') %}
 <div class="banner ok">Proposal regenerated. Review the letter and milestones before submit.</div>
 {% elif request.query_params.get('skipped') %}
 <div class="banner">This job no longer passes Settings, so it was skipped instead of drafting a letter.</div>
 {% elif request.query_params.get('error') == 'blocked' %}
-<div class="banner">This job cannot be drafted (already applied or not in Pending).</div>
+<div class="banner">This job cannot be drafted (already applied, expired, or already submitted).</div>
 {% elif request.query_params.get('error') == 'unproven' %}
 <div class="banner">Fix the unproven answers below before submit.</div>
 {% elif request.query_params.get('error') == 'quote' %}
 <div class="banner">Enter an hourly quote greater than 0.</div>
+{% elif request.query_params.get('error') == 'submit' %}
+<div class="banner">Submit to Upwork failed. {{ submit_error or "Check the log on this page." }}{% if oauth_stale %} Open Connect Upwork in a new tab, then retry.{% endif %}</div>
+{% elif request.query_params.get('error') == 'attachments' %}
+<div class="banner">Could not read that attachment. Paste the text or try another file.</div>
 {% elif request.query_params.get('error') %}
 <div class="banner">Could not write the proposal. Check the log on this page.</div>
 {% elif request.query_params.get('attachments') %}
 <div class="banner ok">Attachment text saved. Regenerate the proposal so the letter can use it.</div>
 {% elif request.query_params.get('saved') %}
 <div class="banner ok">Edits saved.</div>
-{% elif request.query_params.get('error') == 'attachments' %}
-<div class="banner">Could not read that attachment. Paste the text or try another file.</div>
-{% elif job.status == 'submit_failed' %}
+{% elif job.status == 'submit_failed' or (submit_error and not job.applied_on_upwork) %}
 <div class="banner">Submit to Upwork failed. {{ submit_error or "Check the log on this page." }}{% if oauth_stale %} Open Connect Upwork in a new tab, then retry.{% endif %}</div>
 {% endif %}
 
@@ -149,21 +153,24 @@
 
 <div class="job-col">
     <h2>Proposal</h2>
+    {% if job.status == 'skipped' and can_act %}
+    <p class="muted">Skipped by Settings. You can still write a proposal and submit if you want this one.</p>
+    {% endif %}
     {% if can_act and not job.applied_on_upwork %}
-    <form method="post" action="/jobs/{{ job.id }}/regenerate" style="margin-bottom:16px">
+    <form id="regen-form" method="post" action="/jobs/{{ job.id }}/regenerate" style="margin-bottom:16px">
       {% if has_draft %}
       <label for="regen_comments">Regenerate proposal</label>
       <textarea id="regen_comments" name="comments" class="short" placeholder="Optional comments, e.g. stress n8n, answer the 5 apply items, shorter CTA"></textarea>
       <p class="muted">Rewrites the letter, milestones (if fixed-price), screening answers, and highlights with the draft model. Does not submit.</p>
       <div class="actions" style="margin-top:8px">
-        <button class="btn secondary" type="submit">Regenerate</button>
+        <button id="regen-btn" class="btn secondary" type="submit" data-busy-label="Regenerating…">Regenerate</button>
       </div>
       {% else %}
       <label for="regen_comments">Write proposal</label>
       <textarea id="regen_comments" name="comments" class="short" placeholder="Optional focus, e.g. stress RAG evals, skip milestones you dislike"></textarea>
       <p class="muted">Calls the larger draft model for a cover letter, screening answers, and milestones. Does not submit.</p>
       <div class="actions" style="margin-top:8px">
-        <button class="btn" type="submit">Write proposal</button>
+        <button id="regen-btn" class="btn" type="submit" data-busy-label="Writing…">Write proposal</button>
       </div>
       {% endif %}
     </form>
@@ -316,7 +323,7 @@
       {% endif %}
       <div class="job-actions">
         <button class="btn secondary" type="submit">Save</button>
-        <button id="approve-btn" class="btn" type="submit" formaction="/jobs/{{ job.id }}/approve" {% if unproven_gaps %}disabled{% endif %}>Approve &amp; submit</button>
+        <button id="approve-btn" class="btn" type="submit" formaction="/jobs/{{ job.id }}/approve" data-busy-label="Submitting…" {% if unproven_gaps %}disabled{% endif %}>Approve &amp; submit</button>
       </div>
       {% endif %}
     </form>
@@ -563,7 +570,10 @@
       return;
     }
     approveBtn.disabled = true;
-    approveBtn.textContent = "Submitting…";
+    approveBtn.classList.add("is-busy");
+    approveBtn.setAttribute("aria-busy", "true");
+    const label = approveBtn.getAttribute("data-busy-label") || "Submitting…";
+    approveBtn.innerHTML = '<span class="poll-spinner" aria-hidden="true"></span> ' + label;
     submitting = true;
   });
   sync();
@@ -579,6 +589,21 @@
     if (!btn) return;
     btn.disabled = true;
     btn.textContent = "Saving…";
+  });
+})();
+</script>
+<script>
+(function () {
+  const form = document.getElementById("regen-form");
+  const btn = document.getElementById("regen-btn");
+  if (!form || !btn) return;
+  form.addEventListener("submit", function () {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    btn.classList.add("is-busy");
+    btn.setAttribute("aria-busy", "true");
+    const label = btn.getAttribute("data-busy-label") || "Writing…";
+    btn.innerHTML = '<span class="poll-spinner" aria-hidden="true"></span> ' + label;
   });
 })();
 </script>

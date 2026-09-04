@@ -20,7 +20,7 @@
           <span class="studio-name">CanCode <em>Devs</em></span>
         </a>
       </div>
-      <div id="poll-widget" class="poll-form" data-polling="{{ '1' if poll is defined and poll.polling else '0' }}" data-next="{{ poll.next_poll_at if poll is defined and poll.next_poll_at else '' }}">
+      <div id="poll-widget" class="poll-form" data-polling="{{ '1' if poll is defined and poll.polling else '0' }}" data-next="{{ poll.next_poll_at if poll is defined and poll.next_poll_at else '' }}" data-phase="{{ poll.phase if poll is defined else 'idle' }}" data-query="{{ poll.query if poll is defined else '' }}" data-inbox-rev="{{ poll.inbox_rev if poll is defined else 0 }}">
         {% if can is defined and can.poll %}
         <form id="poll-form" action="/poll" method="post">
           <button id="poll-btn" class="poll-now" type="submit"{% if poll is defined and poll.polling %} disabled aria-busy="true"{% endif %}>
@@ -32,9 +32,9 @@
           </button>
         </form>
         {% endif %}
-        <p id="poll-status" class="poll-status"{% if poll is not defined or not poll.polling %} hidden{% endif %}>Searching Upwork for new jobs…</p>
-        <p id="next-poll" class="next-poll"{% if poll is defined and poll.polling %} hidden{% endif %}>
-          <span class="next-poll-label">Next poll</span>
+        <p id="poll-status" class="poll-status"{% if poll is not defined or not poll.polling or poll.phase == 'waiting' %} hidden{% endif %}>{% if poll is defined and poll.phase == 'searching' and poll.query %}Searching "{{ poll.query }}"…{% else %}Searching Upwork for new jobs…{% endif %}</p>
+        <p id="next-poll" class="next-poll"{% if poll is defined and poll.polling and poll.phase != 'waiting' %} hidden{% endif %}>
+          <span class="next-poll-label" id="next-poll-label">{% if poll is defined and poll.phase == 'waiting' and poll.query %}Next search for "{{ poll.query }}"{% else %}Cooldown, next poll{% endif %}</span>
           <time id="next-poll-at" datetime="{{ poll.next_poll_at if poll is defined and poll.next_poll_at else '' }}"></time>
           <span id="next-poll-in"></span>
         </p>
@@ -54,11 +54,14 @@
           <a href="/preferences" class="{% if request.url.path.startswith('/preferences') or request.url.path.startswith('/settings') or request.url.path.startswith('/proposal') or request.url.path.startswith('/portfolio') %}active{% endif %}">Settings</a>
         </div>
         {% endif %}
-        {% if can is defined and (can.settings or can.users) %}
+        {% if can is defined and (can.settings or can.users or can.upwork_connect) %}
         <div class="nav-group">
           <div class="nav-label">Admin</div>
           {% if can.settings %}
           <a href="/config" class="{% if request.url.path.startswith('/config') %}active{% endif %}">Config</a>
+          {% endif %}
+          {% if can.settings or can.upwork_connect %}
+          <a href="/mcp" class="{% if request.url.path.startswith('/mcp') %}active{% endif %}">MCP</a>
           {% endif %}
           {% if can.users %}
           <a href="/users" class="{% if request.url.path.startswith('/users') %}active{% endif %}">Users</a>
@@ -110,10 +113,13 @@
 
     let nextIso = widget.getAttribute("data-next") || "";
     let polling = widget.getAttribute("data-polling") === "1";
+    let phase = widget.getAttribute("data-phase") || "";
+    let query = widget.getAttribute("data-query") || "";
     let userTriggered = false;
     let wasPolling = polling;
     let refreshing = false;
     let toastTimer = 0;
+    let inboxRev = Number(widget.getAttribute("data-inbox-rev") || "0");
 
     function pad(n) {
       return String(n).padStart(2, "0");
@@ -130,7 +136,7 @@
       const h = Math.floor(total / 3600);
       const m = Math.floor((total % 3600) / 60);
       const s = total % 60;
-      if (h > 0) return "in " + h + "h " + m + "m";
+      if (h > 0) return "in " + h + "h " + m + "m " + pad(s) + "s";
       if (m > 0) return "in " + m + "m " + pad(s) + "s";
       return "in " + s + "s";
     }
@@ -138,8 +144,6 @@
     function applyPolling(on) {
       polling = on;
       document.body.classList.toggle("is-polling", on);
-      if (status) status.hidden = !on;
-      if (nextEl) nextEl.hidden = on;
       if (!btn) return;
       if (on) {
         btn.classList.add("is-polling");
@@ -154,22 +158,48 @@
       }
     }
 
+    function updateRail() {
+      const label = document.getElementById("next-poll-label");
+      const searching = polling && phase === "searching";
+      const waiting = polling && phase === "waiting";
+      if (status) {
+        if (searching) {
+          status.hidden = false;
+          status.textContent = query ? 'Searching "' + query + '"…' : "Searching Upwork for new jobs…";
+        } else if (polling && !waiting) {
+          status.hidden = false;
+          status.textContent = "Searching Upwork for new jobs…";
+        } else {
+          status.hidden = true;
+        }
+      }
+      if (nextEl) nextEl.hidden = polling && !waiting;
+      if (label) {
+        if (waiting && query) label.textContent = 'Next search for "' + query + '"';
+        else if (waiting) label.textContent = "Next search";
+        else label.textContent = "Cooldown, next poll";
+      }
+    }
+
     function renderCountdown() {
       if (!nextAt || !nextIn) return;
       if (!nextIso) {
         nextAt.removeAttribute("datetime");
-        nextAt.textContent = "soon";
-        nextIn.textContent = "";
+        nextAt.textContent = "";
+        nextAt.hidden = true;
+        nextIn.textContent = polling ? "" : "soon";
         return;
       }
       const d = new Date(nextIso);
       if (Number.isNaN(d.getTime())) {
         nextAt.textContent = "";
+        nextAt.hidden = true;
         nextIn.textContent = "";
         return;
       }
       nextAt.setAttribute("datetime", nextIso);
-      nextAt.textContent = formatClock(nextIso) || "soon";
+      nextAt.textContent = phase === "waiting" ? "" : (formatClock(nextIso) || "");
+      nextAt.hidden = !nextAt.textContent;
       const ms = d.getTime() - Date.now();
       nextIn.textContent = ms <= 0 ? "now" : formatRemaining(ms);
     }
@@ -273,14 +303,26 @@
     function applySnapshot(data) {
       if (!data) return;
       const nowPolling = Boolean(data.polling);
+      phase = data.phase || "";
+      query = data.query || "";
       nextIso = data.next_poll_at || "";
+      const rev = Number(data.inbox_rev || 0);
+      const revChanged = Number.isFinite(rev) && rev !== inboxRev;
+      inboxRev = Number.isFinite(rev) ? rev : inboxRev;
       widget.setAttribute("data-next", nextIso);
       widget.setAttribute("data-polling", nowPolling ? "1" : "0");
+      widget.setAttribute("data-phase", phase);
+      widget.setAttribute("data-query", query);
+      widget.setAttribute("data-inbox-rev", String(inboxRev));
       if (nowPolling !== polling) applyPolling(nowPolling);
+      else polling = nowPolling;
+      updateRail();
       renderCountdown();
       if (wasPolling && !nowPolling) {
         userTriggered = false;
         showToast(toastMessage(data.last_new, data.last_updated));
+        softRefresh();
+      } else if (revChanged && nowPolling && window.location.pathname === "/") {
         softRefresh();
       }
       wasPolling = nowPolling;
@@ -318,6 +360,7 @@
     }
 
     applyPolling(polling);
+    updateRail();
     renderCountdown();
     setInterval(renderCountdown, 1000);
     setInterval(refreshStatus, 2000);

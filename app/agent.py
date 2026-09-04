@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Literal, TypedDict
 
 from app.config import Settings, get_settings
-from app.db.models import FeedbackLog, Job, UpworkApplication
+from app.db.models import Event, FeedbackLog, Job, UpworkApplication
 from app.db.session import SessionLocal
 from app.events import add_event
 from app.models import JobPayload, JobStatus
+from app.poll_state import bump_inbox_rev, clear_sweep, set_sweep
 from app.profile import load_profile
 from app.runtime import load_runtime
+from app.search_queries import job_title_excluded, poll_queries, title_exclude_terms
 from app.tools.discovery import (
     _parse_client,
     client_hard_gate_reasons,
@@ -29,6 +32,7 @@ from app.upwork.mcp_client import (
     format_mcp_error,
     merge_client_details,
     oauth_needs_login,
+    payload_posted_at,
     prefer_price_label,
     price_from_raw,
     public_job_url,
@@ -39,6 +43,116 @@ from app.upwork.outcomes import application_for_posting
 from app.upwork.sync import sync_proposal_outcomes
 
 logger = logging.getLogger(__name__)
+
+MAX_JOB_AGE_HOURS = 48
+
+
+class QueryStats(TypedDict):
+    query: str
+    found: int
+    dup: int
+    title_filtered: int
+    old: int
+    new: int
+
+
+def _new_query_stats(query: str) -> QueryStats:
+    return {"query": query, "found": 0, "dup": 0, "title_filtered": 0, "old": 0, "new": 0}
+
+
+def job_too_old(payload: JobPayload, now: datetime, max_age_hours: int = MAX_JOB_AGE_HOURS) -> bool:
+    posted = payload_posted_at(payload)
+    if posted is None:
+        return False
+    return now - posted.astimezone(UTC) > timedelta(hours=max_age_hours)
+
+
+def format_search_report(stats: list[QueryStats], max_age_hours: int = MAX_JOB_AGE_HOURS) -> str:
+    found = sum(item["found"] for item in stats)
+    dup = sum(item["dup"] for item in stats)
+    title_filtered = sum(item["title_filtered"] for item in stats)
+    old = sum(item["old"] for item in stats)
+    new = sum(item["new"] for item in stats)
+    header = (
+        f"queries={len(stats)} found={found} unique={found - dup} new={new} "
+        f"filtered_title={title_filtered} filtered_old={old} (>{max_age_hours}h)"
+    )
+    lines = [header]
+    for item in stats:
+        lines.append(
+            f"{item['query']} — found {item['found']}, new {item['new']}, dup {item['dup']}, "
+            f"title {item['title_filtered']}, old {item['old']}"
+        )
+    return "\n".join(lines)
+
+
+def _upsert_search_report(stats: list[QueryStats], event_id: int | None) -> int:
+    message = format_search_report(stats)
+    db = SessionLocal()
+    try:
+        if event_id is not None:
+            row = db.query(Event).filter(Event.id == event_id, Event.kind == "search").one_or_none()
+            if row is not None:
+                row.message = message
+                db.commit()
+                return event_id
+        event = Event(kind="search", message=message)
+        db.add(event)
+        db.commit()
+        db.refresh(event)
+        return event.id
+    finally:
+        db.close()
+
+
+async def _ingest_query_batch(
+    batch: list[JobPayload],
+    stats: list[QueryStats],
+    source_stats: dict[str, QueryStats],
+    counts: dict[str, int],
+    settings: Settings,
+    mcp: UpworkMcpClient,
+    search_event_id: int | None,
+) -> int:
+    if batch:
+        try:
+            counts["activity_refreshed"] += await refresh_known_job_activity(batch, settings)
+        except Exception:
+            logger.exception("activity refresh failed")
+    db = SessionLocal()
+    try:
+        known = {row[0] for row in db.query(Job.upwork_id).all()}
+    finally:
+        db.close()
+    fresh = [item for item in batch if item.get("id") not in known]
+    for item in fresh:
+        row = source_stats.get(str(item.get("id") or ""))
+        if row is not None:
+            row["new"] += 1
+    search_event_id = _upsert_search_report(stats, search_event_id)
+    if fresh:
+        try:
+            fresh = await mcp.enrich_jobs(fresh)
+        except Exception:
+            logger.exception("job detail enrich failed")
+    for payload in fresh:
+        try:
+            result = await ingest_payload(payload, settings, mcp)
+        except Exception:
+            logger.exception("ingest failed")
+            counts["errors"] += 1
+            continue
+        if result == "duplicate":
+            continue
+        counts["new"] += 1
+        if result == "queued":
+            counts["queued"] += 1
+        elif result == "skipped":
+            counts["skipped"] += 1
+        elif result == "submitted":
+            counts["submitted"] += 1
+    bump_inbox_rev()
+    return search_event_id
 
 
 def _details_dict(raw: str | dict | None) -> dict:
@@ -412,13 +526,36 @@ async def run_agent_cycle(settings: Settings | None = None) -> dict[str, int]:
         finally:
             db.close()
         return counts
+    try:
+        return await _run_authenticated_cycle(mcp, settings, counts)
+    finally:
+        clear_sweep()
+
+
+async def _run_authenticated_cycle(
+    mcp: UpworkMcpClient,
+    settings: Settings,
+    counts: dict[str, int],
+) -> dict[str, int]:
     profile = load_profile(settings)
-    queries = profile.search_queries or [
-        q.strip() for q in settings.search_queries.split(",") if q.strip()
-    ]
-    for query in queries:
+    queries = poll_queries(profile, settings)
+    exclude = title_exclude_terms(profile)
+    now = datetime.now(UTC)
+    min_posted = now - timedelta(hours=MAX_JOB_AGE_HOURS)
+    seen_ids: set[str] = set()
+    stats: list[QueryStats] = []
+    source_stats: dict[str, QueryStats] = {}
+    search_event_id: int | None = None
+    gap = max(1, settings.search_gap_seconds)
+    if queries:
+        set_sweep(phase="searching", query=queries[0])
+    for index, query in enumerate(queries):
+        row = _new_query_stats(query)
+        stats.append(row)
+        set_sweep(phase="searching", query=query)
+        batch: list[JobPayload] = []
         try:
-            jobs = await fetch_live_jobs(query, client=mcp)
+            jobs = await fetch_live_jobs(query, client=mcp, min_posted=min_posted)
         except Exception as exc:
             counts["errors"] += 1
             detail = format_mcp_error(exc)
@@ -429,6 +566,15 @@ async def run_agent_cycle(settings: Settings | None = None) -> dict[str, int]:
                 db.commit()
             finally:
                 db.close()
+            search_event_id = await _ingest_query_batch(
+                [],
+                stats,
+                source_stats,
+                counts,
+                settings,
+                mcp,
+                search_event_id,
+            )
             if oauth_needs_login(detail):
                 db = SessionLocal()
                 try:
@@ -437,39 +583,45 @@ async def run_agent_cycle(settings: Settings | None = None) -> dict[str, int]:
                 finally:
                     db.close()
                 break
+            if index < len(queries) - 1:
+                nxt = queries[index + 1]
+                eta = datetime.now(UTC) + timedelta(seconds=gap)
+                set_sweep(phase="waiting", query=nxt, next_at=eta)
+                await asyncio.sleep(gap)
             continue
-        counts["searched"] += len(jobs)
-        try:
-            counts["activity_refreshed"] += await refresh_known_job_activity(jobs, settings)
-        except Exception:
-            logger.exception("activity refresh failed")
-        db = SessionLocal()
-        try:
-            known = {row[0] for row in db.query(Job.upwork_id).all()}
-        finally:
-            db.close()
-        fresh = [item for item in jobs if item.get("id") not in known]
-        if fresh:
-            try:
-                fresh = await mcp.enrich_jobs(fresh)
-            except Exception:
-                logger.exception("job detail enrich failed")
-        for payload in fresh:
-            try:
-                result = await ingest_payload(payload, settings, mcp)
-            except Exception:
-                logger.exception("ingest failed")
-                counts["errors"] += 1
+        for job in jobs:
+            job_id = str(job.get("id") or "")
+            if not job_id:
                 continue
-            if result == "duplicate":
+            row["found"] += 1
+            if job_id in seen_ids:
+                row["dup"] += 1
                 continue
-            counts["new"] += 1
-            if result == "queued":
-                counts["queued"] += 1
-            elif result == "skipped":
-                counts["skipped"] += 1
-            elif result == "submitted":
-                counts["submitted"] += 1
+            seen_ids.add(job_id)
+            source_stats[job_id] = row
+            if job_title_excluded(str(job.get("title") or ""), exclude):
+                row["title_filtered"] += 1
+                continue
+            if job_too_old(job, now):
+                row["old"] += 1
+                continue
+            batch.append(job)
+        counts["searched"] += len(batch)
+        search_event_id = await _ingest_query_batch(
+            batch,
+            stats,
+            source_stats,
+            counts,
+            settings,
+            mcp,
+            search_event_id,
+        )
+        if index < len(queries) - 1:
+            nxt = queries[index + 1]
+            eta = datetime.now(UTC) + timedelta(seconds=gap)
+            set_sweep(phase="waiting", query=nxt, next_at=eta)
+            await asyncio.sleep(gap)
+    set_sweep(phase="working")
     try:
         await backfill_job_details(mcp)
     except Exception:

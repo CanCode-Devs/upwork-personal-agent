@@ -20,6 +20,12 @@
 {% if oauth_notice %}
 <div class="banner {% if oauth == 'ok' %}ok{% endif %}">{{ oauth_notice }}</div>
 {% endif %}
+{% if mcp_drift %}
+<div class="banner">
+  Upwork MCP changed: {{ mcp_drift.added }} added, {{ mcp_drift.removed }} removed, {{ mcp_drift.changed }} updated.
+  <a class="btn" href="/mcp">Review tools</a>
+</div>
+{% endif %}
 {% if mcp and mcp.stale %}
 <div class="banner">
   Upwork login expired, so polls cannot search. Sign in again on this machine.
@@ -116,7 +122,17 @@
     {% for event in events %}
     <div class="event">
       <time>{{ event.created_at|dt }}</time>
+      {% if event.kind == 'search' %}
+        {% set lines = event.message.split('\n') %}
+        <details class="search-report">
+          <summary>search — {{ lines[0] }}</summary>
+          <ul>
+            {% for line in lines[1:] %}<li>{{ line }}</li>{% endfor %}
+          </ul>
+        </details>
+      {% else %}
         {{ event.kind }}{% if event.user %} · {{ event.user.username }}{% endif %} — {{ event.message }}
+      {% endif %}
     </div>
     {% else %}
     <div class="event">No events yet.</div>

@@ -17,6 +17,15 @@ class JobStatus(StrEnum):
     skipped = "skipped"
 
 
+ACTIONABLE_STATUSES: frozenset[str] = frozenset(
+    {
+        JobStatus.pending_review.value,
+        JobStatus.submit_failed.value,
+        JobStatus.skipped.value,
+    }
+)
+
+
 class InboxSort(StrEnum):
     recent = "recent"
     oldest = "oldest"
@@ -108,6 +117,9 @@ class FreelancerProfile(BaseModel):
     working_hours: str = ""
     exclude_keywords: list[str] = Field(default_factory=list)
     search_queries: list[str] = Field(default_factory=list)
+    job_titles: list[str] = Field(default_factory=list)
+    title_keywords: list[str] = Field(default_factory=list)
+    title_exclude_keywords: list[str] = Field(default_factory=list)
     upwork_overview: str = ""
 
 
@@ -355,6 +367,9 @@ class SearchQueryProfile(TypedDict):
     hourly_rate: int | None
     voice: str
     exclude_keywords: list[str]
+    job_titles: list[str]
+    title_keywords: list[str]
+    title_exclude_keywords: list[str]
     current_queries: list[str]
     upwork_overview: str
 
@@ -390,6 +405,7 @@ class FetchLiveJobsArgs(BaseModel):
     query_keywords: str
     category_id: str = ""
     limit: int = 30
+    min_posted: datetime | None = None
 
 
 class RetrieveContextArgs(BaseModel):
@@ -649,6 +665,9 @@ class PollStatus(TypedDict):
     interval_seconds: int
     last_new: int
     last_updated: int
+    phase: str
+    query: str
+    inbox_rev: int
 
 
 class PollStatusView(BaseModel):
@@ -660,12 +679,50 @@ class PollStatusView(BaseModel):
     interval_seconds: int
     last_new: int = 0
     last_updated: int = 0
+    phase: str = "idle"
+    query: str = ""
+    inbox_rev: int = 0
 
 
 class McpStatus(TypedDict):
     connected: bool
     tools: list[str]
     error: str
+
+
+class McpToolSignature(BaseModel):
+    name: str
+    description: str = ""
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+
+
+class McpToolChange(BaseModel):
+    name: str
+    before: McpToolSignature
+    after: McpToolSignature
+    notes: list[str] = Field(default_factory=list)
+
+
+class McpCatalogDrift(BaseModel):
+    checked_at: datetime
+    added: list[McpToolSignature] = Field(default_factory=list)
+    removed: list[McpToolSignature] = Field(default_factory=list)
+    changed: list[McpToolChange] = Field(default_factory=list)
+
+    def has_changes(self) -> bool:
+        return bool(self.added or self.removed or self.changed)
+
+
+class McpCatalogFile(BaseModel):
+    accepted_at: datetime | None = None
+    tools: list[McpToolSignature] = Field(default_factory=list)
+    pending: McpCatalogDrift | None = None
+
+
+class McpDriftCounts(TypedDict):
+    added: int
+    removed: int
+    changed: int
 
 
 class JobRow(TypedDict, total=False):

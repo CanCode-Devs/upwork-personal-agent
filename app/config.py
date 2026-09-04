@@ -38,7 +38,10 @@ class Settings(BaseSettings):
     search_queries: str = "python fastapi"
     min_score: int = 70
     min_client_score: int = 50
-    poll_interval_minutes: int = 15
+    poll_interval_seconds: int = 900
+    search_gap_seconds: int = 60
+    find_jobs_min_interval_seconds: int = 5
+    poll_cooldown_seconds: int = 300
     approval_ttl_hours: int = 24
     autonomy_mode: str = "manual"
     auto_submit_threshold: int = 85
@@ -95,11 +98,24 @@ def enable_store_overlay() -> None:
 
 
 def _apply_overlay(base: Settings, overlay: dict[str, str]) -> Settings:
+    values = dict(overlay)
+    if "poll_interval_seconds" not in values and "poll_interval_minutes" in values:
+        try:
+            values["poll_interval_seconds"] = str(max(1, int(values["poll_interval_minutes"]) * 60))
+        except ValueError:
+            pass
+    int_keys = {
+        "poll_interval_seconds",
+        "search_gap_seconds",
+        "find_jobs_min_interval_seconds",
+        "poll_cooldown_seconds",
+        "approval_ttl_hours",
+    }
     updates: dict[str, object] = {}
-    for key, raw in overlay.items():
+    for key, raw in values.items():
         if key not in Settings.model_fields:
             continue
-        if key in {"poll_interval_minutes", "approval_ttl_hours"}:
+        if key in int_keys:
             try:
                 updates[key] = int(raw)
             except ValueError:

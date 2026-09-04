@@ -266,8 +266,11 @@ h1 { font-family: Outfit, "Segoe UI", sans-serif; font-weight: 600; margin: 0; f
 
 .layout {
   display: grid;
-  grid-template-columns: 1fr 260px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 260px);
   gap: 20px;
+}
+.layout > .card {
+  min-width: 0;
 }
 
 table { width: 100%; border-collapse: collapse; }
@@ -341,8 +344,11 @@ td.title a { color: var(--ink); font-weight: 500; }
   padding: 16px;
 }
 .card h2 { margin: 0 0 12px; font-size: 0.95rem; }
-.event { font-size: 0.82rem; color: var(--muted); margin-bottom: 10px; }
+.event { font-size: 0.82rem; color: var(--muted); margin-bottom: 10px; overflow-wrap: anywhere; word-break: break-word; }
 .event time { display: block; color: var(--muted); font-size: 0.75rem; }
+.event .search-report summary { cursor: pointer; }
+.event .search-report ul { margin: 6px 0 0; padding-left: 16px; }
+.event .search-report li { margin: 2px 0; }
 
 .btn, button.btn, input[type="submit"] {
   font: inherit;
@@ -358,6 +364,14 @@ td.title a { color: var(--ink); font-weight: 500; }
 .btn.danger { background: var(--surface); color: var(--bad); border: 1px solid var(--bad); }
 .btn.ghost { background: transparent; color: var(--muted); }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn.is-busy,
+.btn.is-busy:disabled {
+  opacity: 1;
+  cursor: wait;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
 .actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .muted { color: var(--muted); font-size: 0.85rem; }
 .connects-panel {

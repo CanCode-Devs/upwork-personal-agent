@@ -14,7 +14,7 @@ import app.tools.memory  # noqa: F401
 from app.auth import SessionMiddleware, bootstrap_user, is_public_path, needs_setup
 from app.config import Settings, enable_store_overlay, get_settings, reload_settings
 from app.db.session import SessionLocal, init_db
-from app.env_store import seed_from_env
+from app.env_store import ensure_poll_interval_floor, persist_and_reload, seed_from_env
 from app.profile import ensure_profile_file
 from app.rbac import ForbiddenError
 from app.runtime import get_or_create_runtime
@@ -53,6 +53,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     ensure_profile_file(settings)
     db = SessionLocal()
     try:
+        if ensure_poll_interval_floor(db, settings):
+            settings = persist_and_reload(db)
         bootstrap_user(db, settings)
         get_or_create_runtime(db, settings)
         if settings.seed_demo_portfolio:

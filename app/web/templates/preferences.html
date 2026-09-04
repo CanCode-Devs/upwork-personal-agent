@@ -145,7 +145,7 @@
 {% else %}
 <div class="card">
   <h2>Agent profile (editable)</h2>
-  <p class="sub">Voice, queries, and extra skills for drafts. This is not your Upwork profile.</p>
+  <p class="sub">Voice, titles, keywords, and extra skills for drafts. This is not your Upwork profile.</p>
   <form method="post" action="/preferences/overlay">
     <label for="name">Name</label>
     <input id="name" name="name" type="text" value="{{ overlay.name }}">
@@ -159,17 +159,23 @@
     <textarea id="voice" name="voice" class="short">{{ overlay.voice }}</textarea>
     <label for="skills">Extra skills (comma-separated)</label>
     <input id="skills" name="skills" type="text" value="{{ overlay.skills | join(', ') }}">
-    <label for="exclude_keywords">Exclude keywords</label>
-    <input id="exclude_keywords" name="exclude_keywords" type="text" value="{{ overlay.exclude_keywords | join(', ') }}">
-    <label for="search_queries">Search queries (one per line)</label>
-    <textarea id="search_queries" name="search_queries" class="short">{% for q in overlay.search_queries %}{{ q }}{% if not loop.last %}
+    <label for="job_titles">Titles to search (one per line)</label>
+    <p class="muted">Job titles such as AI Engineer. Each line is a separate Upwork search. Results are merged with keywords to search.</p>
+    <textarea id="job_titles" name="job_titles" class="short">{% for q in overlay.job_titles %}{{ q }}{% if not loop.last %}
 {% endif %}{% endfor %}</textarea>
+    <label for="title_keywords">Keywords to search (one per line)</label>
+    <p class="muted">Extra searches merged with the titles above. Each line is a separate Upwork search.</p>
+    <textarea id="title_keywords" name="title_keywords" class="short">{% for q in overlay.title_keywords %}{{ q }}{% if not loop.last %}
+{% endif %}{% endfor %}</textarea>
+    <label for="title_exclude_keywords">Keywords to filter jobs from</label>
+    <p class="muted">Skip a job if any of these words appear in the title. The description can still contain them.</p>
+    <input id="title_exclude_keywords" name="title_exclude_keywords" type="text" value="{{ overlay.title_exclude_keywords | join(', ') }}">
     <div class="actions" style="margin-top:16px">
       <button class="btn" type="submit">Save agent profile</button>
     </div>
   </form>
   <form method="post" action="/preferences/search-queries/suggest" style="margin-top:16px">
-    <p class="muted">Suggests 6–10 Upwork keyword queries from your profile, Upwork history, and Portfolio case studies. Polls keep using the list above until you Add a suggestion.</p>
+    <p class="muted">Suggests 6–10 titles and keywords from your profile, Upwork history, and Portfolio case studies. Add puts a suggestion into keywords to search. Polls keep using the lists above until you Add.</p>
     {% if not has_work_history %}
     <p class="muted">No work history imported yet. Sync from Upwork on the Portfolio page, or add case studies, then suggest again.</p>
     {% endif %}
@@ -184,7 +190,7 @@
   {% elif request.query_params.get('error') == 'suggest' %}
   <div class="banner" style="margin-top:12px">Could not suggest queries. Check the OpenAI key and try again.</div>
   {% elif request.query_params.get('added') %}
-  <div class="banner ok" style="margin-top:12px">Query added. The next poll will search it.</div>
+  <div class="banner ok" style="margin-top:12px">Added to keywords to search. The next poll will search it.</div>
   {% elif request.query_params.get('dismissed') %}
   <div class="banner" style="margin-top:12px">Suggestion dismissed.</div>
   {% endif %}
